@@ -802,13 +802,21 @@ class MainWindow(QMainWindow):
             x0 = max(0, pad)
             span = max(1, w - pad * 2)
 
-            # 按行拷贝：QImage.constBits 给的是整图起始地址，
-            # 用行步长切片只搬需要的部分，避免整图拷贝。
-            buf = img.constBits()
-            raw = bytes(buf) if not isinstance(buf, (bytes, bytearray)) else buf
-            stride = img.bytesPerLine()
+            # **不要** bytes(整图) —— 那会把整幅位图拷一份（1200x800 是
+            # 5.9MB，4K 是 33MB），而我们要的只是顶部 6%。
+            #
+            # PySide6 的 constBits() 返回 memoryview，可以直接按字节切片。
+            # **必须先 cast("B")** —— 默认视图的元素是 4 字节 C 结构体，
+            # 按字节切会得到错误的元素数。
+            mv = img.constBits()
+            if isinstance(mv, (bytes, bytearray)):
+                mv = memoryview(mv)
+            elif getattr(mv, "itemsize", 1) != 1:
+                mv = mv.cast("B")
+
+            stride = img.bytesPerLine()      # 不一定等于 w*4（行可能对齐填充）
             data = b"".join(
-                raw[y * stride + x0 * 4: y * stride + (x0 + span) * 4]
+                bytes(mv[y * stride + x0 * 4: y * stride + (x0 + span) * 4])
                 for y in range(rows))
 
             rgb = dwm.dominant_color(data, span, rows)
