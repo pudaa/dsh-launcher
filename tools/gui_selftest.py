@@ -79,9 +79,9 @@ def feedback_checks(win) -> list[str]:
     failures: list[str] = []
     seen: list[tuple[str, str]] = []
 
-    win._info = lambda t: seen.append(("info", t))
-    win._warn = lambda t: seen.append(("warn", t))
-    win._show_update_dialog = lambda t: seen.append(("dialog", t))
+    win._info = lambda t, *a, **k: seen.append(("info", t))
+    win._warn = lambda t, *a, **k: seen.append(("warn", t))
+    win._show_update_dialog = lambda t, *a, **k: seen.append(("dialog", t))
 
     no_update = updater.UpdateInfo(
         current="0.1.5-rc.2", stable="0.1.5-rc.2", alpha="0.1.6-alpha.2",
@@ -153,6 +153,133 @@ def update_dialog_copy_checks() -> list[str]:
     return failures
 
 
+def menu_structure_checks(win) -> list[str]:
+    """回归：托盘菜单的分组与语义（2026-09-20 重构）。
+
+    重构要解决的问题：
+      1. 「停止后台服务」与「退出」语义不同但用户意图相同 —— 只留「退出」
+      2. DSH 更新与桌面壳更新混在一起 —— 必须能一眼分辨换的是哪一个
+
+    这几条断言是防止将来又退回去。
+    """
+    failures: list[str] = []
+    texts = [a.text() for a in win.tray.contextMenu().actions() if not a.isSeparator()]
+
+    # 1. 「停止后台服务」不应再作为独立菜单项存在
+    ok = not any("停止后台服务" == t for t in texts)
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 不再有独立的「停止后台服务」菜单项")
+    if not ok:
+        failures.append("残留停止服务菜单项")
+
+    # 2. DSH 更新与桌面壳更新必须分别有明确标识
+    ok = any("DSH" in t and "更新" in t for t in texts) and \
+        any(("桌面壳" in t or "Launcher" in t) and "更新" in t for t in texts)
+    print(f"  [{'OK  ' if ok else 'FAIL'}] DSH 更新与桌面壳更新分开呈现")
+    if not ok:
+        failures.append("两类更新未区分")
+        print("        实际菜单:", texts)
+
+    # 3. 「退出」必须存在且是退出语义
+    ok = any(t == "退出" for t in texts)
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 保留「退出」入口")
+    if not ok:
+        failures.append("缺少退出入口")
+
+    # 4. 关于项存在（版本信息有地方可查）
+    ok = any("关于" in t for t in texts)
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 提供关于/版本信息入口")
+    if not ok:
+        failures.append("缺少关于入口")
+
+    # 5. 退出时确实会停服务（不再有菜单项，但行为必须还在）
+    stopped = []
+    win._stop_service = lambda *a, **k: (stopped.append("stop"), 1)[1]
+    win.tray.hide = lambda *a, **k: None
+    real_quit = g.QApplication.quit
+    g.QApplication.quit = lambda *a, **k: stopped.append("quit")
+    try:
+        win._quit()
+    finally:
+        g.QApplication.quit = real_quit
+    ok = "stop" in stopped and "quit" in stopped
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 退出时会连带停止后台服务")
+    if not ok:
+        failures.append("退出未停服务")
+    return failures
+
+
+def host_update_checks() -> list[str]:
+    """桌面壳自更新的纯逻辑校验（不联网、不下载）。"""
+    from dsh_host import selfupdate as su
+    from dsh_host.version import HOST_VERSION, is_newer
+    failures: list[str] = []
+
+    # 1. 版本比较
+    cases = [
+        ("2.0.1", "2.0.0", True),
+        ("2.0.0", "2.0.1", False),
+        ("2.1.0", "2.0.9", True),
+        ("2.0.0", "2.0.0", False),
+    ]
+    bad = [f"{a}>{b}" for a, b, exp in cases if is_newer(a, b) != exp]
+    print(f"  [{'OK  ' if not bad else 'FAIL'}] 版本比较逻辑正确")
+    if bad:
+        failures.append("版本比较")
+        print("        异常用例:", bad)
+
+    # 2. 源码运行时不支持自更新（避免替换掉开发的 py 文件）
+    supported, reason = su.self_update_supported()
+    ok = (supported is False) and bool(reason)
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 源码运行时禁用自更新并给出原因")
+    if not ok:
+        failures.append("源码运行未禁用自更新")
+
+    # 3. 生成的替换脚本关键要素齐全
+    script = su.build_apply_script(r"C:\apps\DSH-Web.exe", r"C:\tmp\new.exe", 1234)
+    must = [
+        ("反斜杠路径", r"C:\apps\DSH-Web.exe"),
+        ("等待进程", "PID eq %PID%"),
+        ("同目录重命名而非复制", "move /y"),
+        ("失败回滚", "回滚"),
+        ("自删除在最后", 'del "%~f0"'),
+    ]
+    missing = [name for name, frag in must if frag not in script]
+    print(f"  [{'OK  ' if not missing else 'FAIL'}] 替换脚本要素齐全")
+    if missing:
+        failures.append("替换脚本要素")
+        print("        缺失:", missing)
+
+    # 4. 自删除不能出现在中间（否则 cmd 读不到后续行）
+    idx = script.find('del "%~f0"')
+    tail = script[idx:]
+    ok = idx > 0 and "\n" not in tail.split("\n", 1)[1].replace("exit /b 0", "").strip()
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 自删除位于脚本末尾（cmd 逐行读取的约束）")
+    if not ok:
+        failures.append("自删除位置")
+        print("        del 之后仍有可执行行:", repr(tail[:120]))
+
+    # 5. 正斜杠路径必须被规范化掉（move 对正斜杠会静默失败）
+    ok = "/" not in script.split("setlocal")[1].split("\n")[2]
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 路径已规范化为反斜杠")
+    if not ok:
+        failures.append("路径未规范化")
+
+    # 6. PID 为 0 时不生成等待循环
+    s0 = su.build_apply_script(r"C:\a\b.exe", r"C:\t\n.exe", 0)
+    ok = "waitloop" not in s0
+    print(f"  [{'OK  ' if ok else 'FAIL'}] PID 无效时不生成等待循环")
+    if not ok:
+        failures.append("PID=0 仍生成等待循环")
+
+    # 7. 下载体积下限能拦住错误页
+    ok = su.MIN_EXE_BYTES >= 1024 * 1024
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 有下载体积下限校验")
+    if not ok:
+        failures.append("缺少体积校验")
+
+    return failures
+
+
 def main() -> int:
     app = QApplication([])
 
@@ -164,11 +291,19 @@ def main() -> int:
     state["dialog_copy_failures"] = update_dialog_copy_checks()
     print()
 
+    print("== 桌面壳自更新（纯逻辑，不联网）==")
+    state["host_update_failures"] = host_update_checks()
+    print()
+
     win = g.MainWindow()
     win.show()
 
     print("== 手动「检查更新」的反馈路径 ==")
     state["feedback_failures"] = feedback_checks(win)
+    print()
+
+    print("== 托盘菜单结构与语义 ==")
+    state["menu_failures"] = menu_structure_checks(win)
     print()
 
     win.starter.progress.connect(lambda s: print("  progress:", s))
@@ -200,7 +335,8 @@ def main() -> int:
     app.exec()
 
     bad = (state.get("onboarding_failures") or state.get("feedback_failures")
-           or state.get("dialog_copy_failures"))
+           or state.get("dialog_copy_failures") or state.get("host_update_failures")
+           or state.get("menu_failures"))
     if "handle" in state and not bad:
         print("\nGUI 冒烟测试通过")
         return 0

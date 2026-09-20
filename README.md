@@ -24,8 +24,33 @@ DSH 官方只发 CLI。要用 Web UI 得自己开终端跑 `dsh web`，从输出
 | 环境自检 | 启动前诊断 Node / npm / DSH 三行状态 |
 | 首次运行引导 | 缺 Node 走 winget 官方渠道安装；DSH 装到私有 prefix，不动全局环境 |
 | DSH 更新 | 走官方 npm 通道，支持 latest / alpha 双通道与一键回归 |
+| 桌面壳更新 | 从 GitHub Release 拉取新版本，自动替换自身并重启 |
 | 数据安全 | 更新前后统计 DSH_HOME 指纹，记录异常减少 |
 | 应用内反馈 | 手动操作的结果都落在窗口里，不依赖系统通知 |
+
+### 托盘菜单
+
+```
+显示主窗口
+准备运行环境…
+────────────────
+检查 DSH 更新…
+加入预览计划
+回归稳定版
+回滚 DSH 到上一版本
+────────────────
+检查桌面壳更新…
+关于 DSH Launcher
+────────────────
+打开日志目录
+退出
+```
+
+两组更新刻意分开：**DSH 更新**换的是 DSH 程序（走 npm），
+**桌面壳更新**换的是正在运行的 exe（走 GitHub Release）。
+两者可以独立进行，互不影响。
+
+「退出」会连带停止后台服务 —— 想留服务的话，把窗口关掉（最小化到托盘）而不是退出。
 
 ## 快速开始
 
@@ -57,6 +82,21 @@ python -m nuitka --onefile \
 
 > 打包解释器建议用 python.org 的独立环境。conda 系环境会让 Nuitka 报 `flavor 'Anaconda Python'`，其 PySide6 插件枚举 conda 元数据时会 `KeyError: 'files'` 直接崩。
 
+### 发布
+
+版本号只在 `dsh_host/version.py` 里定义一次。改完提交，打 tag 即可：
+
+```bash
+# 1. 改 dsh_host/version.py 里的 HOST_VERSION
+# 2. 提交并打 tag
+git commit -am "release: v2.0.1"
+git tag v2.0.1
+git push origin main v2.0.1
+```
+
+GitHub Actions 会自动跑自测、构建 exe、创建 Release。
+工作流会校验 tag 与源码版本号一致，不一致直接失败。
+
 ## 架构
 
 分三层，越往下越了解 DSH 的内部细节。上层不许越过下层直接和 DSH 打交道。
@@ -70,6 +110,7 @@ python -m nuitka --onefile \
                    │ 只调 dsh_host 的公开函数
 ┌──────────────────▼──────────────────────────┐
 │  L2  dsh_host/updater.py     DSH 更新事务    │
+│      dsh_host/selfupdate.py  桌面壳自更新    │
 │      dsh_host/provision.py   环境供给        │
 └──────────────────┬──────────────────────────┘
                    │
@@ -83,6 +124,7 @@ python -m nuitka --onefile \
 │      启动 / 就绪探测 / URL 解析 / 停止        │
 │      环境自检 / 数据指纹                      │
 │  dsh_host/config.py          路径定义  ★唯一  │
+│  dsh_host/version.py         版本定义  ★唯一  │
 └─────────────────────────────────────────────┘
 ```
 
@@ -93,9 +135,11 @@ python -m nuitka --onefile \
 | 文件 | 职责 |
 |---|---|
 | `dsh_host/config.py` | **所有路径的唯一权威定义处**。其余模块 import，禁止自行拼 `LOCALAPPDATA` |
+| `dsh_host/version.py` | **桌面壳版本号的唯一定义处**。发布脚本与界面都从这里读 |
 | `dsh_host/contract.py` | L0 契约层。DSH 安装探测、服务启动、就绪等待、URL 解析、环境自检、数据指纹 |
 | `dsh_host/compat.py` | L1 版本适配表。按 `major.minor.patch` 代数比较（DSH 所有 release 都是预发布，严格 semver 序会匹配不到） |
 | `dsh_host/updater.py` | L2 DSH 更新事务。停服 → 取指纹 → 安装 → 校验 → 比对指纹 → 重启，失败自动回滚 |
+| `dsh_host/selfupdate.py` | L2 桌面壳自更新。从 GitHub Release 下载、校验、生成替换脚本 |
 | `dsh_host/provision.py` | L2 首次运行环境供给。winget 装 Node、私有 prefix 装 DSH |
 | `dsh_gui_qt.py` | 界面层。PySide6 + QtWebEngine |
 

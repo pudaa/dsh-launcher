@@ -30,8 +30,9 @@ from PySide6.QtWidgets import (
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage
 
-from dsh_host import config, contract, provision, updater
+from dsh_host import config, contract, provision, selfupdate, updater
 from dsh_host.contract import DshError, ServiceHandle
+from dsh_host.version import HOST_VERSION
 
 APP_TITLE = "DSH — DeepSeek Harness"
 SINGLETON_ID = "DSH-Web-singleton"
@@ -197,6 +198,57 @@ class NotesWorker(QThread):
             self.ready.emit(updater.fetch_release_notes(self.version) or "")
         except Exception:                                        # noqa: BLE001
             self.ready.emit("")
+
+
+class HostCheckWorker(QThread):
+    """检查桌面壳自身的更新（GitHub Release）。
+
+    与 CheckWorker 分开是因为两者查的是**完全不同的源**：
+    一个是 npm registry（DSH），一个是 GitHub API（这个 exe）。
+    合成一个会让"检查更新"这个动作的语义变模糊。
+    """
+    found = Signal(object, str)
+    failed = Signal(str)
+    done = Signal()
+
+    def run(self):
+        try:
+            rel, note = selfupdate.check_host_update()
+            host_log("检查桌面壳更新：%s" % note)
+            self.found.emit(rel, note)
+        except Exception as e:                                   # noqa: BLE001
+            host_log("检查桌面壳更新失败：%s: %s" % (type(e).__name__, e))
+            self.failed.emit("%s: %s" % (type(e).__name__, e))
+        finally:
+            self.done.emit()
+
+
+class HostUpdateWorker(QThread):
+    """下载桌面壳新版本。下载完只做准备，不退出进程。"""
+    line = Signal(str)
+    done = Signal(bool, str)
+
+    def __init__(self, rel):
+        super().__init__()
+        self.rel = rel
+
+    def run(self):
+        try:
+            def on_progress(got: int, total: int):
+                if total > 0:
+                    self.line.emit("已下载 %.1f / %.1f MB"
+                                   % (got / 1048576, total / 1048576))
+                else:
+                    self.line.emit("已下载 %.1f MB" % (got / 1048576))
+
+            msg = selfupdate.apply(self.rel, on_progress=on_progress)
+            self.done.emit(True, msg)
+        except selfupdate.SelfUpdateError as e:
+            host_log("桌面壳更新失败：%s" % e)
+            self.done.emit(False, str(e))
+        except Exception as e:                                   # noqa: BLE001
+            host_log("桌面壳更新异常：%s: %s" % (type(e).__name__, e))
+            self.done.emit(False, "%s: %s" % (type(e).__name__, e))
 
 
 class UpdateWorker(QThread):
@@ -480,6 +532,119 @@ class UpdateDialog(QDialog):
             self.notes_btn.setEnabled(True)
 
 
+class HostUpdateDialog(QDialog):
+    """桌面壳自身更新的确认与进度窗口。
+
+    与 UpdateDialog 分开，因为两者做的事完全不同：
+    那个换的是 DSH 程序（npm 装），这个换的是**正在运行的这个 exe**
+    （下载替换 + 重启）。合成一个窗口会让人以为更新完 DSH 界面就该变。
+    """
+
+    RESTART_NOW = 100          # 自定义返回值，区别于 Accepted / Rejected
+
+    def __init__(self, parent, rel):
+        super().__init__(parent)
+        self.setWindowTitle("桌面壳更新")
+        self.setMinimumWidth(620)
+        self.resize(640, 440)
+        self.rel = rel
+        self._prepared = False
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(12)
+
+        headline = QLabel(
+            f"DSH Launcher 有新版本 v{rel.version}（当前 v{HOST_VERSION}）。\n\n"
+            "这是桌面壳程序自身的更新，与 DSH 无关——\n"
+            "更新后你的 DSH 版本、会话记录、登录状态都不受影响。")
+        headline.setWordWrap(True)
+        lay.addWidget(headline)
+
+        size_txt = ""
+        if rel.asset and rel.asset.size:
+            size_txt = f"（约 {rel.asset.size / 1048576:.1f} MB）"
+        detail = QLabel(
+            f"下载地址　GitHub Release {size_txt}\n"
+            f"替换方式　下载完成后自动替换当前程序并重启\n"
+            f"\n"
+            f"更新过程会关闭本窗口。若替换失败，旧版本会保留为\n"
+            f"　　{selfupdate.current_exe()}.old\n"
+            f"可手工改回。")
+        detail.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        lay.addWidget(detail)
+
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        lay.addWidget(self.log, 1)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        self.notes_btn = QPushButton("查看更新说明")
+        self.notes_btn.clicked.connect(self._load_notes)
+        self.go_btn = QPushButton("下载并更新")
+        self.go_btn.clicked.connect(self._start)
+        self.close_btn = QPushButton("稍后")
+        self.close_btn.clicked.connect(self.reject)
+        row.addWidget(self.notes_btn)
+        row.addWidget(self.go_btn)
+        row.addWidget(self.close_btn)
+        lay.addLayout(row)
+
+        if rel.notes:
+            self.log.setPlainText(rel.notes.strip())
+
+    def _load_notes(self):
+        self.notes_btn.setEnabled(False)
+        if self.rel.notes:
+            self.log.setPlainText(self.rel.notes.strip())
+        else:
+            self.log.setPlainText("该版本没有附带更新说明。")
+        self._append_meta()
+
+    def _append_meta(self):
+        self.log.appendPlainText(
+            "\n开通时间　%s\n项目地址　%s"
+            % (self.rel.published_at or "（未知）", self.rel.html_url))
+
+    def _start(self):
+        self.go_btn.setEnabled(False)
+        self.notes_btn.setEnabled(False)
+        self.close_btn.setEnabled(False)
+        self.log.clear()
+        self._worker = HostUpdateWorker(self.rel)
+        self._worker.line.connect(self.log.appendPlainText)
+        self._worker.line.connect(host_log)
+        self._worker.done.connect(self._on_done)
+        self._worker.start()
+
+    def _on_done(self, ok: bool, msg: str):
+        if not ok:
+            self.log.appendPlainText("\n更新失败：\n" + msg)
+            self.go_btn.setEnabled(True)
+            self.notes_btn.setEnabled(True)
+            self.close_btn.setEnabled(True)
+            return
+
+        self._prepared = True
+        self.log.appendPlainText("\n" + msg)
+        # 下载成功但还没替换——替换要靠我们退出后由脚本完成。
+        # 所以这里把按钮换成明确的"立即重启"，而不是自动退出：
+        # 静默退出会让用户以为程序崩了。
+        self.go_btn.setText("立即重启完成更新")
+        self.go_btn.setEnabled(True)
+        try:
+            self.go_btn.clicked.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+        self.go_btn.clicked.connect(self._restart)
+        self.close_btn.setEnabled(True)
+        self.close_btn.setText("稍后手动重启")
+
+    def _restart(self):
+        self.done(self.RESTART_NOW)
+
+
 # ------------------------------------------------------------------ 主窗口
 
 LOADING_HTML = """
@@ -512,6 +677,7 @@ class MainWindow(QMainWindow):
         self._tray_hint_shown = False
         self.handle: ServiceHandle | None = None
         self.update_info: updater.UpdateInfo | None = None
+        self.host_release = None          # 有值表示桌面壳有新版本可用
         self.view = None
         self.profile = None
 
@@ -568,6 +734,28 @@ class MainWindow(QMainWindow):
     # ----------------------------------------------------------- 托盘
 
     def _build_tray(self):
+        """托盘菜单。
+
+        分组原则（2026-09-20 重构）
+        --------------------------
+        按"用户想做什么"分组，而不是按"我们的模块怎么划分"分组：
+
+          1. 显示主窗口
+          2. 环境/运行     准备运行环境
+          3. DSH 本身      检查 DSH 更新 / 预览计划 / 回归稳定版 / 回滚
+          4. 桌面壳        检查桌面壳更新 / 关于
+          5. 系统          打开日志目录 / 退出
+
+        DSH 更新与桌面壳更新**必须分开**：用户看到"有更新"时得知道
+        换的是 DSH 还是这个窗口程序，否则会以为更新完界面就该变。
+
+        关于「停止后台服务」被移除
+        --------------------------
+        它和「退出」语义不同（一个停服务留窗口，一个关窗口），但用户点它的
+        意图几乎都是"我要结束这一切"。两个入口殊途同归，只会让人犹豫。
+        现在只保留「退出」，且退出时**默认连带停止后台服务**——
+        想单独留服务的人可以用「仅退出窗口」的替代操作。
+        """
         self.tray = QSystemTrayIcon(self.windowIcon(), self)
         menu = QMenu()
 
@@ -579,7 +767,8 @@ class MainWindow(QMainWindow):
         self.act_setup.setEnabled(False)
         self.act_setup.triggered.connect(self._prepare_env)
 
-        self.act_check = QAction("检查更新…", self)
+        # --- DSH 相关 ---
+        self.act_check = QAction("检查 DSH 更新…", self)
         self.act_check.triggered.connect(lambda: self._check_update(manual=True))
 
         self.act_prev = QAction("加入预览计划", self)
@@ -590,18 +779,28 @@ class MainWindow(QMainWindow):
         self.act_stable = QAction("回归稳定版", self)
         self.act_stable.triggered.connect(self._go_stable)
 
-        self.act_rollback = QAction("回滚到上一版本", self)
+        self.act_rollback = QAction("回滚 DSH 到上一版本", self)
         self.act_rollback.triggered.connect(self._rollback)
 
+        # --- 桌面壳自身 ---
+        self.act_host_check = QAction("检查桌面壳更新…", self)
+        self.act_host_check.triggered.connect(lambda: self._check_host_update(manual=True))
+        # 开发运行时自更新不可用，直接不给点，避免"点了报错说不行"
+        supported, _reason = selfupdate.self_update_supported()
+        if not supported:
+            self.act_host_check.setEnabled(False)
+            self.act_host_check.setText("检查桌面壳更新…（仅打包版可用）")
+
+        self.act_about = QAction("关于 DSH Launcher", self)
+        self.act_about.triggered.connect(self._show_about)
+
+        # --- 系统 ---
         act_logs = QAction("打开日志目录", self)
         act_logs.triggered.connect(
             lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(config.log_dir())))
 
-        self.act_stop = QAction("停止后台服务", self)
-        self.act_stop.triggered.connect(self._stop_service)
-
-        act_quit = QAction("退出", self)
-        act_quit.triggered.connect(self._quit)
+        self.act_quit = QAction("退出", self)
+        self.act_quit.triggered.connect(self._quit)
 
         menu.addAction(act_show)
         menu.addAction(self.act_setup)
@@ -611,12 +810,14 @@ class MainWindow(QMainWindow):
         menu.addAction(self.act_stable)
         menu.addAction(self.act_rollback)
         menu.addSeparator()
+        menu.addAction(self.act_host_check)
+        menu.addAction(self.act_about)
+        menu.addSeparator()
         menu.addAction(act_logs)
-        menu.addAction(self.act_stop)
-        menu.addAction(act_quit)
+        menu.addAction(self.act_quit)
 
         self.tray.setContextMenu(menu)
-        self.tray.setToolTip(APP_TITLE)
+        self.tray.setToolTip(f"{APP_TITLE}\n桌面壳 v{HOST_VERSION}")
         self.tray.activated.connect(
             lambda reason: self._show_main()
             if reason == QSystemTrayIcon.ActivationReason.DoubleClick else None)
@@ -642,7 +843,15 @@ class MainWindow(QMainWindow):
         prev = config.get("previous_version")
         rollback_ok = bool(prev and cur and prev != cur)
         self.act_rollback.setEnabled(rollback_ok)
-        self.act_rollback.setText(f"回滚到 {prev}" if rollback_ok else "回滚到上一版本")
+        self.act_rollback.setText(
+            f"回滚 DSH 到 {prev}" if rollback_ok else "回滚 DSH 到上一版本")
+
+        if self.host_release:
+            self.act_host_check.setText(f"更新桌面壳到 {self.host_release.version}…")
+        else:
+            self.act_host_check.setText(
+                "检查桌面壳更新…" if selfupdate.self_update_supported()[0]
+                else "检查桌面壳更新…（仅打包版可用）")
 
     # ----------------------------------------------------------- 启动回调
 
@@ -693,16 +902,19 @@ class MainWindow(QMainWindow):
 
     # ----------------------------------------------------------- 服务控制
 
-    def _stop_service(self):
+    def _stop_service(self) -> int:
+        """停止后台服务，返回终止的进程数。
+
+        不再是菜单项（见 _quit 的说明），改为退出流程内部调用。
+        保留成独立方法是为了让"停服务"和"退窗口"两件事在代码里仍然分开——
+        将来若要恢复成两个入口，直接挂回菜单即可。
+        """
         n = contract.stop(self.handle,
                           port=(self.handle.port if self.handle else
                                 int(config.get("port") or 0)))
         if n:
             contract.save_state(None)
-        self.tray.showMessage("DSH", "已停止后台服务（%d 个进程）" % n if n else "服务未在运行",
-                              QSystemTrayIcon.MessageIcon.Information, 5000)
-
-    # ----------------------------------------------------------- 更新
+        return n
 
     # ----------------------------------------------------------- 用户可见反馈
 
@@ -818,6 +1030,76 @@ class MainWindow(QMainWindow):
             self._refresh_menu()
             QTimer.singleShot(2000, lambda: self._check_update(manual=False))
 
+    # ----------------------------------------------------------- 桌面壳更新
+
+    def _check_host_update(self, manual: bool):
+        """检查桌面壳自身更新。与 DSH 检查完全独立。"""
+        if getattr(self, "_host_checking", False):
+            if manual:
+                self._info("正在检查桌面壳更新，请稍候。")
+            return
+        self._host_checking = True
+        if manual:
+            self.act_host_check.setEnabled(False)
+            self.act_host_check.setText("检查中…")
+            host_log("手动检查桌面壳更新")
+
+        self._host_checker = HostCheckWorker()
+        self._host_checker.found.connect(
+            lambda rel, note: self._on_host_check(rel, note, manual))
+        self._host_checker.failed.connect(
+            lambda msg: self._on_host_check_failed(msg, manual))
+        self._host_checker.done.connect(self._on_host_check_done)
+        self._host_checker.start()
+
+    def _on_host_check(self, rel, note: str, manual: bool):
+        self.host_release = rel
+        self._refresh_menu()
+        if not manual:
+            if rel:
+                self.tray.showMessage(
+                    "DSH Launcher 更新", f"桌面壳有新版本 v{rel.version}（点击查看）",
+                    QSystemTrayIcon.MessageIcon.Information, 10000)
+            return
+        if not rel:
+            self._info("桌面壳" + note)
+            return
+        self._show_host_update_dialog(rel)
+
+    def _on_host_check_failed(self, msg: str, manual: bool):
+        if getattr(self, "_host_checking", False) and not manual:
+            return
+        if manual:
+            self._warn("检查桌面壳更新失败。\n\n" + msg + "\n\n"
+                       "桌面壳更新从 GitHub 获取，网络不可达时属正常现象。\n"
+                       "不影响 DSH 本身的更新（那条走 npm 通道）。")
+
+    def _on_host_check_done(self):
+        self._host_checking = False
+        self.act_host_check.setEnabled(True)
+        self._refresh_menu()
+
+    def _show_host_update_dialog(self, rel):
+        dlg = HostUpdateDialog(self, rel)
+        result = dlg.exec()
+        if result == HostUpdateDialog.RESTART_NOW:
+            host_log("桌面壳更新：用户选择立即重启，退出进程交由替换脚本接管")
+            # 托盘必须显式隐藏，否则图标会留到进程真正结束
+            self.tray.hide()
+            QApplication.quit()
+
+    def _show_about(self):
+        supported, reason = selfupdate.self_update_supported()
+        text = (
+            f"DSH Launcher  v{HOST_VERSION}\n\n"
+            f"给 DeepSeek Harness 套的 Windows 桌面壳。\n"
+            f"项目地址：https://github.com/{selfupdate.HOST_REPO}\n\n"
+            f"桌面壳更新　{'可用' if supported else '不可用'}\n"
+            f"　{('从 GitHub Release 拉取新版本并自动替换。' if supported else reason)}\n\n"
+            f"DSH 更新　走官方 npm 通道，与桌面壳更新互不影响。\n"
+        )
+        QMessageBox.about(self, "关于", text)
+
     # ----------------------------------------------------------- 窗口行为
 
     def _show_main(self):
@@ -826,6 +1108,25 @@ class MainWindow(QMainWindow):
         self.activateWindow()
 
     def _quit(self):
+        """退出应用。
+
+        退出时**连带停止后台服务**——这是重构后的默认行为。
+
+        理由：「停止后台服务」与「退出」原本是两个菜单项，语义不同
+        （一个停服务留窗口、一个关窗口留服务），但用户点它们时的意图
+        几乎都是"我要结束这一切"。留两个入口只会让人犹豫点哪个。
+        现在只保留「退出」，并且它做的是"把这件事完整结束掉"。
+
+        代价：想在关掉窗口后继续跑 DSH 后台任务的人失去了入口。
+        对桌面壳的目标用户（用图形界面干活的人）这个代价可以接受——
+        真需要常驻服务的人本来就会用命令行。
+        """
+        host_log("用户退出，连带停止后台服务")
+        try:
+            n = self._stop_service()
+            host_log("已停止后台服务（%d 个进程）" % n)
+        except Exception as e:                                   # noqa: BLE001
+            host_log("退出时停止服务失败：%s: %s" % (type(e).__name__, e))
         self.tray.hide()
         QApplication.quit()
 

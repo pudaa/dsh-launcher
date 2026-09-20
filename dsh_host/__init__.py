@@ -11,4 +11,6 @@
 L0 之上的一切代码都不应该再出现 DSH 的私有路径、私有文件名、私有日志格式。
 """
 
-HOST_VERSION = "2.0.0"
+from .version import HOST_VERSION, HOST_REPO, version_tuple
+
+__all__ = ["HOST_VERSION", "HOST_REPO", "version_tuple"]

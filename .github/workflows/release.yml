@@ -1,0 +1,107 @@
+name: 构建并发布
+
+# 触发方式：
+#   1. 推送 v* 标签（如 v2.0.0）→ 自动构建 exe 并创建 Release
+#   2. 手动触发 → 只构建，产物作为 workflow artifact 供下载（不建 Release）
+#
+# 为什么用 windows-latest：
+#   Nuitka 是原生编译，无法交叉编译到 Windows；且服务生命周期管理
+#   依赖 Windows API（DETACHED_PROCESS / winget / 注册表）。
+#
+# 为什么用 python.org 的解释器：
+#   conda 环境会让 Nuitka 报 flavor 'Anaconda Python'，
+#   其 PySide6 插件枚举 conda 元数据时会 KeyError: 'files' 直接崩。
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write          # 创建 Release 需要
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install PySide6==6.9.3
+          pip install nuitka==4.2.1
+
+      - name: 校验 tag 与源码里的版本号一致
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          SRC=$(python -c "from dsh_host.version import HOST_VERSION; print(HOST_VERSION)")
+          echo "tag=$TAG  源码=$SRC"
+          if [ "$TAG" != "$SRC" ]; then
+            echo "::error::tag ($TAG) 与 dsh_host/version.py 的 HOST_VERSION ($SRC) 不一致"
+            exit 1
+          fi
+
+      - name: 契约层自测
+        run: python tools/contract_selftest.py
+
+      - name: GUI 自测（无头）
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python tools/gui_selftest.py
+
+      - name: 打包
+        shell: bash
+        run: |
+          python -m nuitka --onefile \
+            --windows-console-mode=disable \
+            --windows-icon-from-ico=assets/icon.ico \
+            --enable-plugin=pyside6 \
+            --include-package=dsh_host \
+            --onefile-tempdir-spec={CACHE_DIR}/DSH-Web-runtime \
+            --output-dir=build \
+            --output-filename=DSH-Web.exe \
+            --lto=yes \
+            --assume-yes-for-downloads \
+            dsh_gui_qt.py
+
+      - name: 确认产物存在
+        shell: bash
+        run: |
+          ls -la build/DSH-Web.exe
+          SIZE=$(stat -c%s build/DSH-Web.exe)
+          echo "产物大小: $SIZE 字节"
+          # 太小说明构建有问题，别把坏文件发出去
+          if [ "$SIZE" -lt 20000000 ]; then
+            echo "::error::产物只有 $SIZE 字节，明显不完整"
+            exit 1
+          fi
+
+      - name: 上传为构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: DSH-Web
+          path: build/DSH-Web.exe
+          retention-days: 30
+
+      - name: 创建 Release 并附带 exe
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/DSH-Web.exe
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

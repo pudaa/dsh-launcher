@@ -1,22 +1,34 @@
 # DSH 桌面壳设计说明
 
 面向"DSH 处于 developer preview、每代都可能破坏兼容"这一前提做的适配层改造。
-最后更新：2026-09-18
+最后更新：2026-09-20
 
 ---
 
 ## 1. 分层职责
 
 ```
-L2  dsh_host/updater.py    更新器      只走官方 npm 通道
-    dsh_host/provision.py  环境供给    首次运行补齐 Node 与 DSH
-L1  dsh_host/compat.py     适配表      版本区间 → 探测顺序与降级策略（数据）
-L0  dsh_host/contract.py   契约层      唯一允许知道 DSH 内部结构的地方
-    dsh_gui_qt.py          界面        只做界面 + 流程编排
+L2  dsh_host/updater.py    更新器    DSH 更新，只走官方 npm 通道
+    dsh_host/provision.py  环境供给  首次运行补齐 Node 与 DSH
+    dsh_host/selfupdate.py 自更新    桌面壳自身更新，走 GitHub Release
+L1  dsh_host/compat.py     适配表   版本区间 → 探测顺序与降级策略（数据）
+L0  dsh_host/contract.py   契约层   唯一允许知道 DSH 内部结构的地方
+    dsh_host/config.py     路径     所有路径的唯一权威定义处
+    dsh_host/version.py    版本     桌面壳版本号，只定义一次
+    dsh_gui_qt.py          界面     只做界面 + 流程编排
 ```
 
 **铁律：L0 以上的代码不得出现 DSH 的私有路径、私有文件名、私有日志格式。**
 新增功能时如果发现需要知道 DSH 内部细节，那说明该加一个契约能力，而不是在界面里写 `if`。
+
+**两个版本号相互独立**：
+
+| | 版本号 | 更新源 | 换掉的是什么 |
+|---|---|---|---|
+| DSH | 如 `0.1.6-alpha.2` | npm registry | `%LOCALAPPDATA%\DSH-Web\node-global\` 里的程序 |
+| 桌面壳 | `HOST_VERSION`，如 `2.0.0` | GitHub Release | **正在运行的这个 exe** |
+
+界面上必须分开呈现。合成一个"检查更新"会让用户以为更新完界面就该变。
 
 ---
 
@@ -211,6 +223,54 @@ L0  dsh_host/contract.py   契约层      唯一允许知道 DSH 内部结构的
 
 ---
 
+## 4.8 桌面壳自更新（2026-09-20 加）
+
+走 GitHub Release，与 DSH 的 npm 通道完全无关。
+
+### 为什么不能直接覆盖自己
+
+Windows 不允许覆盖正在运行的 exe（文件被锁）。标准解法是找一个"局外进程"
+在退出后做替换。这里用 `.bat` 而不是再打包一个 updater.exe：
+
+- 零额外依赖，不用为更新功能再造一个 120MB 的 exe
+- 天然可审计，出问题用户能自己打开 bat 看懂它在干什么
+- 用 `move`（同目录重命名）而非 `copy`，**不需要管理员权限**
+
+流程：下载到临时文件 → 校验 → 写 bat → 用户点「立即重启」→ 进程退出 →
+bat 等待 PID 消失 → `move` 备份旧版 → `move` 放入新版 → 重启 → 自删除。
+
+### bat 的五个坑（都踩过，勿回退）
+
+| # | 坑 | 症状 | 正确做法 |
+|---|---|---|---|
+| 1 | **路径用正斜杠** | `move` 静默失败，文件根本没换，且无任何报错 | `os.path.normpath()` 强制反斜杠。实测 `move C:/x/a.exe` 不工作 |
+| 2 | **`>nul 2>&1` 污染 errorlevel** | `if errorlevel 1` 误判，明明成功也走失败分支 | 只重定向 stdout（`>nul`），让 stderr 原样输出 |
+| 3 | **`del "%~f0"` 放在中间** | 报 `The batch file cannot be found`，后续行全读不到 | 必须放最后，且前面用 `goto fin` 保证一定走到 |
+| 4 | **PID 为 0 时进等待循环** | `tasklist /FI "PID eq 0"` 匹配到系统空闲进程，死等到超时，替换永不发生 | PID 无效时直接跳过等待 |
+| 5 | **`find` 解析到 Git Bash 的版本** | 只在自己机器上复现，正常 cmd 环境无此问题 | 写 `find.exe` |
+
+第 1 条最阴——`move` 失败时不报错、不返回非零之外的信息，表现是"更新流程全跑完了但版本没变"。
+回归断言：`tools/gui_selftest.py` 的 `host_update_checks()` 会检查生成的 bat 里路径全是反斜杠。
+
+### 安全边界
+
+只从**官方 GitHub Release** 拉取，且：
+
+1. 校验 tag 与请求的版本号一致（防止被指向别的 release）
+2. 校验是有效 PE 文件（`MZ` 头）——GitHub 出错时会返回 HTML，这一步能拦住
+3. 体积下限 5MB——错误页 / 空文件不可能通过
+4. 替换前把当前 exe 备份为 `DSH-Web.exe.old`，失败可人工改回
+
+**没有做代码签名校验。** 若将来要对外大规模分发，应加签名（需证书）
+或至少校验 SHA-256（可在 Release 资产里附带校验文件）。
+
+### 数据影响
+
+**零。** 桌面壳更新只替换 exe 本身，不碰 `%LOCALAPPDATA%\DSH-Web\`
+（配置与登录态）也不碰 `DSH_HOME`（会话记录）。这一点写在更新对话框里。
+
+---
+
 ## 5. 遇到破坏性更新怎么处置（实操手册）
 
 假设 0.1.7 改了 URL 输出格式，症状是启动卡在"等待服务就绪"直到超时。
@@ -364,22 +424,20 @@ winget install --id OpenJS.NodeJS.LTS --exact \
 
 ---
 
-## 8. 打包
+## 8. 打包与发布
 
-构建环境刻意复现为 **Python 3.13.9 + PySide6 6.9.2 + Nuitka 4.2.1**，与首次打包一致，
-避免换环境引入无关变量。该环境装在独立 venv 里，用 `--system-site-packages` 继承 anaconda 的
-PySide6，**不污染 anaconda base**：
+### 8.1 本地打包
+
+**构建解释器不能用 conda 系**。用 anaconda（哪怕建 venv + `--system-site-packages`）
+会让 Nuitka 报 `flavor 'Anaconda Python'`，其 PySide6 插件枚举 conda 元数据时
+抛 `KeyError: 'files'` 直接崩。用 python.org 的独立解释器。
+
+实测可用的组合：**Python 3.13.14 + PySide6 6.9.3 + Nuitka 4.2.1**。
 
 ```
-# 一次性准备（已执行）
-D:\DevVmEnv\anaconda3\python.exe -m venv --system-site-packages D:\AppData\dsh-launcher-buildenv
-D:\AppData\dsh-launcher-buildenv\Scripts\python.exe -m pip install --upgrade nuitka
-
-# 打包
-cd D:\PersonApps\dsh-launcher
-D:\AppData\dsh-launcher-buildenv\Scripts\python.exe -m nuitka ^
-  --onefile --windows-console-mode=disable ^
-  --windows-icon-from-ico=D:\PersonApps\dsh-launcher\icon.ico ^
+python -m nuitka --onefile ^
+  --windows-console-mode=disable ^
+  --windows-icon-from-ico=assets/icon.ico ^
   --enable-plugin=pyside6 ^
   --include-package=dsh_host ^
   --onefile-tempdir-spec={CACHE_DIR}/DSH-Web-runtime ^
@@ -390,8 +448,34 @@ D:\AppData\dsh-launcher-buildenv\Scripts\python.exe -m nuitka ^
 > `--include-package=dsh_host` 虽然 Nuitka 通常能自动跟随导入，但显式声明更稳妥——
 > 漏收包的表现是打出来的 exe 运行时 ImportError，很难在打包阶段察觉。
 
-**部署**：产物是单个 120MB 的 `build\DSH-Web.exe`，复制到桌面即可。
-桌面上那个 `DSH-Web.exe` 就是这个 onefile 产物本身，不是快捷方式。
+**`--windows-icon-from-ico` 指向 `assets/icon.ico`**（2026-09-20 从根目录移入 `assets/`）。
+同理界面层读图标的路径也用 `os.path.join(ROOT, "assets", "icon.ico")`。
+
+**构建时不要混入 `rm`**：Nuitka 会产生数千个中间文件，安全删除保护会拦截大批量
+`rm` 且让 `&&` 链整体挂起（表现为卡住不报错）。清理单独执行。
+
+### 8.2 发布流程（推荐走这条）
+
+版本号只在 `dsh_host/version.py` 定义一次：
+
+```
+1. 改 HOST_VERSION（如 2.0.0 → 2.0.1）
+2. git commit && git push
+3. git tag v2.0.1 && git push origin v2.0.1
+4. GitHub Actions 自动构建 → 跑自测 → 创建 Release → 附带 DSH-Web.exe
+```
+
+`.github/workflows/release.yml` 会在构建前**校验 tag 与源码里的版本号一致**，
+不一致直接失败——避免发出去的 exe 自称的版本和 tag 对不上，
+那会让客户端的自更新判断彻底错乱。
+
+工作流还会跑两个自测脚本，任何一个失败都不发布。
+
+手动触发（`workflow_dispatch`）只构建、不建 Release，产物作为 artifact 供下载，
+用来验证构建环境是否正常。
+
+**部署**：Release 附带的 `DSH-Web.exe` 是单个约 120MB 的 onefile 产物，
+复制到桌面即可。桌面上那个 `DSH-Web.exe` 就是这个 onefile 产物本身，不是快捷方式。
 
 ---
 
@@ -400,7 +484,7 @@ D:\AppData\dsh-launcher-buildenv\Scripts\python.exe -m nuitka ^
 | 脚本 | 覆盖范围 | 用哪个解释器 |
 |---|---|---|
 | `tools/contract_selftest.py` | 安装定位、prefix 层级、通道查询、启动/就绪/URL/停止全链路，以及环境自检与探测回归（node 与 bin.js 分离、显式覆盖绕过缓存、私有 prefix 优先级） | 任意 Python 3.10+ |
-| `tools/gui_selftest.py` | MainWindow 启动流程、接管已有服务、WebEngine 懒加载、菜单状态，以及引导窗口三种状态的渲染 | 需 PySide6（无头，`QT_QPA_PLATFORM=offscreen`） |
+| `tools/gui_selftest.py` | MainWindow 启动流程、接管已有服务、WebEngine 懒加载、菜单状态、引导窗口三状态渲染，以及**托盘菜单结构语义**与**桌面壳自更新的纯逻辑校验**（版本比较、bat 生成要素、正斜杠规范化、自删除位置、PID=0 分支） | 需 PySide6（无头，`QT_QPA_PLATFORM=offscreen`） |
 
 两个脚本都用临时 `DSH_HOME`，不会碰正在使用的 `D:\AppData\dsh`。
 **每次 DSH 更新后建议跑一遍 `contract_selftest.py`**，用来第一时间发现破坏性变更落在哪一环。
@@ -409,7 +493,7 @@ D:\AppData\dsh-launcher-buildenv\Scripts\python.exe -m nuitka ^
 
 ## 10. 后续优化方向
 
-### 9.1 冷启动
+### 10.1 冷启动
 
 实测服务就绪约 7-8 秒，其中绝大部分是 DSH 自身的插件加载，我方可控的有三处：
 
@@ -422,13 +506,34 @@ D:\AppData\dsh-launcher-buildenv\Scripts\python.exe -m nuitka ^
 另有一条**依赖上游**的：0.1.6 官方声明"减少 CLI 及 Web 启动等候时间"——
 升级本身就是冷启动优化。
 
-### 9.2 自定义标题栏
+### 10.2 标题栏美化（下一步）
 
-按老大的提醒，自绘标题栏必须尽量走系统接口。两条路线：
+目标：让标题栏与 DSH 的深色 UI 衔接自然，不突兀。**不做完全自绘**——
+自绘要照顾大量细节且实现效果通常更差，系统联动也差。
 
-**路线 A（推荐）：保留原生标题栏，只改配色与材质**
+老大在 wxPython 时期的经验值得借鉴：**在界面内容变化时读取最上方一层像素，
+统计主色调，把标题栏调成该颜色**，实现主题自适应衔接。
 
-用 Win32 DWM 接口，不碰窗口结构：
+按此思路的落地方案：
+
+**第一步：取主色调**
+
+DSH 是网页 UI，取色有两条路：
+
+| 路 | 做法 | 评价 |
+|---|---|---|
+| A | `QWebEngineView.grab()` 截图 → 取顶部若干行像素 → 统计主色 | 简单直接，但 grab 是重操作，不宜频繁 |
+| B | 注入 JS 读 `document.body` 的 computed background | 精确，但依赖 DSH 的 DOM 结构 → **违反分层铁律** |
+
+倾向 A。但要解决"何时取"：网页 `loadFinished` 只是 DOM 就绪，样式可能还没应用。
+可以用 `QTimer` 延迟 + 首次取到色后停止（只在启动时取一次），
+或监听 `QWebEnginePage.renderProcessTerminated` 之类的事件。
+**核心约束：取色逻辑不能猜 DSH 的 DOM，只能基于"渲染出来的像素"。**
+
+**第二步：上色**
+
+用 DWM 接口，不碰窗口结构（详见下表）。取到色后调
+`DwmSetWindowAttribute(DWMWA_CAPTION_COLOR)` 与 `DWMWA_TEXT_COLOR`。
 
 | 接口 | 作用 |
 |---|---|
@@ -439,16 +544,15 @@ D:\AppData\dsh-launcher-buildenv\Scripts\python.exe -m nuitka ^
 | `DWMWA_SYSTEMBACKDROP_TYPE, 38` | Mica / Acrylic 材质 |
 
 拖动、缩放、Aero Snap、Snap Layouts、右键系统菜单、多显示器 DPI **全部由系统维持**，
-零维护成本。DSH 本体是深色 UI，配深色标题栏视觉上已相当接近自绘。
+零维护成本。
 
-**路线 B：真去除系统标题栏（`Qt.FramelessWindowHint`）**
+**第三步：文字色需自适应**
 
-若要完全自绘，拖动与缩放**必须**用 Qt 提供的系统级接口，而不是自己算鼠标位移：
+深色标题栏要配浅色文字，浅色标题栏要配深色文字。判据是取到的主色调亮度
+（`0.299R + 0.587G + 0.114B`），阈值取 128 附近。这一步不能省——
+否则在浅色主题下会出现"白底白字"。
 
-- `QWindow.startSystemMove()` —— 底层走 Win32 `SC_MOVE`，保留全部系统行为
-- `QWindow.startSystemResize(edges)` —— 同理走 `SC_SIZE`
-
-自查清单：最大化是否遮住任务栏、Snap Layouts 悬停菜单是否可用、双击标题栏是否最大化、
-右键标题栏是否弹出系统菜单、跨显示器 DPI 变化是否错位。
-这些细节靠自己实现基本做不干净——这也是路线 A 更划算的原因。
+若要真去除系统标题栏（`Qt.FramelessWindowHint`），拖动与缩放**必须**用
+`QWindow.startSystemMove()` / `startSystemResize(edges)` —— 底层走 Win32
+`SC_MOVE` / `SC_SIZE`，保留全部系统行为，不要自己算鼠标位移。
 
