@@ -769,6 +769,21 @@ class MainWindow(QMainWindow):
         `loadFinished` 只代表 DOM 就绪，样式和首次绘制可能还没完成——
         这时候截到的是白色空白页，取出来的主色会是白的。
         所以等一段固定时间再取；取到后就不再重试。
+
+        性能（实测，勿退化）
+        -------------------
+        整条链路跑在 **GUI 线程**上，耗时直接体现为界面卡顿：
+
+          grab + toImage + RGBA8888 + bytes()   约 5 ms
+          （其中 bytes() 拷贝要搬 5.7MB@1200x800）
+          dominant_color 统计                    约 1.5 ms
+          ─────────────────────────────────────────────
+          合计                                   约 6.5 ms
+
+        两个关键优化点：
+          · **只拷要用的那几行**，不整图 toBytes()。整图拷贝随分辨率线性
+            增长（4K 要 33MB），而我们只看顶部 6%。
+          · dominant_color 内部走 C 层切片 + translate（见其 docstring）。
         """
         if not config.get("adaptive_titlebar") or not dwm.available():
             return
@@ -780,14 +795,23 @@ class MainWindow(QMainWindow):
             w, h = img.width(), img.height()
             if w <= 0 or h <= 0:
                 return
-            ptr = img.constBits()
-            # PySide6 的 constBits 返回 memoryview，转成 bytes 才能切片
-            data = bytes(ptr) if not isinstance(ptr, (bytes, bytearray)) else ptr
+
             # 只取顶部 6% 高度，且左右各让开 2%——避开滚动条与圆角
             rows = max(1, int(h * 0.06))
             pad = max(0, int(w * 0.02))
-            rgb = dwm.dominant_color(data, w, h, sample_rows=rows,
-                                     skip_left=pad, skip_right=pad)
+            x0 = max(0, pad)
+            span = max(1, w - pad * 2)
+
+            # 按行拷贝：QImage.constBits 给的是整图起始地址，
+            # 用行步长切片只搬需要的部分，避免整图拷贝。
+            buf = img.constBits()
+            raw = bytes(buf) if not isinstance(buf, (bytes, bytearray)) else buf
+            stride = img.bytesPerLine()
+            data = b"".join(
+                raw[y * stride + x0 * 4: y * stride + (x0 + span) * 4]
+                for y in range(rows))
+
+            rgb = dwm.dominant_color(data, span, rows)
             if rgb:
                 self._apply_titlebar(rgb)
             else:

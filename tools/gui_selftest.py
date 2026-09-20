@@ -436,6 +436,28 @@ def titlebar_checks() -> list[str]:
     if not ok:
         failures.append("blend clamp")
 
+    # 6b. 性能回归护栏
+    #     取色跑在 GUI 线程上，耗时直接变成界面卡顿。优化前逐像素循环
+    #     约 20ms，现在是 C 层切片 + translate，约 1.5ms。
+    #     阈值故意留得很宽（40ms），只拦"退化回逐像素循环"这种量级的
+    #     问题，不做精确计时断言——CI 机器负载抖动会误报。
+    import time as _t
+    SW2, SH2 = 1152, 48
+    _row = b"".join(
+        bytes((34, 193, 163, 255) if 100 <= x < 220 else (30, 32, 36, 255))
+        for x in range(SW2))
+    _buf = _row * SH2
+    _n = 5
+    _t0 = _t.perf_counter()
+    for _ in range(_n):
+        dwm.dominant_color(_buf, SW2, SH2)
+    _ms = (_t.perf_counter() - _t0) / _n * 1000
+    ok = _ms < 40.0
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 取色性能未退化（{_ms:.2f} ms < 40ms）")
+    if not ok:
+        failures.append("取色性能")
+        print("        疑似退化为逐像素 Python 循环（优化前约 20ms）")
+
     # 7. ctypes 签名必须显式声明
     #    这是踩过的坑：不声明 argtypes 时 HWND 按 C int 封送，
     #    64 位下句柄稍大就传错值。声明是硬要求，不是优化。
