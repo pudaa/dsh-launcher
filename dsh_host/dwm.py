@@ -146,7 +146,14 @@ def luminance(rgb: tuple[int, int, int]) -> float:
 
 
 def is_dark(rgb: tuple[int, int, int], threshold: float = 128.0) -> bool:
-    return luminance(rgb) < threshold
+    """亮度低于阈值算深色。
+
+    加 epsilon 是因为三个系数（0.299/0.587/0.114）浮点表示不精确，
+    它们的和是 0.9999999999999999 而非 1.0 —— 于是正中间的中灰
+    (128,128,128) 算出来是 127.99999999999999，会被误判成深色。
+    这个偏差在阈值附近会翻转结论，所以显式补偿。
+    """
+    return luminance(rgb) < threshold - 1e-6
 
 
 def contrast_text(bg: tuple[int, int, int],

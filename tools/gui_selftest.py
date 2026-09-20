@@ -289,6 +289,76 @@ def host_update_checks() -> list[str]:
     return failures
 
 
+def titlebar_checks() -> list[str]:
+    """标题栏取色与配色的纯逻辑校验（不碰真实窗口）。"""
+    from dsh_host import dwm
+    failures: list[str] = []
+
+    # 1. 主色调统计能扛住边界输入
+    edge = [
+        ("空数据", lambda: dwm.dominant_color(b"", 0, 0)),
+        ("零宽度", lambda: dwm.dominant_color(b"\x00" * 16, 0, 4)),
+        ("全透明", lambda: dwm.dominant_color(bytes([255, 0, 0, 0] * 100), 10, 10)),
+    ]
+    bad = [n for n, fn in edge if fn() is not None]
+    print(f"  [{'OK  ' if not bad else 'FAIL'}] 边界输入不崩且返回 None")
+    if bad:
+        failures.append("取色边界")
+        print("        异常:", bad)
+
+    # 2. 饱和度降权：灰底不能盖过主题色
+    #    一半饱和红 + 一半中灰 → 应识别为红
+    px = bytes([200, 30, 30, 255] * 50) + bytes([128, 128, 128, 255] * 50)
+    got = dwm.dominant_color(px, 10, 10)
+    ok = got is not None and got[0] > got[1] + 40
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 低饱和像素降权（灰底不盖主题色）")
+    if not ok:
+        failures.append("饱和度降权")
+        print("        实际取到:", got)
+
+    # 3. 亮度判据用 BT.601 而非均值（均值会把深蓝判成浅色）
+    #    深蓝 (20,30,50)：均值 33 与加权 29 —— 都算深色，看不出差别。
+    #    用绿色 (0,200,0)：均值 67（判深），加权 117（仍判深）—— 也看不出。
+    #    真正能区分的：亮绿 (0,230,0)。均值 77（判深，错），加权 135（判浅，对）。
+    ok_green = not dwm.is_dark((0, 230, 0))
+    ok_blue = dwm.is_dark((20, 30, 50))
+    ok = ok_green and ok_blue
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 亮度用 BT.601 加权（亮绿判浅、深蓝判深）")
+    if not ok:
+        failures.append("亮度判据")
+        print(f"        (0,230,0) is_dark={dwm.is_dark((0,230,0))} 期望 False；"
+              f"(20,30,50) is_dark={dwm.is_dark((20,30,50))} 期望 True")
+
+    # 4. 阈值边界的浮点精度（系数和不等于 1.0 导致中灰误判）
+    ok = dwm.is_dark((127, 127, 127)) and not dwm.is_dark((128, 128, 128))
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 亮度阈值边界正确（127 深 / 128 浅）")
+    if not ok:
+        failures.append("阈值精度")
+
+    # 5. 文字色必须与底色有对比（不然白底白字）
+    dark_bg = (20, 24, 30)
+    light_bg = (235, 238, 242)
+    fg_d = dwm.contrast_text(dark_bg)
+    fg_l = dwm.contrast_text(light_bg)
+    ok = (dwm.luminance(fg_d) - dwm.luminance(dark_bg) > 100
+          and dwm.luminance(light_bg) - dwm.luminance(fg_l) > 100)
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 文字色与底色对比充足（不会白底白字）")
+    if not ok:
+        failures.append("文字对比度")
+        print(f"        深底 {dark_bg} → 文字 {fg_d}；浅底 {light_bg} → 文字 {fg_l}")
+
+    # 6. blend 越界要被 clamp
+    ok = (dwm.blend((100, 100, 100), (0, 0, 0), 0) == (100, 100, 100)
+          and dwm.blend((100, 100, 100), (0, 0, 0), 1) == (0, 0, 0)
+          and dwm.blend((100, 100, 100), (0, 0, 0), 5) == (0, 0, 0)
+          and dwm.blend((100, 100, 100), (0, 0, 0), -1) == (100, 100, 100))
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 混色比例越界被 clamp")
+    if not ok:
+        failures.append("blend clamp")
+
+    return failures
+
+
 def main() -> int:
     #: CI 里没有装 DSH，起不了真实服务。设此变量只跑不依赖 DSH 的部分
     #: （引导窗口渲染、对话框文案、自更新纯逻辑），
@@ -309,13 +379,17 @@ def main() -> int:
     state["host_update_failures"] = host_update_checks()
     print()
 
+    print("== 标题栏取色与配色（纯逻辑）==")
+    state["titlebar_failures"] = titlebar_checks()
+    print()
+
     if static_only:
         # 菜单结构检查不需要服务在跑——它只读菜单项文本与启用状态。
         # 但 MainWindow 的构造函数会立刻启动服务，所以这里用不启动
         # 服务的方式构造：直接跳过窗口，单独验证菜单定义。
         print("== 静态模式下跳过真实启动链路（未安装 DSH）==")
         bad = (state.get("onboarding_failures") or state.get("dialog_copy_failures")
-               or state.get("host_update_failures"))
+               or state.get("host_update_failures") or state.get("titlebar_failures"))
         if bad:
             print("\n用例失败：", "、".join(bad))
             return 1
@@ -363,7 +437,7 @@ def main() -> int:
 
     bad = (state.get("onboarding_failures") or state.get("feedback_failures")
            or state.get("dialog_copy_failures") or state.get("host_update_failures")
-           or state.get("menu_failures"))
+           or state.get("titlebar_failures") or state.get("menu_failures"))
     if "handle" in state and not bad:
         print("\nGUI 冒烟测试通过")
         return 0
