@@ -614,22 +614,38 @@ ratio = (max(La,Lb) + 0.05) / (min(La,Lb) + 0.05)     # 1.0 ~ 21.0
 | 环节 | 1200x800 | 备注 |
 |---|---|---|
 | `grab + toImage + RGBA8888` | ~4.9 ms | 固定成本，无法再省 |
-| 按行切片拷贝顶部 6% | ~0.04 ms | **整图拷贝要 0.82 ms（5.9MB）** |
+| 切片拷贝顶部 6% | ~0.03 ms | **整图拷贝要 1.0 ms（5.7MB）** |
 | `dominant_color` 统计 | ~1.2 ms | 优化前 19.6 ms |
-| **合计** | **~6.2 ms** | 属于"一次性的轻微停顿" |
+| **合计** | **~6.1 ms** | 属于"一次性的轻微停顿" |
 
 两个优化点（都实测验证过效果）：
 
-**① 只拷要用的那几行，不整图拷贝。**
+**① 用 memoryview 直接切片，绝不整图转 bytes。**
 
 ```python
-stride = img.bytesPerLine()          # 注意：不一定等于 width*4
-data = b"".join(raw[y*stride + x0*4 : y*stride + (x0+span)*4]
+mv = img.constBits()
+if isinstance(mv, (bytes, bytearray)):
+    mv = memoryview(mv)
+elif getattr(mv, "itemsize", 1) != 1:
+    mv = mv.cast("B")            # 默认视图元素是 4 字节结构体，必须 cast
+
+stride = img.bytesPerLine()      # 不一定等于 width*4
+data = b"".join(bytes(mv[y*stride + x0*4 : y*stride + (x0+span)*4])
                 for y in range(rows))
 ```
 
-只拷顶部 6% 而非整图，**拷贝量 5.9MB → 0.34MB（省 95%）**，
-4K 下差距更大（整图 33MB）。结果与整图路径逐位一致。
+只拷顶部 6% 而非整图：
+
+| 做法 | 耗时 | 峰值内存 |
+|---|---|---|
+| `bytes(img.constBits())` 再切 | 1.025 ms | 5.7 MB |
+| memoryview 直接切 | **0.033 ms** | **0.33 MB** |
+
+→ **快 31 倍，峰值内存降 17 倍**，结果逐位一致。4K 下差距更大
+（整图 33MB）。
+
+这一步容易白做：只优化 `dominant_color` 而留着上面那句整图
+`bytes()`，省的量会被整图拷贝完全抵消。
 
 必须用 `bytesPerLine()` 而不是假设 `width*4` —— 行有对齐填充时两者不等。
 
