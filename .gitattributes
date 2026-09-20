@@ -1,0 +1,9 @@
+# 统一换行：仓库内一律 LF，工作区按平台自动转换
+* text=auto eol=lf
+
+# 二进制
+*.exe binary
+*.ico binary
+*.png binary
+*.jpg binary
+*.dll binary
