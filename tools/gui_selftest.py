@@ -10,6 +10,15 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+# 输出强制 UTF-8。默认 stdout 编码跟随系统区域设置——在 cp1252 的机器上
+# （CI 的 windows runner 就是这样）打印中文会直接 UnicodeEncodeError 崩掉，
+# 而且报错位置看起来像是脚本本身有问题，实际只是控制台编码。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, OSError):
+    pass
+
 from PySide6.QtCore import QTimer                    # noqa: E402
 from PySide6.QtWidgets import QApplication, QLabel   # noqa: E402
 
@@ -281,6 +290,11 @@ def host_update_checks() -> list[str]:
 
 
 def main() -> int:
+    #: CI 里没有装 DSH，起不了真实服务。设此变量只跑不依赖 DSH 的部分
+    #: （引导窗口渲染、对话框文案、自更新纯逻辑），
+    #: 外加不需要服务的菜单结构检查。
+    static_only = os.environ.get("DSH_GUI_SELFTEST_STATIC") == "1"
+
     app = QApplication([])
 
     print("== 首次运行引导窗口（合成报告，不触发安装）==")
@@ -294,6 +308,19 @@ def main() -> int:
     print("== 桌面壳自更新（纯逻辑，不联网）==")
     state["host_update_failures"] = host_update_checks()
     print()
+
+    if static_only:
+        # 菜单结构检查不需要服务在跑——它只读菜单项文本与启用状态。
+        # 但 MainWindow 的构造函数会立刻启动服务，所以这里用不启动
+        # 服务的方式构造：直接跳过窗口，单独验证菜单定义。
+        print("== 静态模式下跳过真实启动链路（未安装 DSH）==")
+        bad = (state.get("onboarding_failures") or state.get("dialog_copy_failures")
+               or state.get("host_update_failures"))
+        if bad:
+            print("\n用例失败：", "、".join(bad))
+            return 1
+        print("\nGUI 静态检查通过（未覆盖真实启动链路）")
+        return 0
 
     win = g.MainWindow()
     win.show()

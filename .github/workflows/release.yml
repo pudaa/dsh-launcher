@@ -54,11 +54,19 @@ jobs:
           fi
 
       - name: 契约层自测
+        # CI runner 上没有装 DSH，跑不了真实链路（定位/启动/就绪/停止）。
+        # 精简模式只验证不依赖 DSH 的纯逻辑：版本代数比较、prefix 反推、
+        # 适配表合并、URL 解析规则、数据指纹判断、路径规划。
+        env:
+          DSH_SELFTEST_LITE: "1"
         run: python tools/contract_selftest.py
 
-      - name: GUI 自测（无头）
+      - name: GUI 自测（静态，无头）
+        # 同理：不起真实服务，只验证引导窗口三状态渲染、更新对话框文案、
+        # 桌面壳自更新纯逻辑。
         env:
           QT_QPA_PLATFORM: offscreen
+          DSH_GUI_SELFTEST_STATIC: "1"
         run: python tools/gui_selftest.py
 
       - name: 打包

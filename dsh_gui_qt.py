@@ -20,7 +20,7 @@ import sys
 import time
 
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QUrl
-from PySide6.QtGui import QIcon, QAction, QDesktopServices
+from PySide6.QtGui import QIcon, QAction, QDesktopServices, QImage
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QSystemTrayIcon, QMenu, QDialog, QMessageBox,
@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage
 
-from dsh_host import config, contract, provision, selfupdate, updater
+from dsh_host import config, contract, dwm, provision, selfupdate, updater
 from dsh_host.contract import DshError, ServiceHandle
 from dsh_host.version import HOST_VERSION
 
@@ -731,6 +731,71 @@ class MainWindow(QMainWindow):
         self.view.setPage(self.page)
         self.stack.addWidget(self.view)
 
+    # ----------------------------------------------------------- 标题栏自适应
+
+    def _apply_titlebar(self, rgb):
+        """把取到的主色上到标题栏。
+
+        三个必须一起设的属性，少一个就会出现违和的细节：
+          CAPTION_COLOR  底色
+          TEXT_COLOR     标题文字色——不设的话浅底上会白字（读不了）
+          DARK_MODE      影响系统绘制的关闭按钮/边框高光
+        """
+        if not dwm.available() or rgb is None:
+            return
+        mute = float(config.get("titlebar_mute") or 0.0)
+        bg = dwm.blend(rgb, (18, 20, 24), mute) if mute else rgb
+        fg = dwm.contrast_text(bg)
+        dark = dwm.is_dark(bg)
+
+        ok = dwm.set_caption_color(self, bg)
+        dwm.set_text_color(self, fg)
+        dwm.set_border_color(self, bg)
+        dwm.set_dark_mode(self, dark)
+        if ok:
+            host_log("标题栏上色：底色 %s（取自界面 %s）文字 %s"
+                     % (dwm.to_hex(bg), dwm.to_hex(rgb), dwm.to_hex(fg)))
+
+    def _sample_titlebar_color(self):
+        """读界面最上方一层像素，统计主色调，给标题栏上色。
+
+        为什么只取一次
+        --------------
+        `grab()` 会触发一次完整的渲染回读，是重操作。持续取色会拖慢界面，
+        而 DSH 的主题在实际使用中基本不变。所以启动后取一次就够。
+
+        为什么要延迟
+        ------------
+        `loadFinished` 只代表 DOM 就绪，样式和首次绘制可能还没完成——
+        这时候截到的是白色空白页，取出来的主色会是白的。
+        所以等一段固定时间再取；取到后就不再重试。
+        """
+        if not config.get("adaptive_titlebar") or not dwm.available():
+            return
+        if self.view is None:
+            return
+        try:
+            shot = self.view.grab()
+            img = shot.toImage().convertToFormat(QImage.Format.Format_RGBA8888)
+            w, h = img.width(), img.height()
+            if w <= 0 or h <= 0:
+                return
+            ptr = img.constBits()
+            # PySide6 的 constBits 返回 memoryview，转成 bytes 才能切片
+            data = bytes(ptr) if not isinstance(ptr, (bytes, bytearray)) else ptr
+            # 只取顶部 6% 高度，且左右各让开 2%——避开滚动条与圆角
+            rows = max(1, int(h * 0.06))
+            pad = max(0, int(w * 0.02))
+            rgb = dwm.dominant_color(data, w, h, sample_rows=rows,
+                                     skip_left=pad, skip_right=pad)
+            if rgb:
+                self._apply_titlebar(rgb)
+            else:
+                host_log("标题栏取色失败：未能统计出主色调")
+        except Exception as e:                                   # noqa: BLE001
+            # 取色失败不影响使用——标题栏保持系统默认即可
+            host_log("标题栏取色异常：%s: %s" % (type(e).__name__, e))
+
     # ----------------------------------------------------------- 托盘
 
     def _build_tray(self):
@@ -794,6 +859,15 @@ class MainWindow(QMainWindow):
         self.act_about = QAction("关于 DSH Launcher", self)
         self.act_about.triggered.connect(self._show_about)
 
+        # 标题栏自适应：视觉偏好因人而异，给一个关掉的开关
+        self.act_titlebar = QAction("标题栏跟随界面配色", self)
+        self.act_titlebar.setCheckable(True)
+        self.act_titlebar.setChecked(bool(config.get("adaptive_titlebar")))
+        self.act_titlebar.setEnabled(dwm.available())
+        if not dwm.available():
+            self.act_titlebar.setText("标题栏跟随界面配色（系统不支持）")
+        self.act_titlebar.triggered.connect(self._toggle_titlebar)
+
         # --- 系统 ---
         act_logs = QAction("打开日志目录", self)
         act_logs.triggered.connect(
@@ -811,6 +885,8 @@ class MainWindow(QMainWindow):
         menu.addAction(self.act_rollback)
         menu.addSeparator()
         menu.addAction(self.act_host_check)
+        menu.addSeparator()
+        menu.addAction(self.act_titlebar)
         menu.addAction(self.act_about)
         menu.addSeparator()
         menu.addAction(act_logs)
@@ -867,6 +943,10 @@ class MainWindow(QMainWindow):
         self._refresh_menu()
         if config.get("check_update_on_start"):
             QTimer.singleShot(3000, lambda: self._check_update(manual=False))
+        # 标题栏取色：必须等界面真的画出来。loadFinished 只代表 DOM 就绪，
+        # 此时截到的是空白页（主色会是白的），所以延迟到位后再取。
+        if config.get("adaptive_titlebar"):
+            QTimer.singleShot(4000, self._sample_titlebar_color)
 
     def _on_failed(self, msg: str):
         host_log("启动失败：%s" % msg.replace("\n", " | ")[:600])
@@ -1099,6 +1179,20 @@ class MainWindow(QMainWindow):
             f"DSH 更新　走官方 npm 通道，与桌面壳更新互不影响。\n"
         )
         QMessageBox.about(self, "关于", text)
+
+    def _toggle_titlebar(self, checked: bool):
+        """开关标题栏自适应配色。"""
+        config.set(adaptive_titlebar=bool(checked))
+        self.act_titlebar.setChecked(bool(checked))
+        host_log("标题栏跟随界面配色 → %s" % ("开" if checked else "关"))
+        if checked:
+            if not dwm.available():
+                self._info("当前系统不支持（需要 Windows 11）。")
+                return
+            # 立刻取一次，不然要等到下次启动才看到效果
+            self._sample_titlebar_color()
+        else:
+            dwm.reset(self)
 
     # ----------------------------------------------------------- 窗口行为
 

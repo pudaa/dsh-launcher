@@ -17,8 +17,20 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+# 输出强制 UTF-8。默认 stdout 编码跟随系统区域设置——在 cp1252 的机器上
+# （CI 的 windows runner 就是这样）打印中文会直接 UnicodeEncodeError 崩掉，
+# 而且报错位置看起来像是脚本本身有问题，实际只是控制台编码。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, OSError):
+    pass
+
 TMP = os.path.join(ROOT, ".tmp-selftest")
 KEEP = "--keep" in sys.argv
+#: CI 里没有装 DSH，跑不了真实链路。设此变量则只跑不依赖 DSH 的部分。
+#: 显式开关而不是"检测不到就跳过"——后者会让本机漏跑变成静默通过。
+LITE = os.environ.get("DSH_SELFTEST_LITE") == "1"
 os.environ["DSH_HOME"] = TMP
 os.makedirs(TMP, exist_ok=True)
 
@@ -35,6 +47,8 @@ def check(name: str, ok: bool, extra: str = ""):
 
 
 def main() -> int:
+    if LITE:
+        return main_lite()
     print(LINE)
     print("[1] 安装定位")
     try:
@@ -169,6 +183,102 @@ def main() -> int:
         print("失败项：", "、".join(failures))
         return 1
     print("契约层自测全部通过")
+    return 0
+
+
+def main_lite() -> int:
+    """不依赖 DSH 安装的部分（CI 用）。
+
+    检查的是"纯逻辑"：版本代数比较、路径反推、指纹判断、URL 解析规则。
+    这些是契约层里最容易写错、且错了最不容易发现的部分，
+    而且不需要真的装一个 DSH 就能验证。
+    """
+    from dsh_host import compat
+    from dsh_host.version import HOST_VERSION, is_newer, version_tuple
+
+    print(LINE)
+    print("[L1] 版本代数比较（DSH 全是预发布，不能用严格 semver 序）")
+    cases = [
+        ("0.1.6-alpha.2", ">=0.1.6", True, "预发布也应满足不带上限的区间"),
+        ("0.1.5-rc.2", ">=0.1.6", False, "低代数不满足"),
+        ("0.1.5-rc.2", ">=0.1.5", True, "同代数满足"),
+        ("0.2.0", ">=0.1.6", True, "高代数满足"),
+        ("0.1.6-alpha.2", ">=0.1.6-alpha.1", True, "右侧带预发布则退化到严格序"),
+        ("0.1.6-alpha.1", ">=0.1.6-alpha.2", False, "严格序下更低"),
+    ]
+    for ver, spec, expect, why in cases:
+        check(f"satisfies({ver}, {spec}) == {expect}", 
+              compat.satisfies(ver, spec) == expect, why)
+
+    print(LINE)
+    print("[L1] 版本解析与预发布识别")
+    check("parse_version 三段", compat.parse_version("0.1.6-alpha.2")[:3] == (0, 1, 6))
+    check("is_prerelease 认 alpha", compat.is_prerelease("0.1.6-alpha.2"))
+    check("is_prerelease 不认正式版", not compat.is_prerelease("0.1.6"))
+
+    print(LINE)
+    print("[L1] npm prefix 反推（算错会把包装进 node_modules/node_modules/）")
+    # npm 全局布局深度是固定的：<prefix>\node_modules\<scope>\<pkg>
+    # 所以 prefix_of 就是往上三级。给个非 D 盘的路径确认它没写死盘符。
+    pf = contract.prefix_of(r"C:\nodejs\node_modules\@deepseek-ai\dsh")
+    check("三级反推正确", os.path.normcase(pf) == os.path.normcase(r"C:\nodejs"), pf)
+    pf2 = contract.prefix_of(r"D:\a\b\node_modules\@scope\pkg")
+    check("不同盘符与深度也正确",
+          os.path.normcase(pf2) == os.path.normcase(r"D:\a\b"), pf2)
+
+    print(LINE)
+    print("[L0] 适配 profile 四层合并")
+    prof = compat.load_profile("0.1.6-alpha.2")
+    need = ["cli", "url_regexes", "ready_probe", "ready_timeout",
+            "poll_interval", "url_grace", "service_host"]
+    missing = [k for k in need if k not in prof]
+    check("profile 含必要键", not missing, "缺：" + str(missing) if missing else "")
+    check("url_grace 足够补读 URL（时序陷阱的兜底）",
+          float(prof.get("url_grace") or 0) >= 1.0, str(prof.get("url_grace")))
+
+    print(LINE)
+    print("[L2] URL 解析规则（拿不到令牌会首屏 401）")
+    import re
+    sample = "dsh web: http://127.0.0.1:9716/?token=AbC123xyz"
+    url = None
+    for pat in prof.get("url_regexes") or []:
+        m = re.search(pat, sample)
+        if m:
+            url = m.group(0)
+            break
+    check("能从官方输出行解析出 URL", bool(url and "token=" in url), str(url))
+
+    print(LINE)
+    print("[L2] 数据指纹判断逻辑")
+    fp = contract.HomeFingerprint(path=r"C:\fake", files=10, bytes=1000)
+    check("自比不误报减少", not fp.lost_against(fp))
+    check("能识别减少", fp.lost_against(
+        contract.HomeFingerprint(path=fp.path, files=11, bytes=1001)))
+    check("截断时不做判断（不把'没查'伪装成'查过'）",
+          not fp.lost_against(contract.HomeFingerprint(
+              path=fp.path, files=0, bytes=0, truncated=True)))
+
+    print(LINE)
+    print("[L0] 路径规划（数据根与解包目录必须分家）")
+    check("解包目录名与数据根不同",
+          config.APP_NAME != config.RUNTIME_DIR_NAME,
+          f"{config.APP_NAME} / {config.RUNTIME_DIR_NAME}")
+    check("解包目录可随时删（是纯缓存）",
+          "runtime" in config.runtime_dir().lower(), config.runtime_dir())
+    check("私有 npm prefix 在数据根下",
+          os.path.normcase(config.node_global_dir()).startswith(
+              os.path.normcase(config.data_root())), config.node_global_dir())
+
+    print(LINE)
+    print("[Host] 桌面壳版本号")
+    check("版本号可解析为三段", len(version_tuple(HOST_VERSION)) >= 3, HOST_VERSION)
+    check("同版本不比自身新", not is_newer(HOST_VERSION, HOST_VERSION))
+
+    print(LINE)
+    if failures:
+        print("失败项：", "、".join(failures))
+        return 1
+    print("契约层自测（精简模式）全部通过")
     return 0
 
 

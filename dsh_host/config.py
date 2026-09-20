@@ -130,6 +130,10 @@ DEFAULTS: dict = {
     # 更新器写入的状态：用于一键回滚
     "last_good_version": None,
     "previous_version": None,
+    # 标题栏：读界面主色调后自动上色，让标题栏与界面衔接自然
+    "adaptive_titlebar": True,
+    # 取到的主色往中性灰拉多少（0=原色，1=全灰）。太饱和会抢视线
+    "titlebar_mute": 0.35,
 }
 
 _lock = threading.RLock()
