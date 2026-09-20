@@ -308,20 +308,38 @@ def titlebar_checks() -> list[str]:
         print("        异常:", bad)
 
     # 2. 灰底不能盖过主题色 —— 两轮硬隔离
-    #    旧实现只给灰像素降权 0.5，实测 2:1 的像素数优势仍会让灰胜出，
-    #    所以这里刻意用**强对比**的 2:1（大片灰 + 少量主题色）作回归，
-    #    弱对比（1:1）会被旧实现在降权后碰巧蒙对，测不出问题。
-    px = bytes([0x22, 0xC1, 0xA3, 0xFF] * 20) + bytes([0x1E, 0x1E, 0x1E, 0xFF] * 40)
-    got = dwm.dominant_color(px, 60, 1)
-    ok = got is not None and got[1] > got[0] and got[1] > got[2]
-    print(f"  [{'OK  ' if ok else 'FAIL'}] 灰底 2:1 仍识别出主题色（硬隔离生效）")
-    if not ok:
-        failures.append("饱和度隔离")
-        print("        实际取到:", got, "（期望偏青绿，即 G 分量最大）")
+    #    **用真实采样规模造数据**（这一点踩过坑）：真实调用一次采样
+    #    约 5w 像素（1200x800 窗口取顶部 6% 高、左右各让开 2%），
+    #    拿小图（如 80x8）试会得出差两个数量级的错误门槛。
+    SW, SH = 1152, 48                    # = 55296 像素，贴近真实
+    CHROMA = (34, 193, 163)              # 青绿主题色
 
-    # 2b. 纯灰界面应退回灰色方案，而不是返回 None 或乱配色
-    px = bytes([0x30, 0x30, 0x30, 0xFF] * 100)
-    got = dwm.dominant_color(px, 10, 10)
+    def strip(n_cols, bg):
+        """左起 n_cols 列为主题色，其余为 bg。"""
+        row = bytes(CHROMA + (255,)) * n_cols + bytes(bg + (255,)) * (SW - n_cols)
+        return row * SH, SW, SH
+
+    px, w, h = strip(576, (30, 30, 30))          # 50% 主题色
+    got = dwm.dominant_color(px, w, h)
+    ok = got is not None and got[1] > got[0] and got[1] > got[2]
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 灰底 50% 主题色 -> 识别出主题色")
+    if not ok:
+        failures.append("主题色识别")
+        print("        实际取到:", got)
+
+    # 2b. 极少量彩色（图标边缘抗锯齿级别）不应主导标题栏
+    #     1 列 = 48 像素 = 0.087%，必须被挡掉
+    px, w, h = strip(1, (30, 30, 30))
+    got = dwm.dominant_color(px, w, h)
+    ok = got is not None and abs(got[0] - got[1]) < 8 and abs(got[1] - got[2]) < 8
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 0.09% 彩色杂色被挡（退回灰色而非被带偏）")
+    if not ok:
+        failures.append("杂色门槛")
+        print("        实际取到:", got, "（期望接近灰，不该是青绿）")
+
+    # 2c. 纯灰界面应退回灰色方案，而不是返回 None 或乱配色
+    px = bytes([0x30, 0x30, 0x30, 0xFF] * (SW * SH))
+    got = dwm.dominant_color(px, SW, SH)
     ok = got is not None and abs(got[0] - got[1]) < 8 and abs(got[1] - got[2]) < 8
     print(f"  [{'OK  ' if ok else 'FAIL'}] 纯灰界面退回灰色方案（不返回 None）")
     if not ok:
@@ -357,6 +375,56 @@ def titlebar_checks() -> list[str]:
     print(f"  [{'OK  ' if ok else 'FAIL'}] 文字色与底色对比充足（不会白底白字）")
     if not ok:
         failures.append("文字对比度")
+
+    # 5b. 对比度选色（B 方案）：必须是两个候选里对比度高的那个
+    #     这是把"亮度过阈值就换色"换成"算 WCAG 对比度择优"后的核心不变式。
+    DARK, LIGHT = (24, 26, 31), (240, 242, 245)
+    worst, worst_bg = 99.0, None
+    for v in range(0, 256, 5):
+        bg = (v, v, v)
+        pick = dwm.contrast_text(bg)
+        best = max(dwm.contrast_ratio(bg, DARK), dwm.contrast_ratio(bg, LIGHT))
+        got_r = dwm.contrast_ratio(bg, pick)
+        if got_r < best - 1e-9 and got_r < worst:
+            worst, worst_bg = got_r, (bg, pick, best)
+    ok = worst_bg is None
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 对比度选色恒取更优候选（灰阶全扫）")
+    if not ok:
+        failures.append("对比度择优")
+        print("        未取最优:", worst_bg)
+
+    # 5c. 旧阈值判据在灰阶 120-127 选错，新判据必须修好
+    #     旧判据在这些点上硬选浅字，对比度只有 3.57~3.94（低于 AA 4.5）
+    #     新判据改选深字，回到 4.0~4.35
+    fixed = all(dwm.contrast_text((v, v, v)) == DARK for v in (121, 124, 127))
+    improved = (dwm.contrast_ratio((127, 127, 127),
+                                   dwm.contrast_text((127, 127, 127)))
+                > dwm.contrast_ratio((127, 127, 127), LIGHT) + 0.5)
+    ok = fixed and improved
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 修好旧判据的灰阶 120-127 误选（对比度提升）")
+    if not ok:
+        failures.append("灰阶误选")
+        print(f"        127 灰：新选 {dwm.contrast_text((127,127,127))} "
+              f"对比度 {dwm.contrast_ratio((127,127,127), dwm.contrast_text((127,127,127))):.2f}；"
+              f"旧选浅字 {dwm.contrast_ratio((127,127,127), LIGHT):.2f}")
+
+    # 5d. WCAG 公式本身：纯黑白应为 21:1，同色应为 1:1
+    ok = (abs(dwm.contrast_ratio((255, 255, 255), (0, 0, 0)) - 21.0) < 0.05
+          and abs(dwm.contrast_ratio((100, 150, 200), (100, 150, 200)) - 1.0) < 1e-9)
+    print(f"  [{'OK  ' if ok else 'FAIL'}] WCAG 对比度公式正确（黑白 21:1、同色 1:1）")
+    if not ok:
+        failures.append("对比度公式")
+        print(f"        黑白={dwm.contrast_ratio((255,255,255),(0,0,0)):.3f} 期望 21.0")
+
+    # 5e. 相对亮度是 gamma 线性化的，不能等于 BT.601 值
+    ok = (abs(dwm.relative_luminance((255, 255, 255)) - 1.0) < 1e-6
+          and abs(dwm.relative_luminance((0, 0, 0))) < 1e-9
+          and abs(dwm.relative_luminance((128, 128, 128)) - 0.2159) < 0.01)
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 相对亮度已 sRGB 线性化（中灰≈0.216）")
+    if not ok:
+        failures.append("相对亮度")
+        print(f"        中灰 relative_luminance="
+              f"{dwm.relative_luminance((128,128,128)):.4f} 期望≈0.2159")
         print(f"        深底 {dark_bg} → 文字 {fg_d}；浅底 {light_bg} → 文字 {fg_l}")
 
     # 6. blend 越界要被 clamp

@@ -195,13 +195,47 @@ def color_near(a: tuple[int, int, int], b: tuple[int, int, int],
 # ---------------------------------------------------------------- 取色
 
 def luminance(rgb: tuple[int, int, int]) -> float:
-    """感知亮度（ITU-R BT.601）。
+    """感知亮度（ITU-R BT.601）。用于"这颜色算深还是算浅"的粗判。
 
     不能简单取平均值——人眼对绿色最敏感、蓝色最不敏感。
     直接用均值会导致"深蓝"被判成浅色，出现白底白字。
+
+    注意：**这个函数不用于文字色的最终抉择**（那是 contrast_text 的事，
+    用 WCAG 对比度）。它服务于"要不要给系统暗色模式"这类开关判断。
     """
     r, g, b = rgb
     return 0.299 * r + 0.587 * g + 0.114 * b
+
+
+def _linearize(channel: float) -> float:
+    """sRGB 分量线性化（WCAG 2.x 定义）。
+
+    对比度必须在**线性光空间**里算。直接用 sRGB 数值比大小是常见错误：
+    sRGB 是 gamma 编码过的，同样差 50 个数值，在暗部比在亮部实际差得多。
+    """
+    c = channel / 255.0
+    return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def relative_luminance(rgb: tuple[int, int, int]) -> float:
+    """WCAG 相对亮度，取值 0.0（黑）~ 1.0（白）。
+
+    与 `luminance()` 的区别：这个是 gamma 线性化后的值，专门用来算对比度。
+    """
+    r, g, b = rgb
+    return (0.2126 * _linearize(r) + 0.7152 * _linearize(g)
+            + 0.0722 * _linearize(b))
+
+
+def contrast_ratio(a: tuple[int, int, int], b: tuple[int, int, int]) -> float:
+    """WCAG 对比度比值，范围 1.0（完全相同）~ 21.0（纯黑白）。
+
+    `(L_bright + 0.05) / (L_dark + 0.05)`，公式里的 0.05 是环境光补偿项。
+    WCAG AA 正文要求 >= 4.5，大字号 >= 3.0。
+    """
+    la, lb = relative_luminance(a), relative_luminance(b)
+    hi, lo = max(la, lb), min(la, lb)
+    return (hi + 0.05) / (lo + 0.05)
 
 
 def is_dark(rgb: tuple[int, int, int], threshold: float = 128.0) -> bool:
@@ -219,12 +253,27 @@ def contrast_text(bg: tuple[int, int, int],
                   dark: tuple[int, int, int] = (24, 26, 31),
                   light: tuple[int, int, int] = (240, 242, 245)
                   ) -> tuple[int, int, int]:
-    """给背景色配一个可读的标题文字色。
+    """给背景色挑一个可读的标题文字色。
 
-    这一步不能省。只设底色不设文字色的话，浅色背景上会沿用系统的
-    浅色文字（白底白字），深色背景上会沿用深色文字——两者都读不了。
+    用 **WCAG 对比度比值择优**，而不是"亮度过阈值就换色"。
+
+    为什么不能用阈值二选一
+    ----------------------
+    阈值判据有两个毛病（实测）：
+      1. **结果不连续**。背景色在阈值附近动一点，文字色就整个翻转，
+         视觉上很突兀。
+      2. **不保证可读**。它只回答"背景算深还是浅"，不回答"这个字色
+         到底够不够看得清"。中间调背景（如 #22c1a3 这种亮青绿，
+         BT.601 亮度 142）会配上深字，对比度只有 4 左右，属于勉强及格；
+         换个梯度再亮一点的品牌色就会掉到 3 以下。
+    直接算两个候选色的对比度取高的那个，没有这些问题：
+    结果连续、且总是给出可证明更优的解。
+
+    这只在背景**恰好等于**候选色时才会平手（对比度都趋近 1），
+    此时 dark 优先——那种极端情况下换哪个都一样。
     """
-    return light if is_dark(bg) else dark
+    return dark if (contrast_ratio(bg, dark) >= contrast_ratio(bg, light)
+                    ) else light
 
 
 def dominant_color(image_bytes: bytes, width: int, height: int,
@@ -247,16 +296,30 @@ def dominant_color(image_bytes: bytes, width: int, height: int,
     （品牌色按钮、强调条）。若只按像素数投票，灰底必然压倒主题色，
     取到的"主色调"就是灰色 —— 标题栏跟着变灰，等于没做自适应。
 
-    所以分两轮：**只要存在**有彩像素，就完全忽略灰像素，从有彩像素里
-    取众数；整屏确实无彩（纯灰界面）时，才退回用灰像素定色。
+    所以分两轮：先在有彩像素里取众数；只有整屏确实无彩（纯灰界面）
+    时才退回灰像素定色。
 
-    这里刻意**不设绝对数量阈值**。早期版本要求"有彩像素 >= 24 个"，
-    但统计是在降采样后的图上做的，真实界面里主题色往往只占几十个
-    采样点 —— 阈值会误判成"无彩"而退回灰色，正好把要保住的信号丢掉。
-    相对判据（存在即优先）比绝对阈值稳健得多。
+    但"存在即优先"不能是无限的
+    --------------------------
+    实测踩到：深灰底 + 只有 8 个淡彩像素时，会取到那个淡彩
+    （`#28b898`），一个**深色主题的界面**被极少数字节带成亮青标题栏。
+    那些像素来自图标边缘的抗锯齿/次像素渲染，不代表主题色。
 
-    早期版本还试过只给灰像素降权 0.5，实测 2:1 的像素数优势仍会让
-    灰胜出，因此改成硬隔离。
+    所以要求有彩像素**占采样面积的比例**达到 CHROMA_MIN_RATIO。
+    低于这个比例就认为界面无彩，退回灰色方案。
+
+    为什么不能用「像素数量」当门槛（踩过两次）
+    ----------------------------------------
+    数量门槛**不可移植**——同样的 48 个像素，在小窗口里可能是可观的
+    一条带，在 1200x800 的窗口里只是 0.09%。而真实调用一次要采样
+    4w~12w 像素（`rows=6%高` × `宽-4%`），此时"一列 48 行"的杂色
+    也能凑够任何固定的低数量门槛。所以只看**占比**，不看绝对数量。
+
+    这个坑的教训：验证门槛时必须用**真实采样规模**造数据。
+    我最初拿 80x8（640 像素）试，看着挺合理；换算到真实规模才
+    发现门槛差了两个数量级。
+
+    早期还试过只给灰像素降权 0.5，实测 2:1 的像素数优势仍让灰胜出。
     """
     if not image_bytes or width <= 0 or height <= 0:
         return None
@@ -271,9 +334,15 @@ def dominant_color(image_bytes: bytes, width: int, height: int,
 
     #: 饱和度高于此值算"有彩"，参与主色调竞争
     SAT_MIN = 0.15
+    #: 有彩像素占采样面积的比例达到此值，才认为界面确实有主题色。
+    #  取值依据：真实调用一次采样 4w~12w 像素（rows=6%高、左右各让开 2%），
+    #  0.5% 相当于 200~600 个像素 —— 这个量级才是"界面上真有一块彩色"，
+    #  低于它多半是图标边缘抗锯齿、滚动条、圆角过渡之类的杂色。
+    CHROMA_MIN_RATIO = 0.005
 
     chroma: dict[tuple[int, int, int], int] = {}
     neutral: dict[tuple[int, int, int], int] = {}
+    total = 0
 
     for y in range(rows):
         base = y * stride
@@ -283,6 +352,7 @@ def dominant_color(image_bytes: bytes, width: int, height: int,
                 break
             if image_bytes[i + 3] < 8:     # 全透明像素不参与
                 continue
+            total += 1
             r, g, b = image_bytes[i], image_bytes[i + 1], image_bytes[i + 2]
 
             # 量化到 16 级一档，减少噪声导致的"每像素一个颜色"
@@ -295,7 +365,11 @@ def dominant_color(image_bytes: bytes, width: int, height: int,
             else:
                 neutral[key] = neutral.get(key, 0) + 1
 
-    pool = chroma if chroma else neutral
+    # 有彩像素要占到一定比例，才算界面的主题色
+    n_chroma = sum(chroma.values())
+    strong = bool(total) and n_chroma / total >= CHROMA_MIN_RATIO
+
+    pool = chroma if (strong and chroma) else neutral
     if not pool:
         return None
 

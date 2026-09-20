@@ -189,6 +189,31 @@ def step_algo():
     # 5c 空输入
     check("5c 空输入返回 None", dwm.dominant_color(b"", 0, 0) is None)
 
+    # 5d **真实采样规模**下的杂色门槛
+    #    教训：拿小图（如 80x8）验门槛会得出差两个数量级的结论。
+    #    真实调用一次采样 4w~12w 像素，必须是这个量级才测得准。
+    SW, SH = 1152, 48                 # 55296 像素，贴近 1200x800 窗口
+    CH = (34, 193, 163)
+
+    def strip(n_cols, bg):
+        row = bytes(CH + (255,)) * n_cols + bytes(bg + (255,)) * (SW - n_cols)
+        return row * SH
+
+    # 0.09%（一列杂色）必须被挡掉，退回灰色
+    got = dwm.dominant_color(strip(1, (30, 30, 30)), SW, SH)
+    check("5d 真实规模下 0.09% 杂色被挡", got is not None
+          and abs(got[0] - got[1]) < 8, str(got))
+
+    # 1% 应认出主题色
+    got = dwm.dominant_color(strip(12, (30, 30, 30)), SW, SH)
+    check("5e 真实规模下 1% 主题色被认出", got is not None
+          and got[1] > got[0] and got[1] > got[2], str(got))
+
+    # 5f 浅色主题下同样工作（黑白主题用户的实际场景）
+    got = dwm.dominant_color(strip(1, (240, 240, 240)), SW, SH)
+    check("5f 浅色主题下杂色也被挡", got is not None
+          and abs(got[0] - got[1]) < 8 and got[1] > 200, str(got))
+
     print("\n" + "=" * 64)
     print("结果：%d 通过 / %d 失败" % (len(PASS), len(FAIL)))
     for f in FAIL:
