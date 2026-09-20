@@ -56,11 +56,47 @@ def available() -> bool:
     if not IS_WINDOWS:
         return False
     try:
-        ctypes.windll.dwmapi          # noqa: B018
+        _dwmapi()                     # 顺手确认能加载
         build = sys.getwindowsversion().build
         return build >= 22000
     except Exception:                                          # noqa: BLE001
         return False
+
+
+# ---------------------------------------------------- ctypes 签名（关键）
+#
+# 必须显式声明 argtypes/restype。省略时 ctypes 会把 Python 整数按 C int
+# 封送，而 HWND 在 64 位下是指针宽度 —— 值小的时候碰巧能用，句柄一变大
+# 就悄悄传错。声明后由 ctypes 负责转换，且异常变成可捕获的错误。
+#
+# 另一个坑：DwmSetWindowAttribute 第四参是 cbAttribute，第五参才是
+# pvAttribute。ctypes 不做参数名匹配，顺序错了会得到 E_INVALIDARG。
+
+_dwm_declared = False
+
+
+def _dwmapi():
+    """返回已声明签名的 dwmapi，只声明一次。"""
+    global _dwm_declared
+    api = ctypes.windll.dwmapi
+    if _dwm_declared:
+        return api
+    api.DwmSetWindowAttribute.argtypes = [
+        wintypes.HWND,      # hwnd
+        wintypes.DWORD,     # dwAttribute
+        ctypes.c_void_p,    # pvAttribute
+        wintypes.DWORD,     # cbAttribute
+    ]
+    api.DwmSetWindowAttribute.restype = ctypes.c_long
+    api.DwmGetWindowAttribute.argtypes = [
+        wintypes.HWND,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    api.DwmGetWindowAttribute.restype = ctypes.c_long
+    _dwm_declared = True
+    return api
 
 
 def _hwnd(widget) -> int:
@@ -133,6 +169,29 @@ def reset(widget) -> None:
         _set_attr(_hwnd(widget), attr, DWMWA_COLOR_DEFAULT)
 
 
+# ------------------------------------------------- 验证（只能靠 GDI 截屏）
+#
+# 重要：DWMWA_CAPTION_COLOR / TEXT_COLOR / BORDER_COLOR 是**只写**属性。
+# 对它们调 DwmGetWindowAttribute 一律返回 E_INVALIDARG (0x80070057)，
+# **不代表设置失败**。曾经因为拿 Get 的回读当验收标准，误判成"DWM 不可用"。
+#
+# 另一个坑：Qt 的 QScreen.grabWindow(winId) 在本机返回整片纯色
+# （陈旧/空白合成表面），也不能用来验证。
+#
+# 唯一可靠方式 = Win32 GDI `PrintWindow(hwnd, dc, PW_RENDERFULLCONTENT)`。
+# 完整实现见 `tools/dwm_verify.py`（会创建真实窗口，不适合放进被测代码）。
+
+
+def color_near(a: tuple[int, int, int], b: tuple[int, int, int],
+               tol: int = 12) -> bool:
+    """两色是否足够接近（用于截图验证的容差比较）。
+
+    容差不设 0 是因为标题栏在 Windows 11 上会叠一层轻微的高光渐变，
+    截出来的像素不会与设定值逐位相等。
+    """
+    return all(abs(a[i] - b[i]) <= tol for i in range(3))
+
+
 # ---------------------------------------------------------------- 取色
 
 def luminance(rgb: tuple[int, int, int]) -> float:
@@ -182,8 +241,22 @@ def dominant_color(image_bytes: bytes, width: int, height: int,
     做法是量化到 16 级一档再统计众数，而不是求平均——
     平均会把高饱和的主色和背景色混成一团灰，那正是"突兀"的来源。
 
-    另外做了一个饱和度加权：完全灰的像素（页面留白/滚动条）权重降一档，
-    否则大面积灰底会盖过真正的主题色。
+    灰像素处理（两轮，这是关键）
+    ----------------------------
+    界面顶部通常是大面积中性灰底（工具栏、留白）+ 小面积高饱和主题色
+    （品牌色按钮、强调条）。若只按像素数投票，灰底必然压倒主题色，
+    取到的"主色调"就是灰色 —— 标题栏跟着变灰，等于没做自适应。
+
+    所以分两轮：**只要存在**有彩像素，就完全忽略灰像素，从有彩像素里
+    取众数；整屏确实无彩（纯灰界面）时，才退回用灰像素定色。
+
+    这里刻意**不设绝对数量阈值**。早期版本要求"有彩像素 >= 24 个"，
+    但统计是在降采样后的图上做的，真实界面里主题色往往只占几十个
+    采样点 —— 阈值会误判成"无彩"而退回灰色，正好把要保住的信号丢掉。
+    相对判据（存在即优先）比绝对阈值稳健得多。
+
+    早期版本还试过只给灰像素降权 0.5，实测 2:1 的像素数优势仍会让
+    灰胜出，因此改成硬隔离。
     """
     if not image_bytes or width <= 0 or height <= 0:
         return None
@@ -195,7 +268,12 @@ def dominant_color(image_bytes: bytes, width: int, height: int,
         return None
 
     stride = width * 4                     # RGBA8888
-    buckets: dict[tuple[int, int, int], float] = {}
+
+    #: 饱和度高于此值算"有彩"，参与主色调竞争
+    SAT_MIN = 0.15
+
+    chroma: dict[tuple[int, int, int], int] = {}
+    neutral: dict[tuple[int, int, int], int] = {}
 
     for y in range(rows):
         base = y * stride
@@ -203,26 +281,25 @@ def dominant_color(image_bytes: bytes, width: int, height: int,
             i = base + x * 4
             if i + 3 >= len(image_bytes):
                 break
-            a = image_bytes[i + 3]
-            if a < 8:                      # 全透明像素不参与
+            if image_bytes[i + 3] < 8:     # 全透明像素不参与
                 continue
             r, g, b = image_bytes[i], image_bytes[i + 1], image_bytes[i + 2]
 
             # 量化到 16 级一档，减少噪声导致的"每像素一个颜色"
-            qr, qg, qb = r >> 4, g >> 4, b >> 4
-
-            # 饱和度低（接近灰）的权重减半
+            key = (r >> 4, g >> 4, b >> 4)
             mx, mn = max(r, g, b), min(r, g, b)
             sat = (mx - mn) / 255.0
-            weight = 1.0 if sat > 0.06 else 0.5
 
-            key = (qr, qg, qb)
-            buckets[key] = buckets.get(key, 0.0) + weight
+            if sat >= SAT_MIN:
+                chroma[key] = chroma.get(key, 0) + 1
+            else:
+                neutral[key] = neutral.get(key, 0) + 1
 
-    if not buckets:
+    pool = chroma if chroma else neutral
+    if not pool:
         return None
 
-    best = max(buckets.items(), key=lambda kv: kv[1])[0]
+    best = max(pool.items(), key=lambda kv: kv[1])[0]
     # 还原到档位中心，避免取色偏暗
     return (best[0] << 4 | 0x8, best[1] << 4 | 0x8, best[2] << 4 | 0x8)
 

@@ -5,6 +5,7 @@
 """
 import os
 import sys
+import ctypes
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -306,14 +307,25 @@ def titlebar_checks() -> list[str]:
         failures.append("取色边界")
         print("        异常:", bad)
 
-    # 2. 饱和度降权：灰底不能盖过主题色
-    #    一半饱和红 + 一半中灰 → 应识别为红
-    px = bytes([200, 30, 30, 255] * 50) + bytes([128, 128, 128, 255] * 50)
-    got = dwm.dominant_color(px, 10, 10)
-    ok = got is not None and got[0] > got[1] + 40
-    print(f"  [{'OK  ' if ok else 'FAIL'}] 低饱和像素降权（灰底不盖主题色）")
+    # 2. 灰底不能盖过主题色 —— 两轮硬隔离
+    #    旧实现只给灰像素降权 0.5，实测 2:1 的像素数优势仍会让灰胜出，
+    #    所以这里刻意用**强对比**的 2:1（大片灰 + 少量主题色）作回归，
+    #    弱对比（1:1）会被旧实现在降权后碰巧蒙对，测不出问题。
+    px = bytes([0x22, 0xC1, 0xA3, 0xFF] * 20) + bytes([0x1E, 0x1E, 0x1E, 0xFF] * 40)
+    got = dwm.dominant_color(px, 60, 1)
+    ok = got is not None and got[1] > got[0] and got[1] > got[2]
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 灰底 2:1 仍识别出主题色（硬隔离生效）")
     if not ok:
-        failures.append("饱和度降权")
+        failures.append("饱和度隔离")
+        print("        实际取到:", got, "（期望偏青绿，即 G 分量最大）")
+
+    # 2b. 纯灰界面应退回灰色方案，而不是返回 None 或乱配色
+    px = bytes([0x30, 0x30, 0x30, 0xFF] * 100)
+    got = dwm.dominant_color(px, 10, 10)
+    ok = got is not None and abs(got[0] - got[1]) < 8 and abs(got[1] - got[2]) < 8
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 纯灰界面退回灰色方案（不返回 None）")
+    if not ok:
+        failures.append("纯灰回退")
         print("        实际取到:", got)
 
     # 3. 亮度判据用 BT.601 而非均值（均值会把深蓝判成浅色）
@@ -355,6 +367,29 @@ def titlebar_checks() -> list[str]:
     print(f"  [{'OK  ' if ok else 'FAIL'}] 混色比例越界被 clamp")
     if not ok:
         failures.append("blend clamp")
+
+    # 7. ctypes 签名必须显式声明
+    #    这是踩过的坑：不声明 argtypes 时 HWND 按 C int 封送，
+    #    64 位下句柄稍大就传错值。声明是硬要求，不是优化。
+    try:
+        dwm._dwmapi()
+        has_sig = bool(ctypes.windll.dwmapi.DwmSetWindowAttribute.argtypes)
+    except Exception:                                       # noqa: BLE001
+        has_sig = False
+    print(f"  [{'OK  ' if has_sig else 'FAIL'}] DwmSetWindowAttribute 已声明 argtypes")
+    if not has_sig:
+        failures.append("ctypes 签名")
+
+    # 8. 明确记录"只写属性"的事实，防止后人又拿 Get 当验收标准
+    #    DWMWA_CAPTION_COLOR(35) 等不支持 DwmGetWindowAttribute，
+    #    对它回读恒得 E_INVALIDARG(0x80070057)，与设置成功与否无关。
+    ok = (dwm.DWMWA_CAPTION_COLOR == 35
+          and dwm.DWMWA_TEXT_COLOR == 36
+          and dwm.DWMWA_BORDER_COLOR == 34
+          and dwm.DWMWA_COLOR_DEFAULT == 0xFFFFFFFF)
+    print(f"  [{'OK  ' if ok else 'FAIL'}] DWM 属性常量正确（含只写属性语义）")
+    if not ok:
+        failures.append("DWM 常量")
 
     return failures
 
