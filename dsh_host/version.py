@@ -21,7 +21,7 @@ GitHub Actions 会自动构建 exe 并创建 Release。见 .github/workflows/rel
 """
 from __future__ import annotations
 
-HOST_VERSION = "2.0.0"
+HOST_VERSION = "2.1.0"
 
 #: 桌面壳自身的发布仓库（owner/repo）。自动更新从这里拉 Release。
 HOST_REPO = "pudaa/dsh-launcher"
