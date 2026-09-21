@@ -38,8 +38,47 @@ APP_TITLE = "DSH — DeepSeek Harness"
 SINGLETON_ID = "DSH-Web-singleton"
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def _asset_dir() -> str:
+    """定位 assets 目录。**必须兼容打包后的布局。**
+
+    这个函数存在的理由（2026-09-21 踩坑）
+    -------------------------------------
+    打包命令原先只有 `--windows-icon-from-ico=assets/icon.ico`，
+    那只是把图标塞进 **exe 自身的 PE 资源**（资源管理器看的那个）。
+    而运行时 `QIcon("assets/xxx.ico")` 是去**文件系统**读的 ——
+    Nuitka onefile 不会自动带上 assets/ 目录，于是 QIcon 拿到空对象，
+    `isNull()` 为真，图标切换**静默失效**（回落到 exe 资源里的那个）。
+
+    所以两件事缺一不可：
+      1. 打包命令要有 `--include-data-dir=assets=assets`
+      2. 这里要能在"解包目录 / exe 同目录 / 源码目录"里找到 assets
+
+    候选顺序覆盖三种运行形态：源码直跑、onefile 解包、standalone 目录。
+    """
+    bases: list[str] = []
+    try:
+        bases.append(os.path.dirname(os.path.abspath(__file__)))
+    except NameError:                                          # pragma: no cover
+        pass
+    # Nuitka 打包后 __compiled__ 存在；frozen 覆盖其他打包器
+    if getattr(sys, "frozen", False) or "__compiled__" in globals():
+        bases.append(os.path.dirname(os.path.abspath(sys.argv[0])))
+    bases.append(os.getcwd())
+    for b in bases:
+        p = os.path.join(b, "assets")
+        if os.path.isdir(p):
+            return p
+    # 全都找不到就返回首个候选下的 assets —— 后续 os.path.isfile 判空即可。
+    # 不要在这里抛异常：图标缺失不该阻止应用启动。
+    return os.path.join(bases[0] if bases else ".", "assets")
+
+
+ASSET_DIR = _asset_dir()
+
 #: 早期内置的单色图标，仅作兜底
-ICON_PATH = os.path.join(ROOT, "assets", "icon.ico")
+ICON_PATH = os.path.join(ASSET_DIR, "icon.ico")
 
 # 随标题栏深浅切换的两套图标。
 #
@@ -48,8 +87,8 @@ ICON_PATH = os.path.join(ROOT, "assets", "icon.ico")
 #
 # 两份 ico 由 tools/make_icons.py 从 assets/deepseek.svg 生成，
 # 每个文件内含 16~256 共 9 个尺寸——单尺寸 ICO 在小图标下会糊。
-ICON_FOR_DARK_BG = os.path.join(ROOT, "assets", "icon-light.ico")
-ICON_FOR_LIGHT_BG = os.path.join(ROOT, "assets", "icon-dark.ico")
+ICON_FOR_DARK_BG = os.path.join(ASSET_DIR, "icon-light.ico")
+ICON_FOR_LIGHT_BG = os.path.join(ASSET_DIR, "icon-dark.ico")
 
 
 def icon_for(dark_bg: bool) -> QIcon:
@@ -58,6 +97,47 @@ def icon_for(dark_bg: bool) -> QIcon:
     if not os.path.isfile(path):
         path = ICON_PATH
     return QIcon(path) if os.path.isfile(path) else QIcon()
+
+
+#: 环境变量：设成文件路径时，应用只做资源自检、写报告、退出。
+#
+# 为什么需要它
+# ------------
+# "图标在源码里能用、打包后静默失效"这类问题，**只能在打包产物上验**。
+# 源码树里 assets/ 永远存在，测试全绿也说明不了包里带没带。
+# 所以给打包产物一个可自动化的自检入口，CI 构建后立刻跑它。
+RESOURCE_CHECK_ENV = "DSH_HOST_RESOURCE_CHECK"
+
+
+def resource_report() -> tuple[str, bool]:
+    """检查运行环境里的资源是否齐备。返回 (报告文本, 是否通过)。
+
+    只做"文件在不在 + QIcon 能不能加载"这两件事——纯粹的部署自检，
+    不涉及任何业务逻辑。
+    """
+    lines = [
+        "DSH Launcher 资源自检",
+        "  sys.frozen       = %s" % getattr(sys, "frozen", False),
+        "  __compiled__     = %s" % ("__compiled__" in globals()),
+        "  __file__         = %s" % globals().get("__file__", "(无)"),
+        "  argv[0]          = %s" % (sys.argv[0] if sys.argv else "(无)"),
+        "  ASSET_DIR        = %s" % ASSET_DIR,
+        "  ASSET_DIR 存在    = %s" % os.path.isdir(ASSET_DIR),
+    ]
+    ok = True
+    for label, p in (("icon.ico ", ICON_PATH),
+                     ("icon-light", ICON_FOR_DARK_BG),
+                     ("icon-dark ", ICON_FOR_LIGHT_BG)):
+        exists = os.path.isfile(p)
+        size = os.path.getsize(p) if exists else 0
+        ic = QIcon(p) if exists else QIcon()
+        loadable = not ic.isNull()
+        if not (exists and loadable):
+            ok = False
+        lines.append("  %s  存在=%-5s 大小=%-7d 可加载=%s  %s"
+                     % (label, exists, size, loadable, p))
+    lines.append("  结论             = %s" % ("通过" if ok else "**失败**"))
+    return "\n".join(lines), ok
 
 
 #: 主题跟踪的"变色"容差。小于这个差值不动手——避免因渐变/抗锯齿噪声
@@ -1580,7 +1660,7 @@ def activate_existing() -> None:
             w._show_main()
 
 
-def main() -> None:
+def main() -> int:
     sock = QLocalSocket()
     sock.connectToServer(SINGLETON_ID)
     if sock.waitForConnected(300):
@@ -1594,6 +1674,20 @@ def main() -> None:
     QApplication.setApplicationName("DSH-Web")
     QApplication.setOrganizationName("DSH")
     app = QApplication(sys.argv)
+
+    # 打包产物资源自检：设了环境变量就只检查、写报告、退出，不进 GUI。
+    # CI 构建完 exe 后立刻跑这个，用来兜住"包里没带 assets"这类问题。
+    _rc = os.environ.get(RESOURCE_CHECK_ENV)
+    if _rc:
+        text, ok = resource_report()
+        try:
+            with open(_rc, "w", encoding="utf-8") as f:
+                f.write(text + "\n")
+        except OSError as e:
+            sys.stderr.write("写报告失败: %s\n" % e)
+        print(text)
+        return 0 if ok else 3
+
     # 全局图标先跟系统主题；MainWindow 取到界面色后会再切一次
     _ic = icon_for(dwm.system_uses_dark())
     if not _ic.isNull():
@@ -1618,4 +1712,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # 必须 sys.exit(main())：main() 在资源自检失败时返回非 0，
+    # 而裸调 main() 会把返回值丢掉 → 退出码恒为 0 → CI 拦不住坏产物。
+    sys.exit(main())

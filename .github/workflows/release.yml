@@ -72,9 +72,19 @@ jobs:
       - name: 打包
         shell: bash
         run: |
+          # 关于 --include-data-dir：**不能省**。
+          #
+          # `--windows-icon-from-ico` 只是把图标塞进 exe 自身的 PE 资源
+          # （资源管理器看的那个），而运行时 QIcon("assets/xxx.ico") 是去
+          # **文件系统**读的。Nuitka onefile 不会自动带上 assets/，
+          # 少了这行，图标在源码里能用、打包后静默失效。
+          #
+          # 正确性由下面"在产物上做资源自检"那一步兜住——
+          # 它在真实产物上验证 assets 能否解析、图标能否加载。
           python -m nuitka --onefile \
             --windows-console-mode=disable \
             --windows-icon-from-ico=assets/icon.ico \
+            --include-data-dir=assets=assets \
             --enable-plugin=pyside6 \
             --include-package=dsh_host \
             --onefile-tempdir-spec={CACHE_DIR}/DSH-Web-runtime \
@@ -93,6 +103,24 @@ jobs:
           # 太小说明构建有问题，别把坏文件发出去
           if [ "$SIZE" -lt 20000000 ]; then
             echo "::error::产物只有 $SIZE 字节，明显不完整"
+            exit 1
+          fi
+
+      - name: 在产物上做资源自检
+        # 源码树里 assets/ 永远存在，所以单元测试全绿也证明不了"包里带了"。
+        # 这一步直接问打包产物自己：assets 解析到哪、图标能不能加载。
+        # 少了这一步，图标会在发布后才被发现是坏的。
+        shell: bash
+        run: |
+          # 报告用相对路径：exe 在 bash 的 cwd 下运行，避免 Windows/POSIX
+          # 路径混写带来的坑。
+          DSH_HOST_RESOURCE_CHECK="resource-check.txt" ./build/DSH-Web.exe || CODE=$?
+          CODE=${CODE:-0}
+          echo "退出码=$CODE"
+          echo "----- 自检报告 -----"
+          cat resource-check.txt 2>/dev/null || echo "(没写出报告)"
+          if [ "$CODE" != "0" ]; then
+            echo "::error::打包产物资源自检未通过（退出码 $CODE），图标会是坏的"
             exit 1
           fi
 

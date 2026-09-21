@@ -587,6 +587,35 @@ def titlebar_checks() -> list[str]:
     if not ok:
         failures.append("PrintWindow flag")
 
+    # 7j. 打包配置与退出码（易回退，且只能在"打包后"暴露问题）
+    #
+    #     Nuitka 不会自动带上 assets/ —— 少了 --include-data-dir，
+    #     图标在源码里能用、打包后静默失效。源码树的测试全绿也测不出。
+    wf = os.path.join(ROOT, ".github", "workflows", "release.yml")
+    wf_text = open(wf, encoding="utf-8").read() if os.path.isfile(wf) else ""
+    ok = "--include-data-dir=assets=assets" in wf_text
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 打包命令包含 assets 数据目录")
+    if not ok:
+        failures.append("打包漏 assets")
+        print("        Nuitka 不会自动带上 assets/，图标会静默失效")
+
+    #     资源自检必须真的能改变退出码：main() 曾声明 -> None 且裸调，
+    #     返回值被丢掉 → 退出码恒 0 → CI 拦不住坏产物。
+    src_main = open(os.path.join(ROOT, "dsh_gui_qt.py"),
+                    encoding="utf-8").read()
+    ok = ("sys.exit(main())" in src_main and "def main() -> int:" in src_main)
+    print(f"  [{'OK  ' if ok else 'FAIL'}] main() 返回值驱动退出码")
+    if not ok:
+        failures.append("退出码未传递")
+        print("        裸调 main() 会丢掉资源自检的失败码")
+
+    #     自检本身要能识别"缺资源"（判据存在且指向真实文件）
+    ok = callable(getattr(g, "resource_report", None)) and hasattr(
+        g, "RESOURCE_CHECK_ENV")
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 打包产物资源自检入口存在")
+    if not ok:
+        failures.append("资源自检缺失")
+
     # 7f. 图标必须随主题切换（黑色图标在深色标题栏上看不见）
     light_p = g.ICON_FOR_DARK_BG     # 深底用（白图标）
     dark_p = g.ICON_FOR_LIGHT_BG     # 浅底用（深图标）
