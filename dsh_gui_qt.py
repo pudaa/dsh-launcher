@@ -41,6 +41,61 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 ICON_PATH = os.path.join(ROOT, "assets", "icon.ico")
 
 
+# ---------------------------------------------------------------- 主题色探针
+#
+# L1 取色：在**界面顶部**取几个采样点，读它们"实际生效"的背景色。
+#
+# 设计要点
+# --------
+# · **只用标准 DOM API**：elementFromPoint 取该点最上层元素，
+#   getComputedStyle 读它的背景色；背景透明就沿父链上溯，
+#   直到找到一个不透明的。
+#   → 不依赖 DSH 的类名、id 或任何层级结构，所以不违反"界面层不得
+#     知道 DSH 内部结构"的分层铁律。DSH 怎么改 DOM 都不影响。
+# · 返回最多的那个颜色（众数），避免被个别异色元素带偏。
+# · 取不到就返回 null，让 Python 侧降级到像素截图。
+#
+# 为什么不用像素截图作为唯一来源：见 _sample_titlebar_color 的 docstring。
+_JS_THEME_PROBE = r"""
+(function () {
+  function parse(c) {
+    var m = /rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*([\d.]+))?\s*\)/
+              .exec(c || '');
+    if (!m) { return null; }
+    var a = (m[4] === undefined) ? 1 : parseFloat(m[4]);
+    if (!(a > 0.5)) { return null; }          // 半透明及以上不算"看得见的底色"
+    return [parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10)];
+  }
+  function effectiveBg(el) {
+    var guard = 0;
+    while (el && el.nodeType === 1 && guard++ < 64) {
+      var c = parse(getComputedStyle(el).backgroundColor);
+      if (c) { return c; }
+      el = el.parentElement;
+    }
+    return null;
+  }
+  var W = window.innerWidth, H = window.innerHeight;
+  if (W < 4 || H < 4) { return null; }
+  var ys = [0.015, 0.03, 0.05, 0.08];
+  var xs = [0.03, 0.15, 0.3, 0.45, 0.6, 0.75, 0.9, 0.97];
+  var counts = {}, best = null, bestN = 0;
+  for (var i = 0; i < ys.length; i++) {
+    var y = Math.max(1, Math.round(H * ys[i]));
+    for (var j = 0; j < xs.length; j++) {
+      var x = Math.max(1, Math.round(W * xs[j]));
+      var c = effectiveBg(document.elementFromPoint(x, y));
+      if (!c) { continue; }
+      var k = c.join(',');
+      counts[k] = (counts[k] || 0) + 1;
+      if (counts[k] > bestN) { bestN = counts[k]; best = c; }
+    }
+  }
+  return best ? best.join(',') : null;
+})();
+"""
+
+
 def host_log(msg: str) -> None:
     """桌面壳自身的运行日志。
 
@@ -757,76 +812,139 @@ class MainWindow(QMainWindow):
                      % (dwm.to_hex(bg), dwm.to_hex(rgb), dwm.to_hex(fg)))
 
     def _sample_titlebar_color(self):
-        """读界面最上方一层像素，统计主色调，给标题栏上色。
+        """取界面主题色，给标题栏上色。**三层降级**。
+
+        为什么必须降级（2026-09-21 实机教训）
+        -------------------------------------
+        原实现只有一层：`self.view.grab()`。但这是**不可靠**的来源 ——
+        QWebEngineView 的网页在独立渲染进程/合成器里画，
+        `QWidget.grab()` 不保证能拿到那些像素。实测在某些环境下它返回
+        的是 widget 自身的空白背景（整片纯色），取出来的"主题色"是
+        空白色，标题栏反而被染成一片灰白。
+
+        所以按可靠性排序依次尝试，任一层成功即止：
+
+          L1  JS 读计算样式    最准——直接拿到界面真正的背景色，
+                               与合成方式无关。用的都是标准 DOM API
+                               （elementFromPoint + getComputedStyle
+                               + 向上找非透明祖先），**不依赖 DSH 的
+                               私有类名或层级结构**，所以不违反分层铁律。
+          L2  GDI PrintWindow  向系统要窗口真实像素（已验证可靠）。
+                               截客户区顶部，兼做纯色校验。
+          L3  view.grab()      兜底。同样做纯色校验，纯色则判失败。
+
+        三层都失败就保持系统默认标题栏——**不要拿一个不可信的颜色上色**。
 
         为什么只取一次
         --------------
-        `grab()` 会触发一次完整的渲染回读，是重操作。持续取色会拖慢界面，
-        而 DSH 的主题在实际使用中基本不变。所以启动后取一次就够。
+        定时器触发一次，不做持续监听：界面主题在使用中基本不变，
+        而持续截图会拖慢界面。
 
         为什么要延迟
         ------------
-        `loadFinished` 只代表 DOM 就绪，样式和首次绘制可能还没完成——
-        这时候截到的是白色空白页，取出来的主色会是白的。
-        所以等一段固定时间再取；取到后就不再重试。
-
-        性能（实测，勿退化）
-        -------------------
-        整条链路跑在 **GUI 线程**上，耗时直接体现为界面卡顿：
-
-          grab + toImage + RGBA8888 + bytes()   约 5 ms
-          （其中 bytes() 拷贝要搬 5.7MB@1200x800）
-          dominant_color 统计                    约 1.5 ms
-          ─────────────────────────────────────────────
-          合计                                   约 6.5 ms
-
-        两个关键优化点：
-          · **只拷要用的那几行**，不整图 toBytes()。整图拷贝随分辨率线性
-            增长（4K 要 33MB），而我们只看顶部 6%。
-          · dominant_color 内部走 C 层切片 + translate（见其 docstring）。
+        `loadFinished` 只代表 DOM 就绪，样式与首绘可能还没完成，
+        这时取到的是空白页颜色。所以等一段固定时间再取。
         """
         if not config.get("adaptive_titlebar") or not dwm.available():
             return
         if self.view is None:
             return
         try:
-            shot = self.view.grab()
-            img = shot.toImage().convertToFormat(QImage.Format.Format_RGBA8888)
-            w, h = img.width(), img.height()
-            if w <= 0 or h <= 0:
-                return
-
-            # 只取顶部 6% 高度，且左右各让开 2%——避开滚动条与圆角
-            rows = max(1, int(h * 0.06))
-            pad = max(0, int(w * 0.02))
-            x0 = max(0, pad)
-            span = max(1, w - pad * 2)
-
-            # **不要** bytes(整图) —— 那会把整幅位图拷一份（1200x800 是
-            # 5.9MB，4K 是 33MB），而我们要的只是顶部 6%。
-            #
-            # PySide6 的 constBits() 返回 memoryview，可以直接按字节切片。
-            # **必须先 cast("B")** —— 默认视图的元素是 4 字节 C 结构体，
-            # 按字节切会得到错误的元素数。
-            mv = img.constBits()
-            if isinstance(mv, (bytes, bytearray)):
-                mv = memoryview(mv)
-            elif getattr(mv, "itemsize", 1) != 1:
-                mv = mv.cast("B")
-
-            stride = img.bytesPerLine()      # 不一定等于 w*4（行可能对齐填充）
-            data = b"".join(
-                bytes(mv[y * stride + x0 * 4: y * stride + (x0 + span) * 4])
-                for y in range(rows))
-
-            rgb = dwm.dominant_color(data, span, rows)
-            if rgb:
-                self._apply_titlebar(rgb)
-            else:
-                host_log("标题栏取色失败：未能统计出主色调")
+            self.view.page().runJavaScript(_JS_THEME_PROBE,
+                                           self._on_js_theme_color)
         except Exception as e:                                   # noqa: BLE001
-            # 取色失败不影响使用——标题栏保持系统默认即可
-            host_log("标题栏取色异常：%s: %s" % (type(e).__name__, e))
+            host_log("标题栏取色异常（JS）：%s: %s" % (type(e).__name__, e))
+            self._sample_by_pixels()
+
+    #: 各层取色失败的记录，用一次日志把"为什么没上色"讲清楚
+    _probe_trace: list = []
+
+    def _on_js_theme_color(self, value):
+        """L1 回调。value 形如 "30,32,36"，取不到是 None。"""
+        rgb = None
+        if isinstance(value, str):
+            parts = value.split(",")
+            if len(parts) == 3:
+                try:
+                    rgb = tuple(int(p) for p in parts)
+                except ValueError:
+                    rgb = None
+        if rgb:
+            host_log("标题栏取色：来源=JS 计算样式 %s" % dwm.to_hex(rgb))
+            self._apply_titlebar(rgb)
+            return
+        self._probe_trace.append("JS 未取到")
+        self._sample_by_pixels()
+
+    def _sample_by_pixels(self):
+        """L2 GDI PrintWindow -> L3 view.grab()。"""
+        # --- L2：窗口真实像素 ---
+        try:
+            rgb = dwm.capture_window_top(int(self.winId()))
+            if rgb:
+                host_log("标题栏取色：来源=窗口像素 %s" % dwm.to_hex(rgb))
+                self._apply_titlebar(rgb)
+                return
+            self._probe_trace.append("窗口像素未取到（纯色或截取失败）")
+        except Exception as e:                                   # noqa: BLE001
+            self._probe_trace.append("窗口像素异常 %s" % type(e).__name__)
+
+        # --- L3：控件截图兜底 ---
+        try:
+            rgb = self._grab_view_color()
+            if rgb:
+                host_log("标题栏取色：来源=控件截图 %s" % dwm.to_hex(rgb))
+                self._apply_titlebar(rgb)
+                return
+            self._probe_trace.append("控件截图未取到（纯色）")
+        except Exception as e:                                   # noqa: BLE001
+            self._probe_trace.append("控件截图异常 %s" % type(e).__name__)
+
+        host_log("标题栏取色三层均失败，保持系统默认标题栏：%s"
+                 % "；".join(self._probe_trace))
+        self._probe_trace = []
+
+    def _grab_view_color(self):
+        """L3：截 QWebEngineView 取色。截不到有效内容返回 None。
+
+        两段式判断：**空白判定看整幅**，取色只看顶部一条。
+        不能只拿顶部一条判空白——真实界面的顶部可能就是一条纯色工具栏，
+        那完全正常，据此判"没渲染"会误杀。
+
+        性能：只拷顶部 6%，不整图 toBytes()（整图 1200x800 是 5.7MB、
+        4K 是 33MB）。constBits 的 memoryview 需先 cast("B")——默认
+        视图元素是 4 字节结构体，按字节切会算错元素数。
+        """
+        img = self.view.grab().toImage().convertToFormat(
+            QImage.Format.Format_RGBA8888)
+        w, h = img.width(), img.height()
+        if w <= 0 or h <= 0:
+            return None
+        mv = img.constBits()
+        if isinstance(mv, (bytes, bytearray)):
+            mv = memoryview(mv)
+        elif getattr(mv, "itemsize", 1) != 1:
+            mv = mv.cast("B")
+        stride = img.bytesPerLine()      # 不一定等于 w*4（行可能对齐填充）
+        pad = max(0, int(w * 0.02))
+        x0, span = pad, max(1, w - pad * 2)
+
+        def _rows(y0, n):
+            """取第 y0 行起的 n 行（左右各让开 pad），紧排成 RGB 缓冲。"""
+            return b"".join(
+                bytes(mv[y * stride + x0 * 4: y * stride + (x0 + span) * 4])
+                for y in range(y0, min(y0 + n, h)))
+
+        # 先判整幅是否一片纯色（没渲染出来的控件背景就是整片同色）
+        full = _rows(0, h)
+        if not full or dwm.flat_ratio(full, span, h) >= dwm.FLAT_RATIO:
+            return None
+
+        rows = max(1, int(h * 0.06))
+        top = _rows(0, rows)
+        if not top:
+            return None
+        return dwm.dominant_color(top, span, len(top) // (span * 4))
 
     # ----------------------------------------------------------- 托盘
 

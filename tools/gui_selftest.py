@@ -6,10 +6,19 @@
 import os
 import sys
 import ctypes
+import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+# 隔离配置目录：config 的数据根是 %LOCALAPPDATA%\DSH-Web，是**用户的真实配置**。
+# 本脚本会构造 MainWindow，其中的菜单回调可能写配置——必须重定向到沙箱，
+# 否则"跑个测试"就会改掉用户的设置。
+# 教训来源：titlebar_e2e.py 曾把 adaptive_titlebar 写成 false，导致功能被关。
+_SANDBOX = os.path.join(tempfile.gettempdir(), "dsh-launcher-test-cfg")
+os.makedirs(_SANDBOX, exist_ok=True)
+os.environ["LOCALAPPDATA"] = _SANDBOX
 
 # 输出强制 UTF-8。默认 stdout 编码跟随系统区域设置——在 cp1252 的机器上
 # （CI 的 windows runner 就是这样）打印中文会直接 UnicodeEncodeError 崩掉，
@@ -458,7 +467,56 @@ def titlebar_checks() -> list[str]:
         failures.append("取色性能")
         print("        疑似退化为逐像素 Python 循环（优化前约 20ms）")
 
-    # 7. ctypes 签名必须显式声明
+    # 7. 空白检测（flat_ratio）—— 三层降级取色的基石
+    #    未渲染的控件截图整片同色，取出的"主色调"是空白色，
+    #    拿它上标题栏比不上色更糟，所以必须能识别出来。
+    _flat = bytes((243, 243, 243, 255)) * 500
+    _var = bytes((34, 193, 163, 255)) * 250 + bytes((30, 32, 36, 255)) * 250
+    fr_flat = dwm.flat_ratio(_flat, 50, 10)
+    fr_var = dwm.flat_ratio(_var, 50, 10)
+    ok = fr_flat >= dwm.FLAT_RATIO and fr_var < dwm.FLAT_RATIO
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 空白检测：纯色 {fr_flat:.3f} / 有内容 {fr_var:.3f}")
+    if not ok:
+        failures.append("空白检测")
+
+    # 7b. require_variety 必须让纯色返回 None（而不是返回那个空白色）
+    ok = (dwm.dominant_color(_flat, 50, 10, require_variety=True) is None
+          and dwm.dominant_color(_flat, 50, 10) is not None)
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 纯色时 require_variety 返回 None")
+    if not ok:
+        failures.append("require_variety")
+
+    # 7c. 三层降级取色的骨架必须齐全
+    #    单一来源（view.grab()）已证不可靠，必须有降级链。
+    need = ["_sample_titlebar_color", "_on_js_theme_color",
+            "_sample_by_pixels", "_grab_view_color"]
+    missing = [n for n in need if not hasattr(g.MainWindow, n)]
+    print(f"  [{'OK  ' if not missing else 'FAIL'}] 三层取色方法齐全（JS/像素/控件）")
+    if missing:
+        failures.append("取色降级链")
+        print("        缺失:", missing)
+
+    # 7d. JS 探针只能用标准 DOM API，不得出现 DSH 私有选择器
+    js = getattr(g, "_JS_THEME_PROBE", "")
+    uses_std = ("elementFromPoint" in js and "getComputedStyle" in js
+                and "parentElement" in js)
+    # 私有选择器特征：querySelector 带类名/id、以及 DSH 相关字样
+    leaky = [t for t in ("querySelector", "getElementById", "dsh-", "DSH")
+             if t in js]
+    ok = uses_std and not leaky
+    print(f"  [{'OK  ' if ok else 'FAIL'}] JS 探针只用标准 DOM API（无 DSH 私有选择器）")
+    if not ok:
+        failures.append("JS 探针分层")
+        print(f"        标准API={uses_std} 可疑字样={leaky}")
+
+    # 7e. PrintWindow flag 必须是 PW_RENDERFULLCONTENT(2)
+    #     用 0 只画客户区，拿不到 DWM 绘制的部分。
+    ok = getattr(dwm, "PW_RENDERFULLCONTENT", None) == 2
+    print(f"  [{'OK  ' if ok else 'FAIL'}] PrintWindow 使用 PW_RENDERFULLCONTENT")
+    if not ok:
+        failures.append("PrintWindow flag")
+
+    # 8. ctypes 签名必须显式声明
     #    这是踩过的坑：不声明 argtypes 时 HWND 按 C int 封送，
     #    64 位下句柄稍大就传错值。声明是硬要求，不是优化。
     try:

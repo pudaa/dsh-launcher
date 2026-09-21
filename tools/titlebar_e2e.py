@@ -12,15 +12,37 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
+import tempfile
 from ctypes import wintypes
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# ---------------------------------------------------------------
+# 关键：隔离配置目录，绝不写真实 settings.json
+# ---------------------------------------------------------------
+# 教训（2026-09-20）：本脚本原先直接调 config.set(adaptive_titlebar=False)，
+# 而 config 的数据根是 %LOCALAPPDATA%\DSH-Web —— 那是**老大的真实配置**。
+# 结果：跑一次测试就把「标题栏跟随界面配色」永久关掉了，导致老大
+# 实机运行时完全没效果，白排查一场。
+#
+# config._local_appdata() 每次调用都读环境变量，所以在导入任何会写配置的
+# 模块**之前**改写 LOCALAPPDATA，就能把全部读写重定向到沙箱目录。
+# 必须放在 dsh_host 导入之前。
+_SANDBOX = os.path.join(tempfile.gettempdir(), "dsh-launcher-test-cfg")
+os.makedirs(_SANDBOX, exist_ok=True)
+os.environ["LOCALAPPDATA"] = _SANDBOX
+
 from PySide6.QtCore import QTimer                                    # noqa: E402
 from PySide6.QtWidgets import QApplication, QMainWindow              # noqa: E402
 
 from dsh_host import config, dwm                                     # noqa: E402
+
+# 断言隔离生效——不生效就立刻失败，而不是悄悄污染老大配置
+_real_root = os.path.join(os.environ.get("LOCALAPPDATA", ""), "DSH-Web")
+assert config.data_root().startswith(_SANDBOX), (
+    "配置目录隔离失败！data_root=%s 不在沙箱 %s 内，拒绝继续以免污染真实配置"
+    % (config.data_root(), _SANDBOX))
 
 user32 = ctypes.windll.user32
 gdi32 = ctypes.windll.gdi32

@@ -192,6 +192,165 @@ def color_near(a: tuple[int, int, int], b: tuple[int, int, int],
     return all(abs(a[i] - b[i]) <= tol for i in range(3))
 
 
+# ------------------------------------------------- 窗口像素取色（GDI）
+#
+# 为什么不用 Qt 的 widget.grab()
+# ------------------------------
+# `QWidget.grab()` / `QScreen.grabWindow()` 都**不保证**能拿到子窗口的
+# 实际绘制内容。实测 `QWebEngineView.grab()` 返回的是 widget 自身的
+# 空白背景（整片纯色），因为 WebEngine 的网页在独立合成器里渲染。
+#
+# Win32 的 `PrintWindow(hwnd, dc, PW_RENDERFULLCONTENT)` 直接向系统要
+# **窗口的真实像素**，不依赖控件怎么实现绘制。已实测能正确截到窗口
+# 标题栏与客户区（见 tools/dwm_verify.py）。
+#
+# PrintWindow 同样可能拿到陈旧帧，所以取完做「一片纯色」校验，
+# 不合格就返回 None 让调用方降级——不要把一个空白色当成主题色。
+
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+class _RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+class _BMIH(ctypes.Structure):
+    _fields_ = [("biSize", wintypes.DWORD), ("biWidth", ctypes.c_long),
+                ("biHeight", ctypes.c_long), ("biPlanes", wintypes.WORD),
+                ("biBitCount", wintypes.WORD),
+                ("biCompression", wintypes.DWORD),
+                ("biSizeImage", wintypes.DWORD),
+                ("biXPelsPerMeter", ctypes.c_long),
+                ("biYPelsPerMeter", ctypes.c_long),
+                ("biClrUsed", wintypes.DWORD),
+                ("biClrImportant", wintypes.DWORD)]
+
+
+#: PrintWindow 的 flag：不传这个只画客户区，拿不到 DWM 绘制的部分
+PW_RENDERFULLCONTENT = 2
+
+
+def _grab_window_bgra(hwnd: int):
+    """GDI 截取整个窗口（含扩展边框）。返回 (BGRA bytes, w, h) 或 (b'', 0, 0)。"""
+    if not IS_WINDOWS or not hwnd:
+        return b"", 0, 0
+    try:
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+        rect = _RECT()
+        if not user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rect)):
+            return b"", 0, 0
+        w, h = rect.right - rect.left, rect.bottom - rect.top
+        if w <= 0 or h <= 0:
+            return b"", 0, 0
+
+        hdc = user32.GetWindowDC(wintypes.HWND(hwnd))
+        memdc = gdi32.CreateCompatibleDC(hdc)
+        bmp = gdi32.CreateCompatibleBitmap(hdc, w, h)
+        gdi32.SelectObject(memdc, bmp)
+        user32.PrintWindow(wintypes.HWND(hwnd), memdc, PW_RENDERFULLCONTENT)
+
+        bi = _BMIH()
+        bi.biSize = ctypes.sizeof(_BMIH)
+        bi.biWidth = w
+        bi.biHeight = -h               # 负值 = 自上而下
+        bi.biPlanes = 1
+        bi.biBitCount = 32
+        buf = ctypes.create_string_buffer(w * h * 4)
+        gdi32.GetDIBits(memdc, bmp, 0, h, buf, ctypes.byref(bi), 0)
+
+        gdi32.DeleteObject(bmp)
+        gdi32.DeleteDC(memdc)
+        user32.ReleaseDC(wintypes.HWND(hwnd), hdc)
+        return buf.raw, w, h
+    except Exception:                                          # noqa: BLE001
+        return b"", 0, 0
+
+
+def capture_window_top(hwnd: int, rows_frac: float = 0.06
+                       ) -> tuple[int, int, int] | None:
+    """截取窗口**客户区**顶部一条，统计主色调。截不到有效内容返回 None。
+
+    两段式判断（重要，别简化成一段）
+    -------------------------------
+      · **取色**只看顶部一条（要匹配的是界面顶部的观感）
+      · **空白判定**看整个客户区
+
+    为什么不能只拿顶部一条做空白判定：真实界面的顶部 6% 很可能本身
+    就是一条纯色工具栏——那是完全正常的，若据此判"没渲染"就会误杀，
+    标题栏永远上不了色。
+
+    客户区偏移用 GetClientRect + ClientToScreen 算，不猜：
+    PrintWindow 给的是含标题栏与边框的整窗位图，直接裁顶部会取到
+    系统标题栏的颜色（那就成了"标题栏跟随标题栏"，毫无意义）。
+    """
+    data, w, h = _grab_window_bgra(hwnd)
+    if not data or w <= 0 or h <= 0:
+        return None
+
+    # 客户区在整窗位图中的原点
+    try:
+        user32 = ctypes.windll.user32
+        crect = _RECT()
+        user32.GetClientRect(wintypes.HWND(hwnd), ctypes.byref(crect))
+        pt = _POINT(0, 0)
+        user32.ClientToScreen(wintypes.HWND(hwnd), ctypes.byref(pt))
+        wrect = _RECT()
+        user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(wrect))
+        ox = max(0, pt.x - wrect.left)
+        oy = max(0, pt.y - wrect.top)
+        cw = min(crect.right, w - ox)
+        ch = min(crect.bottom, h - oy)
+    except Exception:                                          # noqa: BLE001
+        ox, oy, cw, ch = 0, 0, w, h
+
+    if cw < 8 or ch < 8:
+        return None
+
+    stride = w * 4                      # PrintWindow 按**窗口**宽给的步长
+
+    def _rgba_rows(y_from: int, n_rows: int) -> bytes:
+        """取客户区从 y_from 起的 n_rows 行，转成 RGB 连续缓冲。"""
+        seg = bytearray()
+        for y in range(oy + y_from, min(oy + y_from + n_rows, oy + ch)):
+            s = y * stride + ox * 4
+            e = s + cw * 4
+            if e > len(data):
+                break
+            row = bytearray(data[s:e])
+            row[0::4], row[2::4] = row[2::4], row[0::4]      # BGRA -> RGBA
+            seg += row
+        return bytes(seg)
+
+    # --- 第一段：整个客户区是否"一片纯色"（= 没渲染出来）---
+    full = _rgba_rows(0, ch)
+    if not full or flat_ratio(full, cw, ch) >= FLAT_RATIO:
+        return None
+
+    # --- 第二段：取顶部一条的主色调 ---
+    rows = max(1, min(ch, int(ch * rows_frac)))
+    pad = max(0, int(cw * 0.02))
+    x0 = max(0, pad)
+    span = max(1, cw - pad * 2)
+
+    top = bytearray()
+    for y in range(oy, oy + rows):
+        s = y * stride + (ox + x0) * 4
+        e = s + span * 4
+        if e > len(data):
+            break
+        row = bytearray(data[s:e])
+        row[0::4], row[2::4] = row[2::4], row[0::4]
+        top += row
+    if not top:
+        return None
+
+    return dominant_color(bytes(top), span, len(top) // (span * 4))
+
+
 # ---------------------------------------------------------------- 取色
 
 def luminance(rgb: tuple[int, int, int]) -> float:
@@ -278,7 +437,9 @@ def contrast_text(bg: tuple[int, int, int],
 
 def dominant_color(image_bytes: bytes, width: int, height: int,
                    sample_rows: int = 0, skip_left: int = 0,
-                   skip_right: int = 0) -> tuple[int, int, int] | None:
+                   skip_right: int = 0,
+                   require_variety: bool = False
+                   ) -> tuple[int, int, int] | None:
     """从 RGBA 像素数据里统计主色调。
 
     参数
@@ -286,6 +447,9 @@ def dominant_color(image_bytes: bytes, width: int, height: int,
     sample_rows : 取最上方的多少行参与统计。0 表示全部。
                   只取顶部是因为要匹配的是"界面顶部的观感"。
     skip_left / skip_right : 左右各跳过多少像素。
+    require_variety : 要求画面"有变化"。整片纯色时返回 None 而不是
+                  返回那个纯色本身——空白截图（未渲染）取出来的
+                  "主色调"是空白色，拿它上标题栏比不上色更糟。
 
     做法是量化到 16 级一档再统计众数，而不是求平均——
     平均会把高饱和的主色和背景色混成一团灰，那正是"突兀"的来源。
@@ -339,6 +503,55 @@ def dominant_color(image_bytes: bytes, width: int, height: int,
     if not image_bytes or width <= 0 or height <= 0:
         return None
 
+    buckets = _bucketize(image_bytes, width, height, sample_rows,
+                         skip_left, skip_right)
+    if buckets is None:
+        return None
+    chroma, neutral, n_votes = buckets
+
+    # 有彩像素要占到一定比例，才算界面的主题色
+    n_chroma = sum(chroma.values())
+    strong = bool(n_votes) and n_chroma / n_votes >= _CHROMA_MIN_RATIO
+
+    pool = chroma if (strong and chroma) else neutral
+    if not pool:
+        return None
+
+    best, top_n = max(pool.items(), key=lambda kv: kv[1])
+
+    # 「一片纯色」检测：空白截图（未渲染）会整片同色，取出来的"主色调"
+    # 就是那个空白色 —— 拿它上标题栏比不上色更糟，所以判为失败。
+    if require_variety and n_votes and top_n / n_votes >= FLAT_RATIO:
+        return None
+
+    # 还原到档位中心，避免取色偏暗
+    return (best[0] << 4 | 0x8, best[1] << 4 | 0x8, best[2] << 4 | 0x8)
+
+
+#: 单个量化档位占比达到此值即视为「一片纯色」（未渲染/空白）
+FLAT_RATIO = 0.97
+
+#: 有彩像素占采样面积的比例达到此值，才认为界面确实有主题色。
+#  取值依据：真实一次采样 4w~12w 像素，0.5% 相当于 200~600 个像素 ——
+#  这个量级才是"界面上真有一块彩色"，低于它多半是图标边缘抗锯齿、
+#  滚动条、圆角过渡之类的杂色。
+_CHROMA_MIN_RATIO = 0.005
+
+
+def _bucketize(image_bytes: bytes, width: int, height: int,
+               sample_rows: int = 0, skip_left: int = 0,
+               skip_right: int = 0):
+    """降采样 + 量化 + 分桶，返回 (chroma, neutral, n_votes)；无效入参返回 None。
+
+    键是 3 字节的量化档位三元组，值是计数。chroma = 有彩像素，
+    neutral = 近灰像素。
+
+    抽出来是为了让 `dominant_color` 与 `flat_ratio` 共用同一套裁剪／
+    量化／降采样逻辑——两处各写一遍必然漂移。
+    """
+    if not image_bytes or width <= 0 or height <= 0:
+        return None
+
     rows = min(sample_rows, height) if sample_rows else height
     x0 = max(0, skip_left)
     x1 = min(width, width - skip_right)
@@ -347,15 +560,6 @@ def dominant_color(image_bytes: bytes, width: int, height: int,
 
     stride = width * 4                     # RGBA8888
 
-    #: 饱和度高于此值算"有彩"，参与主色调竞争
-    SAT_MIN = 0.15
-    #: 有彩像素占采样面积的比例达到此值，才认为界面确实有主题色。
-    #  取值依据：真实调用一次采样 4w~12w 像素（rows=6%高、左右各让开 2%），
-    #  0.5% 相当于 200~600 个像素 —— 这个量级才是"界面上真有一块彩色"，
-    #  低于它多半是图标边缘抗锯齿、滚动条、圆角过渡之类的杂色。
-    CHROMA_MIN_RATIO = 0.005
-
-    # ---------------------------------------------------------- 快路径
     # 整块检查有没有透明像素。bytes.find 在 C 层跑，没有就完全不用
     # 走 Python 循环逐像素查 alpha —— 而绝大多数截图都是全不透明的。
     scan_end = min(len(image_bytes), rows * stride)
@@ -365,7 +569,6 @@ def dominant_color(image_bytes: bytes, width: int, height: int,
     buf = b"".join(image_bytes[y * stride + x0 * 4: y * stride + x1 * 4]
                    for y in range(rows))
     span = x1 - x0
-    n_pix = rows * span
 
     rgb = _strip_alpha(buf) if no_alpha else _strip_alpha_masked(buf)
     n_pix = len(rgb) // 3
@@ -397,17 +600,34 @@ def dominant_color(image_bytes: bytes, width: int, height: int,
         else:
             neutral[key] = neutral.get(key, 0) + 1
 
-    # 有彩像素要占到一定比例，才算界面的主题色
-    n_chroma = sum(chroma.values())
-    strong = bool(n_votes) and n_chroma / n_votes >= CHROMA_MIN_RATIO
+    return chroma, neutral, n_votes
 
-    pool = chroma if (strong and chroma) else neutral
-    if not pool:
-        return None
 
-    best = max(pool.items(), key=lambda kv: kv[1])[0]
-    # 还原到档位中心，避免取色偏暗
-    return (best[0] << 4 | 0x8, best[1] << 4 | 0x8, best[2] << 4 | 0x8)
+def flat_ratio(image_bytes: bytes, width: int, height: int,
+               sample_rows: int = 0, skip_left: int = 0,
+               skip_right: int = 0) -> float:
+    """最大颜色档位占采样像素的比例。1.0 = 整片同色。
+
+    用途：判断一次截图是不是**空白**（控件没渲染出来）。空白截图整片
+    同色，取出的"主色调"是那个空白色 —— 拿它上标题栏比不上色更糟，
+    所以要能识别出来并降级。
+
+    注意：判断"整体是否空白"要**看整块区域**，而不是只看要取色的那条。
+    真实界面的顶部 6% 可能本身就是一条纯色工具栏（完全正常），
+    若拿它做纯色判断会误杀。
+    """
+    b = _bucketize(image_bytes, width, height, sample_rows,
+                   skip_left, skip_right)
+    if b is None:
+        return 1.0
+    chroma, neutral, n_votes = b
+    if not n_votes:
+        return 1.0
+    top = 0
+    for d in (chroma, neutral):
+        if d:
+            top = max(top, max(d.values()))
+    return top / n_votes
 
 
 #: 量化查表：每字节 >> 4（用 translate 在 C 层完成）
@@ -445,41 +665,6 @@ def _strip_alpha_masked(buf: bytes) -> bytes:
         if buf[i + 3] >= 8:
             out += buf[i:i + 3]
     return bytes(out)
-    neutral: dict[tuple[int, int, int], int] = {}
-    total = 0
-
-    for y in range(rows):
-        base = y * stride
-        for x in range(x0, x1):
-            i = base + x * 4
-            if i + 3 >= len(image_bytes):
-                break
-            if image_bytes[i + 3] < 8:     # 全透明像素不参与
-                continue
-            total += 1
-            r, g, b = image_bytes[i], image_bytes[i + 1], image_bytes[i + 2]
-
-            # 量化到 16 级一档，减少噪声导致的"每像素一个颜色"
-            key = (r >> 4, g >> 4, b >> 4)
-            mx, mn = max(r, g, b), min(r, g, b)
-            sat = (mx - mn) / 255.0
-
-            if sat >= SAT_MIN:
-                chroma[key] = chroma.get(key, 0) + 1
-            else:
-                neutral[key] = neutral.get(key, 0) + 1
-
-    # 有彩像素要占到一定比例，才算界面的主题色
-    n_chroma = sum(chroma.values())
-    strong = bool(total) and n_chroma / total >= CHROMA_MIN_RATIO
-
-    pool = chroma if (strong and chroma) else neutral
-    if not pool:
-        return None
-
-    best = max(pool.items(), key=lambda kv: kv[1])[0]
-    # 还原到档位中心，避免取色偏暗
-    return (best[0] << 4 | 0x8, best[1] << 4 | 0x8, best[2] << 4 | 0x8)
 
 
 def to_hex(rgb: tuple[int, int, int]) -> str:
