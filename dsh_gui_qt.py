@@ -38,7 +38,26 @@ APP_TITLE = "DSH — DeepSeek Harness"
 SINGLETON_ID = "DSH-Web-singleton"
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+#: 早期内置的单色图标，仅作兜底
 ICON_PATH = os.path.join(ROOT, "assets", "icon.ico")
+
+# 随标题栏深浅切换的两套图标。
+#
+# 为什么必须两套：DSH 的暗色主题下标题栏是深色，**黑色图标等于看不见**
+# （老大实机发现）。所以深色标题栏配白色图标、浅色标题栏配深色图标。
+#
+# 两份 ico 由 tools/make_icons.py 从 assets/deepseek.svg 生成，
+# 每个文件内含 16~256 共 9 个尺寸——单尺寸 ICO 在小图标下会糊。
+ICON_FOR_DARK_BG = os.path.join(ROOT, "assets", "icon-light.ico")
+ICON_FOR_LIGHT_BG = os.path.join(ROOT, "assets", "icon-dark.ico")
+
+
+def icon_for(dark_bg: bool) -> QIcon:
+    """按底色深浅挑图标。两套都找不到就退回内置单色图标。"""
+    path = ICON_FOR_DARK_BG if dark_bg else ICON_FOR_LIGHT_BG
+    if not os.path.isfile(path):
+        path = ICON_PATH
+    return QIcon(path) if os.path.isfile(path) else QIcon()
 
 
 # ---------------------------------------------------------------- 主题色探针
@@ -724,8 +743,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
-        if os.path.isfile(ICON_PATH):
-            self.setWindowIcon(QIcon(ICON_PATH))
+        # 图标在下方 _set_theme_icon(dwm.system_uses_dark()) 里设置——
+        # 单色图标 ICON_PATH 已不够用：黑色图标在深色标题栏上看不见。
         self.resize(1360, 860)
         self.setMinimumSize(960, 600)
 
@@ -738,6 +757,10 @@ class MainWindow(QMainWindow):
 
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
+        # 初始图标跟随**系统**主题——此刻还不知道界面是什么色。
+        # 取色成功后会被 _set_theme_icon 换成匹配界面底色的那套。
+        self._icon_dark_bg = None
+        self._set_theme_icon(dwm.system_uses_dark())
         self._build_loading_page()
         self._build_tray()
 
@@ -807,11 +830,44 @@ class MainWindow(QMainWindow):
         dwm.set_text_color(self, fg)
         dwm.set_border_color(self, bg)
         dwm.set_dark_mode(self, dark)
+        # 图标要跟着底色走：深色标题栏配白图标，否则黑图标看不见。
+        # 用 try 包住——图标设置失败绝不能影响上色这个主功能。
+        try:
+            self._set_theme_icon(dark)
+        except Exception as e:                                   # noqa: BLE001
+            host_log("切换主题图标失败（不影响上色）：%s: %s"
+                     % (type(e).__name__, e))
         if ok:
             host_log("标题栏上色：底色 %s（取自界面 %s）文字 %s"
                      % (dwm.to_hex(bg), dwm.to_hex(rgb), dwm.to_hex(fg)))
 
-    def _sample_titlebar_color(self):
+    def _set_theme_icon(self, dark_bg: bool) -> None:
+        """按标题栏深浅切换窗口/托盘图标。
+
+        用实例属性记住上次的状态，避免每次重设——重设窗口图标会让
+        任务栏图标闪一下，而且托盘图标重建代价更高。
+        """
+        if getattr(self, "_icon_dark_bg", "unset") == dark_bg:
+            return
+        ic = icon_for(dark_bg)
+        if ic.isNull():
+            return
+        self._icon_dark_bg = dark_bg
+        self.setWindowIcon(ic)
+        app = QApplication.instance()
+        if app is not None:
+            try:
+                app.setWindowIcon(ic)
+            except Exception:                                      # noqa: BLE001
+                pass
+        tray = getattr(self, "tray", None)
+        if tray is not None:
+            try:
+                tray.setIcon(ic)
+            except Exception:                                      # noqa: BLE001
+                pass
+
+    def _sample_titlebar_color(self, attempt: int = 0):
         """取界面主题色，给标题栏上色。**三层降级**。
 
         为什么必须降级（2026-09-21 实机教训）
@@ -849,6 +905,8 @@ class MainWindow(QMainWindow):
             return
         if self.view is None:
             return
+        self._tb_attempt = attempt
+        self._probe_trace = []
         try:
             self.view.page().runJavaScript(_JS_THEME_PROBE,
                                            self._on_js_theme_color)
@@ -858,6 +916,8 @@ class MainWindow(QMainWindow):
 
     #: 各层取色失败的记录，用一次日志把"为什么没上色"讲清楚
     _probe_trace: list = []
+    #: 当前是第几次尝试（用于退避重试）
+    _tb_attempt: int = 0
 
     def _on_js_theme_color(self, value):
         """L1 回调。value 形如 "30,32,36"，取不到是 None。"""
@@ -902,7 +962,9 @@ class MainWindow(QMainWindow):
 
         host_log("标题栏取色三层均失败，保持系统默认标题栏：%s"
                  % "；".join(self._probe_trace))
-        self._probe_trace = []
+        # 多半是页面还没画出来（loadFinished 早于首绘）。退避后重试，
+        # 而不是立刻放弃或死等。
+        self._schedule_titlebar_probe(self._tb_attempt + 1)
 
     def _grab_view_color(self):
         """L3：截 QWebEngineView 取色。截不到有效内容返回 None。
@@ -929,19 +991,23 @@ class MainWindow(QMainWindow):
         pad = max(0, int(w * 0.02))
         x0, span = pad, max(1, w - pad * 2)
 
-        def _rows(y0, n):
+        def _rows(y0, n, step=1):
             """取第 y0 行起的 n 行（左右各让开 pad），紧排成 RGB 缓冲。"""
             return b"".join(
                 bytes(mv[y * stride + x0 * 4: y * stride + (x0 + span) * 4])
-                for y in range(y0, min(y0 + n, h)))
+                for y in range(y0, min(y0 + n, h), step))
 
-        # 先判整幅是否一片纯色（没渲染出来的控件背景就是整片同色）
-        full = _rows(0, h)
-        if not full or dwm.flat_ratio(full, span, h) >= dwm.FLAT_RATIO:
+        # 先判整幅是否一片纯色（没渲染出来的控件背景就是整片同色）。
+        # 按行抽样——逐行全转在 4K 下要搬 33MB，而"是否空白"只需
+        # 有代表性的采样。上限约 96 行，代价与分辨率解耦。
+        step_y = max(1, h // 96)
+        full = _rows(0, h, step=step_y)
+        sampled = len(range(0, h, step_y))
+        if not full or dwm.flat_ratio(full, span, sampled) >= dwm.FLAT_RATIO:
             return None
 
         rows = max(1, int(h * 0.06))
-        top = _rows(0, rows)
+        top = _rows(0, rows)          # 取色这一条要逐行，保证准确
         if not top:
             return None
         return dwm.dominant_color(top, span, len(top) // (span * 4))
@@ -1086,17 +1152,44 @@ class MainWindow(QMainWindow):
         host_log("服务就绪：%s | 端口 %s | 来源 %s"
                  % (handle.install.describe(), handle.port, handle.install.source))
         self._ensure_webview()
-        self.view.loadFinished.connect(lambda ok: self.stack.setCurrentIndex(1)
-                                       if ok else None)
+        self.view.loadFinished.connect(self._on_view_loaded)
         self.view.load(QUrl(handle.url))
         QTimer.singleShot(15000, lambda: self.stack.setCurrentIndex(1))
         self._refresh_menu()
         if config.get("check_update_on_start"):
             QTimer.singleShot(3000, lambda: self._check_update(manual=False))
-        # 标题栏取色：必须等界面真的画出来。loadFinished 只代表 DOM 就绪，
-        # 此时截到的是空白页（主色会是白的），所以延迟到位后再取。
-        if config.get("adaptive_titlebar"):
-            QTimer.singleShot(4000, self._sample_titlebar_color)
+
+    def _on_view_loaded(self, ok: bool):
+        """页面加载完成回调。
+
+        标题栏取色在这里触发，而**不是**等一个固定时长。
+        早期实现是 `singleShot(4000, ...)` 死等 4 秒，老大反馈
+        "加载完网页后有明显延迟"——正是这 4 秒。
+
+        现在改成"立刻试一次 + 失败退避重试"：既然有了空白检测
+        （见 dwm.FLAT_RATIO），就能区分"页面还没画出来"和"页面本身是纯色"，
+        于是在页面真正渲染完成的那一刻就上色，通常 1 秒内完成。
+        """
+        if ok:
+            self.stack.setCurrentIndex(1)
+        if ok and config.get("adaptive_titlebar") and dwm.available():
+            self._schedule_titlebar_probe(0)
+
+    #: 标题栏取色的重试节奏（毫秒）。首次很快，之后逐步退避，
+    #  累计约 7.7 秒 —— 足够覆盖冷启动的样式计算与首绘，
+    #  而正常情况第一次就成功，用户感知不到等待。
+    _TB_RETRY_MS = (250, 400, 600, 900, 1300, 1800, 2400)
+
+    def _schedule_titlebar_probe(self, attempt: int):
+        """安排第 attempt 次取色。"""
+        if not config.get("adaptive_titlebar") or not dwm.available():
+            return
+        if attempt >= len(self._TB_RETRY_MS):
+            host_log("标题栏取色：重试 %d 次仍未取到，放弃（保持系统默认）"
+                     % attempt)
+            return
+        QTimer.singleShot(self._TB_RETRY_MS[attempt],
+                          lambda a=attempt: self._sample_titlebar_color(a))
 
     def _on_failed(self, msg: str):
         host_log("启动失败：%s" % msg.replace("\n", " | ")[:600])
@@ -1343,6 +1436,9 @@ class MainWindow(QMainWindow):
             self._sample_titlebar_color()
         else:
             dwm.reset(self)
+            # 标题栏交还系统了，图标也要跟着回到系统主题——
+            # 否则深色界面配白图标、浅色系统标题栏配白图标，又是一片糊。
+            self._set_theme_icon(dwm.system_uses_dark())
 
     # ----------------------------------------------------------- 窗口行为
 
@@ -1405,8 +1501,10 @@ def main() -> None:
     QApplication.setApplicationName("DSH-Web")
     QApplication.setOrganizationName("DSH")
     app = QApplication(sys.argv)
-    if os.path.isfile(ICON_PATH):
-        app.setWindowIcon(QIcon(ICON_PATH))
+    # 全局图标先跟系统主题；MainWindow 取到界面色后会再切一次
+    _ic = icon_for(dwm.system_uses_dark())
+    if not _ic.isNull():
+        app.setWindowIcon(_ic)
 
     server = QLocalServer()
     server.listen(SINGLETON_ID)

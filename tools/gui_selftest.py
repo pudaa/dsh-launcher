@@ -516,6 +516,54 @@ def titlebar_checks() -> list[str]:
     if not ok:
         failures.append("PrintWindow flag")
 
+    # 7f. 图标必须随主题切换（黑色图标在深色标题栏上看不见）
+    light_p = g.ICON_FOR_DARK_BG     # 深底用（白图标）
+    dark_p = g.ICON_FOR_LIGHT_BG     # 浅底用（深图标）
+    have = os.path.isfile(light_p) and os.path.isfile(dark_p)
+    differs = False
+    if have:
+        import hashlib
+        differs = (hashlib.md5(open(light_p, "rb").read()).hexdigest()
+                   != hashlib.md5(open(dark_p, "rb").read()).hexdigest())
+    ic_l = g.icon_for(True)
+    ic_d = g.icon_for(False)
+    ok = have and differs and not ic_l.isNull() and not ic_d.isNull()
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 深浅两套图标存在且不同")
+    if not ok:
+        failures.append("主题图标")
+        print(f"        存在={have} 不同={differs} "
+              f"可加载={not ic_l.isNull()}/{not ic_d.isNull()}")
+
+    # 7g. 取色重试节奏：必须是递增退避，且总时长合理（别退化成秒级死等）
+    retry = list(getattr(g.MainWindow, "_TB_RETRY_MS", []))
+    total = sum(retry)
+    ok = (len(retry) >= 3 and all(retry[i] < retry[i + 1]
+                                  for i in range(len(retry) - 1))
+          and 1000 <= total <= 15000)
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 取色重试递增退避（{len(retry)} 次共 {total}ms）")
+    if not ok:
+        failures.append("取色重试节奏")
+        print(f"        实际: {retry}")
+
+    # 7h. 不能残留"固定死等"式取色触发
+    #     老大反馈过"加载完网页后有明显延迟"，罪魁就是 QTimer.singleShot(4000)。
+    #     注意匹配要带 QTimer. 前缀——docstring 里为说明历史也写了
+    #     "singleShot(4000, ...)"，不带前缀会误伤自己。
+    src = open(os.path.join(ROOT, "dsh_gui_qt.py"), encoding="utf-8").read()
+    ok = ("QTimer.singleShot(4000" not in src
+          and "loadFinished.connect(self._on_view_loaded)" in src)
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 取色由 loadFinished 触发（无固定死等）")
+    if not ok:
+        failures.append("取色触发方式")
+
+    # 7i. 降级链与图标方法齐备（借用方法时容易漏掉依赖）
+    need2 = ["_on_view_loaded", "_schedule_titlebar_probe", "_set_theme_icon"]
+    missing2 = [n for n in need2 if not hasattr(g.MainWindow, n)]
+    print(f"  [{'OK  ' if not missing2 else 'FAIL'}] 重试/图标方法齐备")
+    if missing2:
+        failures.append("方法缺失")
+        print("        缺失:", missing2)
+
     # 8. ctypes 签名必须显式声明
     #    这是踩过的坑：不声明 argtypes 时 HWND 按 C int 封送，
     #    64 位下句柄稍大就传错值。声明是硬要求，不是优化。

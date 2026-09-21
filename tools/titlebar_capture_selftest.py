@@ -131,8 +131,35 @@ def run():
             row[0::4], row[2::4] = row[2::4], row[0::4]
             seg += row
         fr2 = dwm.flat_ratio(bytes(seg), w2_, h2_)
-        print(f"    纯色窗 flat_ratio = {fr2:.3f}（应≈1）")
+        print(f"\n[4] 纯色窗 flat_ratio = {fr2:.3f}（应≈1）")
         check("纯色窗 flat_ratio 接近 1", fr2 >= dwm.FLAT_RATIO, f"{fr2:.3f}")
+
+    # ---- 图标随主题切换 ----
+    print("\n[5] 主题图标")
+    import dsh_gui_qt as g
+    ic_dark_bg = g.icon_for(True)      # 深底 -> 白图标
+    ic_light_bg = g.icon_for(False)    # 浅底 -> 深图标
+    check("两套图标都能加载",
+          not ic_dark_bg.isNull() and not ic_light_bg.isNull())
+    check("两套图标确实不同",
+          ic_dark_bg.cacheKey() != ic_light_bg.cacheKey())
+
+    # 真的挂到窗口上，并确认重复设置是幂等的（避免任务栏图标闪）
+    w1.setWindowIcon(ic_dark_bg)
+    k1 = w1.windowIcon().cacheKey()
+    w1.setWindowIcon(ic_dark_bg)
+    check("重复设置同一图标不变化（幂等）",
+          k1 == w1.windowIcon().cacheKey())
+
+    # ---- 重试节奏自检 ----
+    print("\n[6] 取色重试节奏")
+    retry = list(g.MainWindow._TB_RETRY_MS)
+    total = sum(retry)
+    print(f"    节奏 = {retry}  合计 {total}ms")
+    check("首次尝试很快（<=400ms，用户无感）", retry[0] <= 400, f"{retry[0]}ms")
+    check("递增退避", all(retry[i] < retry[i + 1]
+                          for i in range(len(retry) - 1)))
+    check("总时长不超过 10 秒", total <= 10000, f"{total}ms")
 
     print("\n" + "=" * 68)
     print("结果：%d 通过 / %d 失败" % (len(PASS), len(FAIL)))

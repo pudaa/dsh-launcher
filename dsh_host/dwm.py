@@ -169,6 +169,30 @@ def reset(widget) -> None:
         _set_attr(_hwnd(widget), attr, DWMWA_COLOR_DEFAULT)
 
 
+def system_uses_dark() -> bool:
+    """系统当前是否使用深色（应用）主题。
+
+    用途：我们没接管标题栏时（关掉自适应配色、或取色失败），标题栏是
+    系统默认色，此时图标应当跟随**系统**主题，而不是我们采到的界面色。
+
+    只有 HKCU 下的 AppsUseLightTheme 有权威值：
+      0 = 深色，1 = 浅色。读不到就按浅色处理（保守——浅色图标在
+    浅底上才看得见，误判成深色的代价是图标隐形）。
+    """
+    if not IS_WINDOWS:
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+        ) as key:
+            v, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+        return int(v) == 0
+    except Exception:                                          # noqa: BLE001
+        return False
+
+
 # ------------------------------------------------- 验证（只能靠 GDI 截屏）
 #
 # 重要：DWMWA_CAPTION_COLOR / TEXT_COLOR / BORDER_COLOR 是**只写**属性。
@@ -312,12 +336,19 @@ def capture_window_top(hwnd: int, rows_frac: float = 0.06
 
     stride = w * 4                      # PrintWindow 按**窗口**宽给的步长
 
-    def _rgba_rows(y_from: int, n_rows: int) -> bytes:
-        """取客户区从 y_from 起的 n_rows 行，转成 RGB 连续缓冲。"""
+    def _rgba_rows(y_from: int, n_rows: int, step: int = 1,
+                   x_off: int = 0, x_len: int = 0) -> bytes:
+        """取客户区 y_from 起的行，转成 RGB 连续缓冲（BGRA -> RGBA）。
+
+        step > 1 时按行抽样——空白判定不需要逐行，抽样足够且便宜得多。
+        x_off/x_len 限定横向区间（0 表示整宽）。
+        """
+        off = ox + (x_off or 0)
+        ln = x_len or cw
         seg = bytearray()
-        for y in range(oy + y_from, min(oy + y_from + n_rows, oy + ch)):
-            s = y * stride + ox * 4
-            e = s + cw * 4
+        for y in range(oy + y_from, min(oy + y_from + n_rows, oy + ch), step):
+            s = y * stride + off * 4
+            e = s + ln * 4
             if e > len(data):
                 break
             row = bytearray(data[s:e])
@@ -326,29 +357,23 @@ def capture_window_top(hwnd: int, rows_frac: float = 0.06
         return bytes(seg)
 
     # --- 第一段：整个客户区是否"一片纯色"（= 没渲染出来）---
-    full = _rgba_rows(0, ch)
-    if not full or flat_ratio(full, cw, ch) >= FLAT_RATIO:
+    # 按行抽样即可：逐行全转在 4K 下要搬 33MB，而"是否空白"只需有代表性
+    # 的采样。上限约 96 行，代价与分辨率解耦。
+    step_y = max(1, ch // 96)
+    sampled_rows = len(range(0, ch, step_y))
+    full = _rgba_rows(0, ch, step=step_y)
+    if not full or flat_ratio(full, cw, sampled_rows) >= FLAT_RATIO:
         return None
 
-    # --- 第二段：取顶部一条的主色调 ---
+    # --- 第二段：取顶部一条的主色调（这一条要逐行，保证取色准确）---
     rows = max(1, min(ch, int(ch * rows_frac)))
     pad = max(0, int(cw * 0.02))
-    x0 = max(0, pad)
     span = max(1, cw - pad * 2)
-
-    top = bytearray()
-    for y in range(oy, oy + rows):
-        s = y * stride + (ox + x0) * 4
-        e = s + span * 4
-        if e > len(data):
-            break
-        row = bytearray(data[s:e])
-        row[0::4], row[2::4] = row[2::4], row[0::4]
-        top += row
+    top = _rgba_rows(0, rows, step=1, x_off=pad, x_len=span)
     if not top:
         return None
 
-    return dominant_color(bytes(top), span, len(top) // (span * 4))
+    return dominant_color(top, span, len(top) // (span * 4))
 
 
 # ---------------------------------------------------------------- 取色

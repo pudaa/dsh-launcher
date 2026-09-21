@@ -116,9 +116,16 @@ app = QApplication.instance() or QApplication(sys.argv)
 
 
 class Probe(QMainWindow):
-    """借用真实实现的方法，避免构造完整窗口（会连服务）。"""
+    """借用真实实现的方法，避免构造完整窗口（会连服务）。
+
+    要点：**借用的方法所依赖的其他方法也必须一起借**。
+    之前漏了 _set_theme_icon —— _apply_titlebar 内部会调它，
+    结果在 Qt 槽里抛 AttributeError 把 app.quit() 一起带走，
+    app.exec() 永久阻塞（表现为"测试挂住不返回"，很误导）。
+    """
     _apply_titlebar = g.MainWindow._apply_titlebar
     _sample_titlebar_color = g.MainWindow._sample_titlebar_color
+    _set_theme_icon = g.MainWindow._set_theme_icon
 
 
 win = Probe()
@@ -172,5 +179,11 @@ def step():
 
 
 QTimer.singleShot(500, step)
+# 兜底：无论中途哪个回调抛异常，都不能让 app.exec() 永久阻塞。
+# 没有它的时候，一次 AttributeError 就让测试挂死（排查起来很误导）。
+QTimer.singleShot(20000, app.quit)
 app.exec()
+if not FAIL and not PASS:
+    print("\n⚠️ 测试未产生任何断言结果（可能中途异常），视为失败")
+    sys.exit(1)
 sys.exit(1 if FAIL else 0)
