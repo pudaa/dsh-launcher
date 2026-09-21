@@ -301,7 +301,7 @@ def host_update_checks() -> list[str]:
 
 def titlebar_checks() -> list[str]:
     """标题栏取色与配色的纯逻辑校验（不碰真实窗口）。"""
-    from dsh_host import dwm
+    from dsh_host import config, dwm
     failures: list[str] = []
 
     # 1. 主色调统计能扛住边界输入
@@ -444,6 +444,77 @@ def titlebar_checks() -> list[str]:
     print(f"  [{'OK  ' if ok else 'FAIL'}] 混色比例越界被 clamp")
     if not ok:
         failures.append("blend clamp")
+
+    # 6a. **浅色主题不能被拉灰**（老大实机反馈的 bug）
+    #     日志铁证：取色 #ffffff 正确，上色却成了 #acadae。
+    #     原因是弱化用了"往固定深灰 blend"，纯白被拉成灰。
+    #     正确语义是降饱和（往自身灰度拉），中性色应当保持不变。
+    neutrals = [(255, 255, 255), (250, 250, 251), (245, 245, 247),
+                (0, 0, 0), (18, 18, 18), (128, 128, 128)]
+    bad = []
+    for c in neutrals:
+        got = dwm.desaturate(c, 0.35)
+        # 中性色降饱和后，各通道差不应变大，亮度也不该明显变化
+        if (abs(dwm.luminance(got) - dwm.luminance(c)) > 3
+                or dwm.saturation(got) > dwm.saturation(c) + 0.02):
+            bad.append((dwm.to_hex(c), dwm.to_hex(got)))
+    print(f"  [{'OK  ' if not bad else 'FAIL'}] 中性色降饱和后保持不变（浅色主题不拉灰）")
+    if bad:
+        failures.append("中性色拉灰")
+        print("        被改动的:", bad)
+
+    # 6b. 饱和色应被降饱和，但**亮度基本不变**
+    vivid = (0x22, 0xC1, 0xA3)
+    got = dwm.desaturate(vivid, 0.35)
+    ok = (dwm.saturation(got) < dwm.saturation(vivid) - 0.1
+          and abs(dwm.luminance(got) - dwm.luminance(vivid)) < 3)
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 饱和色只降彩度、不明显改明暗")
+    if not ok:
+        failures.append("饱和色弱化")
+        print(f"        {dwm.to_hex(vivid)} 饱和 {dwm.saturation(vivid):.3f}"
+              f" -> {dwm.to_hex(got)} 饱和 {dwm.saturation(got):.3f}"
+              f"  亮度 {dwm.luminance(vivid):.1f} -> {dwm.luminance(got):.1f}")
+
+    # 6c. desaturate 比例边界
+    ok = (dwm.desaturate((200, 50, 50), 0) == (200, 50, 50)
+          and dwm.desaturate((200, 50, 50), -1) == (200, 50, 50))
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 降饱和比例 0/负值等于不处理")
+    if not ok:
+        failures.append("desaturate 边界")
+
+    # 6d. 主题跟踪：间隔配置与变更容差
+    watch_ms = config.DEFAULTS.get("theme_watch_ms")
+    ok = isinstance(watch_ms, int) and watch_ms >= 0
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 主题跟踪间隔配置存在（{watch_ms} ms）")
+    if not ok:
+        failures.append("跟踪间隔配置")
+
+    ok = (g.THEME_CHANGE_TOL > 0 and g._THEME_WATCH_MIN_MS >= 1000)
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 变更容差与最小间隔有下限"
+          f"（tol={g.THEME_CHANGE_TOL}, min={g._THEME_WATCH_MIN_MS}ms）")
+    if not ok:
+        failures.append("跟踪下限")
+
+    # 6e. 探针返回值解析（含非法输入）
+    cases = [("21,21,23", (21, 21, 23)), ("0,0,0", (0, 0, 0)),
+             ("255,255,255", (255, 255, 255))]
+    okp = all(g._parse_probe_color(v) == e for v, e in cases)
+    badp = [v for v in (None, "", "abc", "1,2", "1,2,3,4", "300,0,0",
+                        "-1,0,0", "1;2;3") if g._parse_probe_color(v) is not None]
+    ok = okp and not badp
+    print(f"  [{'OK  ' if ok else 'FAIL'}] JS 探针返回值解析正确（非法输入返回 None）")
+    if not ok:
+        failures.append("探针解析")
+        print(f"        合法解析={okp} 误判为合法={badp}")
+
+    # 6f. 变更比对：容差内不算变、超出才算变
+    def _changed(a, b):
+        return not all(abs(a[i] - b[i]) <= g.THEME_CHANGE_TOL for i in range(3))
+    ok = (not _changed((255, 255, 255), (253, 254, 255))
+          and _changed((255, 255, 255), (21, 21, 23)))
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 主题变更判定（白→白不算变，白→深色算变）")
+    if not ok:
+        failures.append("变更判定")
 
     # 6b. 性能回归护栏
     #     取色跑在 GUI 线程上，耗时直接变成界面卡顿。优化前逐像素循环

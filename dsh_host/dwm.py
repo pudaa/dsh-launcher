@@ -698,11 +698,39 @@ def to_hex(rgb: tuple[int, int, int]) -> str:
 
 def blend(a: tuple[int, int, int], b: tuple[int, int, int],
           ratio: float) -> tuple[int, int, int]:
-    """按比例混合两色。ratio=0 取 a，ratio=1 取 b。
-
-    用途：把取到的主色调往中性方向拉一点再上到标题栏。
-    直接用界面原色往往太饱和（尤其 DSH 这种带蓝紫调的界面），
-    标题栏会抢视线。混一点深灰让它"退后"一格。
-    """
+    """按比例混合两色。ratio=0 取 a，ratio=1 取 b。"""
     ratio = max(0.0, min(1.0, ratio))
     return tuple(int(round(a[i] * (1 - ratio) + b[i] * ratio)) for i in range(3))
+
+
+def saturation(rgb: tuple[int, int, int]) -> float:
+    """粗略饱和度 0~1（最大最小通道之差 / 255）。"""
+    return (max(rgb) - min(rgb)) / 255.0
+
+
+def desaturate(rgb: tuple[int, int, int], ratio: float) -> tuple[int, int, int]:
+    """降低饱和度，**保持亮度**：把颜色往它自己的灰度值拉。
+
+    为什么不能用"往固定深灰 blend"来实现弱化
+    ----------------------------------------
+    早期实现是 `blend(rgb, (18,20,24), 0.35)` —— 往**固定的深灰**拉。
+    对鲜艳品牌色（如 #22c1a3）效果尚可，但对**中性浅色是灾难**：
+    纯白 #ffffff 被拉成 #acadae（灰），于是浅色主题下出现
+    "界面是白的、标题栏是灰的"这种明显违和的观感。
+
+    实测日志：取色拿到 #ffffff（完全正确），上色却变成 #acadae。
+
+    往**自身的灰度**拉则没有这个问题，因为：
+      · 白色  -> 灰度就是白，混合后仍是白（不变）
+      · 黑色  -> 灰度就是黑，仍是黑（不变）
+      · 鲜艳色 -> 只降彩度、不改变明暗，观感"退后"但不脏
+    这正是"弱化饱和色、让标题栏不抢视线"的本意。
+
+    灰度目标用 BT.601 亮度，所以降饱和前后感知亮度基本不变。
+    """
+    ratio = max(0.0, min(1.0, ratio))
+    if ratio <= 0:
+        return rgb
+    g = luminance(rgb)
+    grey = (int(round(g)),) * 3
+    return blend(rgb, grey, ratio)

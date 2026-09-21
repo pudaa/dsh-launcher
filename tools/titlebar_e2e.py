@@ -2,7 +2,7 @@
 """端到端：用真实 GUI 窗口验证 `_apply_titlebar` 的完整调用链。
 
 前面的 dwm_verify.py 验证的是 dwm 模块的**基本能力**；
-本脚本验证的是**接线**：从 config 读 mute → blend → contrast_text
+本脚本验证的是**接线**：从 config 读 mute → desaturate → contrast_text
 → is_dark → 四个 DWM 调用 → GDI 截图确认像素落地。
 
 关键在于它用的是真实的主窗口类，而不是裸 QMainWindow。
@@ -49,6 +49,8 @@ gdi32 = ctypes.windll.gdi32
 
 PASS: list[str] = []
 FAIL: list[str] = []
+#: 是否走到最后一步。用来区分"跑完"和"中途异常"——只看 PASS 非空不够。
+FINISHED = False
 
 
 def check(name, ok, detail=""):
@@ -138,9 +140,9 @@ DOM = (0x22, 0xC1, 0xA3)          # 「青云学」主题色，模拟界面主�
 
 def step():
     mute = float(config.get("titlebar_mute") or 0.0)
-    expect = dwm.blend(DOM, (18, 20, 24), mute)
+    expect = dwm.desaturate(DOM, mute)
     print("\n[1] 模拟界面主色 %s，mute=%.2f" % (dwm.to_hex(DOM), mute))
-    print("    预期标题栏底色 = %s（往深灰拉 %d%%）"
+    print("    预期标题栏底色 = %s（降饱和 %d%%）"
           % (dwm.to_hex(expect), mute * 100))
 
     d0, w0, h0 = gdi_capture(int(win.winId()))
@@ -154,7 +156,7 @@ def step():
         d1, w1, h1 = gdi_capture(int(win.winId()))
         after = rows_near(d1, w1, h1, expect)
         print("    命中预期色的行数 =", len(after))
-        check("标题栏落地为 blend 后的颜色", len(after) >= 8,
+        check("标题栏落地为 desaturate 后的颜色", len(after) >= 8,
               "命中 %d 行" % len(after))
         # 文字色必须与底色对比
         fg = dwm.contrast_text(expect)
@@ -173,6 +175,8 @@ def step():
         for f in FAIL:
             print("  FAILED:", f)
         print("=" * 64)
+        global FINISHED
+        FINISHED = True
         app.quit()
 
     QTimer.singleShot(900, verify)
@@ -181,9 +185,13 @@ def step():
 QTimer.singleShot(500, step)
 # 兜底：无论中途哪个回调抛异常，都不能让 app.exec() 永久阻塞。
 # 没有它的时候，一次 AttributeError 就让测试挂死（排查起来很误导）。
+#
+# 判据用 FINISHED，不是"PASS 非空"——后者在"前几步成功、之后异常"
+# 的情况下会把失败误判成通过。
 QTimer.singleShot(20000, app.quit)
 app.exec()
-if not FAIL and not PASS:
-    print("\n⚠️ 测试未产生任何断言结果（可能中途异常），视为失败")
+if FAIL or not FINISHED:
+    if not FINISHED:
+        print("\n⚠️ 测试未跑完（中途异常），视为失败")
     sys.exit(1)
-sys.exit(1 if FAIL else 0)
+sys.exit(0)

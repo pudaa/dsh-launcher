@@ -60,6 +60,31 @@ def icon_for(dark_bg: bool) -> QIcon:
     return QIcon(path) if os.path.isfile(path) else QIcon()
 
 
+#: 主题跟踪的"变色"容差。小于这个差值不动手——避免因渐变/抗锯齿噪声
+#  反复重设 DWM 属性（既无意义，也会让标题栏偶尔闪）。
+THEME_CHANGE_TOL = 6
+
+#: 主题跟踪每秒允许的最大检查次数上限的间隔（毫秒）。配置值低于它会被抬到它，
+#  防止有人把 theme_watch_ms 设成 50 之类把渲染进程变成忙轮询。
+_THEME_WATCH_MIN_MS = 1500
+
+
+def _parse_probe_color(value) -> tuple[int, int, int] | None:
+    """把 JS 探针返回的 "r,g,b" 解析成元组。解析失败返回 None。"""
+    if not isinstance(value, str):
+        return None
+    parts = value.split(",")
+    if len(parts) != 3:
+        return None
+    try:
+        rgb = tuple(int(p) for p in parts)
+    except ValueError:
+        return None
+    if any(c < 0 or c > 255 for c in rgb):
+        return None
+    return rgb
+
+
 # ---------------------------------------------------------------- 主题色探针
 #
 # L1 取色：在**界面顶部**取几个采样点，读它们"实际生效"的背景色。
@@ -754,6 +779,8 @@ class MainWindow(QMainWindow):
         self.host_release = None          # 有值表示桌面壳有新版本可用
         self.view = None
         self.profile = None
+        self._theme_timer = None          # 主题跟踪定时器（低频）
+        self._last_titlebar_rgb = None    # 上次上色用的界面色，用于变更比对
 
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
@@ -822,9 +849,13 @@ class MainWindow(QMainWindow):
         if not dwm.available() or rgb is None:
             return
         mute = float(config.get("titlebar_mute") or 0.0)
-        bg = dwm.blend(rgb, (18, 20, 24), mute) if mute else rgb
+        # 用降饱和（往**自身灰度**拉）而不是往固定深灰 blend：
+        # 后者会把纯白拉成灰色，浅色主题下观感明显违和。
+        # 详见 dwm.desaturate 的 docstring。
+        bg = dwm.desaturate(rgb, mute) if mute else rgb
         fg = dwm.contrast_text(bg)
         dark = dwm.is_dark(bg)
+        self._last_titlebar_rgb = rgb
 
         ok = dwm.set_caption_color(self, bg)
         dwm.set_text_color(self, fg)
@@ -921,14 +952,7 @@ class MainWindow(QMainWindow):
 
     def _on_js_theme_color(self, value):
         """L1 回调。value 形如 "30,32,36"，取不到是 None。"""
-        rgb = None
-        if isinstance(value, str):
-            parts = value.split(",")
-            if len(parts) == 3:
-                try:
-                    rgb = tuple(int(p) for p in parts)
-                except ValueError:
-                    rgb = None
+        rgb = _parse_probe_color(value)
         if rgb:
             host_log("标题栏取色：来源=JS 计算样式 %s" % dwm.to_hex(rgb))
             self._apply_titlebar(rgb)
@@ -1174,6 +1198,73 @@ class MainWindow(QMainWindow):
             self.stack.setCurrentIndex(1)
         if ok and config.get("adaptive_titlebar") and dwm.available():
             self._schedule_titlebar_probe(0)
+            self._start_theme_watch()
+
+    # ---------------------------------------------------- 主题跟踪（低频）
+    #
+    # 老大问："有没有办法兼顾性能的同时做主题色的跟踪？"
+    #
+    # 有的，关键是**跟踪动作必须比取色本身便宜一个量级**：
+    #
+    #   · 只跑 L1（JS 读计算样式）——**完全不做截图**。
+    #     像素截图要跨进程回读整幅位图，是重操作；读 computed style
+    #     只是查 CSSOM，几十次调用在渲染进程里是微秒级。
+    #   · 颜色**真的变了**才动 DWM（容差见 THEME_CHANGE_TOL）。
+    #     绝大多数 tick 是"读一次、发现没变、什么都不做"。
+    #   · 窗口最小化/不可见时直接跳过——没人在看就不用跟。
+    #
+    # 代价核算：默认 8 秒一次，每次一次 JS 往返。相对于 DSH 自己在跑的
+    # 推理流，这个开销可以忽略。想彻底关掉把 theme_watch_ms 设成 0。
+
+    def _start_theme_watch(self):
+        """按配置启动/停止主题跟踪。"""
+        ms = int(config.get("theme_watch_ms") or 0)
+        if ms > 0:
+            ms = max(ms, _THEME_WATCH_MIN_MS)
+        if not config.get("adaptive_titlebar") or ms <= 0:
+            timer = getattr(self, "_theme_timer", None)
+            if timer is not None:
+                timer.stop()
+            return
+        timer = getattr(self, "_theme_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.timeout.connect(self._theme_watch_tick)
+            self._theme_timer = timer
+        # 已在跑就只保证节拍正确，不重启倒计时——避免频繁 start()
+        # 反复重置计时器。
+        if not timer.isActive() or timer.interval() != ms:
+            timer.start(ms)
+            host_log("主题跟踪：每 %d ms 检查一次（仅读计算样式，无截图）" % ms)
+
+    def _theme_watch_tick(self):
+        """跟踪 tick：只看 L1，且没变就什么都不做。"""
+        if not config.get("adaptive_titlebar") or self.view is None:
+            timer = getattr(self, "_theme_timer", None)
+            if timer is not None:
+                timer.stop()
+            return
+        # 最小化/隐藏时不看——省掉无谓的渲染进程往返
+        if self.isMinimized() or not self.isVisible():
+            return
+        try:
+            self.view.page().runJavaScript(_JS_THEME_PROBE,
+                                           self._on_watch_color)
+        except Exception:                                       # noqa: BLE001
+            pass
+
+    def _on_watch_color(self, value):
+        """跟踪回调：与上次上色用的颜色比对，变了才动。"""
+        rgb = _parse_probe_color(value)
+        if rgb is None:
+            return
+        last = getattr(self, "_last_titlebar_rgb", None)
+        if last is not None and all(
+                abs(rgb[i] - last[i]) <= THEME_CHANGE_TOL for i in range(3)):
+            return                       # 没变——大多数 tick 走这里
+        host_log("标题栏：检测到界面配色变化 %s → %s"
+                 % (dwm.to_hex(last) if last else "(无)", dwm.to_hex(rgb)))
+        self._apply_titlebar(rgb)
 
     #: 标题栏取色的重试节奏（毫秒）。首次很快，之后逐步退避，
     #  累计约 7.7 秒 —— 足够覆盖冷启动的样式计算与首绘，
@@ -1439,6 +1530,8 @@ class MainWindow(QMainWindow):
             # 标题栏交还系统了，图标也要跟着回到系统主题——
             # 否则深色界面配白图标、浅色系统标题栏配白图标，又是一片糊。
             self._set_theme_icon(dwm.system_uses_dark())
+        # 开关关闭时 _start_theme_watch 内部会停掉定时器
+        self._start_theme_watch()
 
     # ----------------------------------------------------------- 窗口行为
 

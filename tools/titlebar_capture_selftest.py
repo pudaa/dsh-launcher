@@ -29,12 +29,15 @@ os.environ["LOCALAPPDATA"] = _SANDBOX
 
 from PySide6.QtCore import QTimer                                   # noqa: E402
 from PySide6.QtGui import QColor, QPainter                          # noqa: E402
-from PySide6.QtWidgets import QApplication, QWidget                  # noqa: E402
+from PySide6.QtWidgets import QApplication, QMainWindow, QWidget     # noqa: E402
 
 from dsh_host import dwm                                            # noqa: E402
 
 PASS: list[str] = []
 FAIL: list[str] = []
+#: 是否走到了最后一次断言。用来区分"正常跑完"和"中途异常退出"——
+#  只看 PASS 非空是不够的：前面几步成功后异常，会被误判成通过。
+FINISHED = False
 
 
 def check(name, ok, detail=""):
@@ -161,14 +164,73 @@ def run():
                           for i in range(len(retry) - 1)))
     check("总时长不超过 10 秒", total <= 10000, f"{total}ms")
 
+    # ---- 主题跟踪定时器（低频、有下限、可关闭）----
+    print("\n[7] 主题跟踪定时器")
+    from dsh_host import config as cfg
+
+    class WatchProbe(QMainWindow):
+        # 借用方法时**必须把依赖闭包一起借** —— _start_theme_watch 内部会
+        # 连 _theme_watch_tick 的信号。这个坑已经犯过三次了（titlebar_e2e
+        # 的 _set_theme_icon、这里的 _theme_watch_tick）。
+        _start_theme_watch = g.MainWindow._start_theme_watch
+        _theme_watch_tick = g.MainWindow._theme_watch_tick
+
+    wp = WatchProbe()
+    wp._theme_timer = None
+
+    def interval_of(w):
+        t = getattr(w, "_theme_timer", None)
+        return t.interval() if t is not None else None
+
+    def active_of(w):
+        t = getattr(w, "_theme_timer", None)
+        return t.isActive() if t is not None else False
+
+    # 注意：必须先打开 adaptive_titlebar —— 沙箱配置里它可能是 False
+    # （titlebar_e2e 会把它设成 False），而 _start_theme_watch 在
+    # 该开关关闭时是直接停表返回的。
+    cfg.set(adaptive_titlebar=True, theme_watch_ms=200)
+    wp._start_theme_watch()
+    iv = interval_of(wp)
+    check("过低间隔被抬到下限", iv is not None and iv >= g._THEME_WATCH_MIN_MS,
+          f"设定 200ms -> 实际 {iv}ms")
+    check("定时器已启动", active_of(wp))
+
+    # 重复调用不应改变节拍（保证稳定）
+    wp._start_theme_watch()
+    check("重复调用不改变间隔", interval_of(wp) == iv)
+
+    # 设为 0 = 关闭跟踪
+    cfg.set(adaptive_titlebar=True, theme_watch_ms=0)
+    wp._start_theme_watch()
+    check("theme_watch_ms=0 时停止跟踪", not active_of(wp))
+
+    # 关闭自适应配色时也必须停
+    cfg.set(adaptive_titlebar=False, theme_watch_ms=8000)
+    wp._start_theme_watch()
+    check("关闭自适应配色时停止跟踪", not active_of(wp))
+
     print("\n" + "=" * 68)
     print("结果：%d 通过 / %d 失败" % (len(PASS), len(FAIL)))
     for f in FAIL:
         print("  FAILED:", f)
     print("=" * 68)
+    global FINISHED
+    FINISHED = True
     app.quit()
 
 
 QTimer.singleShot(800, run)
+# 兜底：run() 是在 Qt 槽里跑的，任何未捕获异常都会把 app.quit() 一起带走，
+# 让 app.exec() 永久阻塞（表现为"无输出、进程被 SIGTERM"，极难排查）。
+# 这个坑在 titlebar_e2e 上真实踩过一次，两个脚本都要有保险。
+#
+# 注意判据必须是 FINISHED，不能只看 PASS 非空——前面几步成功后异常，
+# 只看 PASS 会把"中途崩了"误判成"通过"。
+QTimer.singleShot(25000, app.quit)
 app.exec()
-sys.exit(1 if FAIL else 0)
+if FAIL or not FINISHED:
+    if not FINISHED:
+        print("\n⚠️ 测试未跑完（中途异常），视为失败")
+    sys.exit(1)
+sys.exit(0)
