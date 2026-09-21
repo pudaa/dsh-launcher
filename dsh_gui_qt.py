@@ -19,6 +19,16 @@ import os
 import sys
 import time
 
+# 输出强制 UTF-8。默认 stdout 编码跟随系统区域设置——在 cp1252 的机器上
+# （GitHub Actions 的 windows runner 就是这样）打印中文会直接
+# UnicodeEncodeError 崩掉，而且异常会把调用处的返回码一起带走。
+# tools/ 下的自测脚本都做了这件事，主程序同样需要。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, OSError, ValueError):
+    pass
+
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QUrl
 from PySide6.QtGui import QIcon, QAction, QDesktopServices, QImage
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
@@ -1679,13 +1689,26 @@ def main() -> int:
     # CI 构建完 exe 后立刻跑这个，用来兜住"包里没带 assets"这类问题。
     _rc = os.environ.get(RESOURCE_CHECK_ENV)
     if _rc:
+        # 小心：报告含中文，而 CI（Windows runner）的 stdout 是 cp1252，
+        # 直接 print 会抛 UnicodeEncodeError —— 异常会把这个分支的
+        # 返回码一起带走，退出码变成 1，让人误以为是"自检不通过"。
+        # 这个 cp1252 的坑我们的自测脚本早就踩过并加了 reconfigure，
+        # 这里忘了照做。所以：先写文件（关键产物），打印只当附带输出。
         text, ok = resource_report()
         try:
             with open(_rc, "w", encoding="utf-8") as f:
                 f.write(text + "\n")
         except OSError as e:
-            sys.stderr.write("写报告失败: %s\n" % e)
-        print(text)
+            try:
+                sys.stderr.write("写报告失败: %s\n" % e)
+            except Exception:                                  # noqa: BLE001
+                pass
+        try:
+            print(text)
+        except Exception:                                      # noqa: BLE001
+            # 控制台编码不支持中文时忽略即可——报告已经落盘，
+            # 判定只看返回码，不依赖这里的打印。
+            pass
         return 0 if ok else 3
 
     # 全局图标先跟系统主题；MainWindow 取到界面色后会再切一次

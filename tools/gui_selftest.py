@@ -616,6 +616,15 @@ def titlebar_checks() -> list[str]:
     if not ok:
         failures.append("资源自检缺失")
 
+    #     stdout 必须强制 UTF-8：CI 的 windows runner 是 cp1252，
+    #     主程序里打印中文会 UnicodeEncodeError，而**异常会把返回码一起
+    #     带走** —— 资源自检因此报过退出码 1（实际是"通过"被异常打断）。
+    ok = "sys.stdout.reconfigure(" in src_main
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 主程序已强制 stdout UTF-8（cp1252 兜底）")
+    if not ok:
+        failures.append("stdout 编码")
+        print("        CI runner 是 cp1252，打印中文会崩并吞掉返回码")
+
     # 7f. 图标必须随主题切换（黑色图标在深色标题栏上看不见）
     light_p = g.ICON_FOR_DARK_BG     # 深底用（白图标）
     dark_p = g.ICON_FOR_LIGHT_BG     # 浅底用（深图标）
