@@ -487,6 +487,7 @@ python -m nuitka --onefile ^
 | `tools/gui_selftest.py` | MainWindow 启动流程、接管已有服务、WebEngine 懒加载、菜单状态、引导窗口三状态渲染，**托盘菜单结构语义**、**桌面壳自更新纯逻辑**（版本比较、bat 生成要素、反斜杠规范化、自删除位置、PID=0 分支）、**标题栏取色与配色**（含 WCAG 对比度择优与真实采样规模的杂色门槛） | 需 PySide6（无头，`QT_QPA_PLATFORM=offscreen`） |
 | `tools/dwm_verify.py` | **实机**验证 DWM 上色：GDI 截屏逐行采样核对像素、算法链路、真实采样规模下的取色门槛 | 需 PySide6 + 真实窗口（会闪现） |
 | `tools/titlebar_e2e.py` | **端到端**验证 `_apply_titlebar` 接线：config → blend → contrast_text → 四个 DWM 调用 → 像素落地 | 需 PySide6 + 真实窗口（会闪现） |
+| `tools/selfupdate_e2e.py` | **端到端**验证自更新全链路：`running_as_exe` 判定（含 Nuitka 的 `__compiled__`）、`current_exe` 不指向解释器、download 的体积/PE 校验（正反两向）、apply 写出并拉起 bat、bat 真的替换目标并留 `.old` | 任意 Python 3.10+ |
 
 两个无头脚本都用临时 `DSH_HOME`，不会碰正在使用的 `D:\AppData\dsh`。
 **每次 DSH 更新后建议跑一遍 `contract_selftest.py`**，用来第一时间发现破坏性变更落在哪一环。

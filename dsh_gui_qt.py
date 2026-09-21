@@ -120,17 +120,18 @@ RESOURCE_CHECK_ENV = "DSH_HOST_RESOURCE_CHECK"
 
 
 def resource_report() -> tuple[str, bool]:
-    """检查运行环境里的资源是否齐备。返回 (报告文本, 是否通过)。
+    """检查运行环境里的资源与能力是否齐备。返回 (报告文本, 是否通过)。
 
-    只做"文件在不在 + QIcon 能不能加载"这两件事——纯粹的部署自检，
-    不涉及任何业务逻辑。
+    只做纯粹的自检，不涉及业务逻辑。
     """
+    packaged = ("__compiled__" in globals()) or bool(getattr(sys, "frozen", False))
     lines = [
-        "DSH Launcher 资源自检",
+        "DSH Launcher 产物自检",
         "  sys.frozen       = %s" % getattr(sys, "frozen", False),
         "  __compiled__     = %s" % ("__compiled__" in globals()),
         "  __file__         = %s" % globals().get("__file__", "(无)"),
         "  argv[0]          = %s" % (sys.argv[0] if sys.argv else "(无)"),
+        "  sys.executable   = %s" % getattr(sys, "executable", "(无)"),
         "  ASSET_DIR        = %s" % ASSET_DIR,
         "  ASSET_DIR 存在    = %s" % os.path.isdir(ASSET_DIR),
     ]
@@ -146,6 +147,26 @@ def resource_report() -> tuple[str, bool]:
             ok = False
         lines.append("  %s  存在=%-5s 大小=%-7d 可加载=%s  %s"
                      % (label, exists, size, loadable, p))
+
+    # --- 自更新可用性 ---
+    # 这条专门防一个会静默失效的坑：Nuitka 不设 sys.frozen，
+    # 若 running_as_exe() 只看 frozen，打包版会被判成"源码运行" →
+    # 自更新菜单项被禁用 → 功能直接死掉。必须在产物上验。
+    try:
+        supported, reason = selfupdate.self_update_supported()
+        exe = selfupdate.current_exe()
+    except Exception as e:                                     # noqa: BLE001
+        supported, reason, exe = False, "%s: %s" % (type(e).__name__, e), "?"
+    lines.append("  自更新可用        = %s%s"
+                 % (supported, ("  (%s)" % reason) if reason else ""))
+    lines.append("  current_exe      = %s" % exe)
+    if packaged and not supported:
+        ok = False
+        lines.append("  ↑ 打包版里自更新应当可用，否则菜单项会被禁用")
+    if packaged and not exe.lower().endswith(".exe"):
+        ok = False
+        lines.append("  ↑ 打包版里 current_exe 应指向 .exe")
+
     lines.append("  结论             = %s" % ("通过" if ok else "**失败**"))
     return "\n".join(lines), ok
 

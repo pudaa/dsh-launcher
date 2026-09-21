@@ -80,15 +80,68 @@ class HostRelease:
 # ------------------------------------------------------------------ 当前状态
 
 def running_as_exe() -> bool:
-    """是否运行在冻结后的 exe 里（Nuitka / PyInstaller 都会设 sys.frozen）。
+    """是否运行在打包后的 exe 里。
 
-    源码运行时不能自更新——替换掉 .py 没有意义，而且会破坏开发环境。
+    **不能只查 sys.frozen**（2026-09-21 修，实测踩到）
+    -------------------------------------------------
+    PyInstaller 会设 `sys.frozen`，但 **Nuitka 不设** —— 我们自己的 exe
+    里实测是 `sys.frozen = False`、`__compiled__ = True`（见 CI 的资源
+    自检报告）。
+
+    只查 frozen 的后果不是"误报"，而是**整个功能直接死掉**：
+    打包版里 `self_update_supported()` 返回 False → 托盘菜单项被改成
+    "检查桌面壳更新…（仅打包版可用）"并**禁用** → 自更新永远不可用。
+    而自更新恰恰是发过一次版之后最省事的一环。
+
+    三条判据取或，覆盖 PyInstaller / Nuitka / 其他打包器。
+    **刻意不加"exe 名不像 python"这类启发式**：万一在开发机误判为
+    "已打包"，apply() 会去替换那个 python 解释器，后果比功能不可用严重得多。
     """
-    return bool(getattr(sys, "frozen", False))
+    if getattr(sys, "frozen", False):
+        return True
+    if "__compiled__" in globals():
+        return True
+    return False
+
+
+#: 绝不能被当成"待替换目标"的文件名主干——它们都是解释器。
+#  这个防护不是多余的：apply() 会**替换掉 current_exe() 指向的文件**，
+#  万一把解释器当目标，后果比"更新失败"严重得多。
+_INTERPRETER_STEMS = ("python", "pythonw", "python3", "pythonw3", "py", "pyw")
+
+
+def _looks_like_interpreter(path: str) -> bool:
+    stem = os.path.splitext(os.path.basename(path or ""))[0].lower()
+    return stem.startswith("python") or stem in _INTERPRETER_STEMS
 
 
 def current_exe() -> str:
-    return os.path.abspath(sys.executable if running_as_exe() else sys.argv[0])
+    """当前可执行文件的绝对路径。
+
+    Nuitka onefile 与 PyInstaller 下 `sys.executable` 都指向 exe 自身，
+    但不同打包器/版本偶有差异，所以用 `argv[0]` 兜底——它同样是我们
+    被启动时的那条路径。
+
+    **必须排除解释器候选**：`python.exe` 同样以 `.exe` 结尾，只过滤
+    后缀是拦不住的（自测里真的抓到过这一点）。宁可多试几个候选，
+    也不能返回一个指向解释器的路径——apply() 会照着它去替换文件。
+    """
+    cands = []
+    if running_as_exe():
+        cands += [getattr(sys, "executable", "") or "",
+                  sys.argv[0] if sys.argv else ""]
+    else:
+        cands.append(sys.argv[0] if sys.argv else "")
+    # 优先：存在、以 .exe 结尾、且不像解释器
+    for c in cands:
+        if (c and c.lower().endswith(".exe") and os.path.isfile(c)
+                and not _looks_like_interpreter(c)):
+            return os.path.abspath(c)
+    # 退而求其次：存在且不像解释器（源码模式下的 .py）
+    for c in cands:
+        if c and not _looks_like_interpreter(c):
+            return os.path.abspath(c)
+    return os.path.abspath(sys.argv[0] if sys.argv else ".")
 
 
 def self_update_supported() -> tuple[bool, str]:
