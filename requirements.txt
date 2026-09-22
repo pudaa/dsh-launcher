@@ -1,3 +1,6 @@
-PySide6>=6.9.3
+# 必须 >=6.11.2：QtWebEngine 内核 = Chromium 140。
+# 低版本（6.9.x=130 / 6.10.x=134）会让 DSH 前端的文件预览失效
+# （报「文件资源服务不可用」），详见 docs/file-preview-unavailable-triage.md
+PySide6>=6.11.2
 # 打包用（开发运行可不装）
 # Nuitka>=4.2.1

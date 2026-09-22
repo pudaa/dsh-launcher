@@ -432,18 +432,38 @@ winget install --id OpenJS.NodeJS.LTS --exact \
 会让 Nuitka 报 `flavor 'Anaconda Python'`，其 PySide6 插件枚举 conda 元数据时
 抛 `KeyError: 'files'` 直接崩。用 python.org 的独立解释器。
 
-实测可用的组合：**Python 3.13.14 + PySide6 6.9.3 + Nuitka 4.2.1**。
+实测可用的组合：**Python 3.13.14 + PySide6 6.11.2 + Nuitka 4.2.1**（2026-09-22 升级）。
+
+> **为什么从 6.9.3 升到 6.11.2（2026-09-22）**：QtWebEngine 的内核版本决定网页兼容性——
+> Qt **6.9.x = Chromium 130**、6.10.x = 134、**6.11.x = 140**。
+> DSH 0.1.6-alpha.2 的前端（`client.pdf.js` 内嵌 PDF.js 6.3.289）用到
+> `Uint8Array.fromBase64`（Chromium 140+）等 API，Chromium 130 上会失效，
+> 表现为侧边栏文件预览报 **「文件资源服务不可用」**。
+> 升级后实测恢复（老大人工核验 README.md 预览正常渲染）。
+> 排查全过程见 `docs/file-preview-unavailable-triage.md`。
+>
+> 打包实测（2026-09-22，同一台机器）：PySide6 6.11.2 下 Nuitka 打包**无阻塞问题**——
+> onefile 压缩比 26.76%（467 MB → 125 MB），`--lto=yes` 正常，
+> WebEngine 全套资源（`QtWebEngineProcess.exe` / `icudtl.dat` /
+> `qtwebengine_resources*.pak` / `v8_context_snapshot.bin` / 357 个翻译文件）均被正确收集。
 
 ```
 python -m nuitka --onefile ^
   --windows-console-mode=disable ^
   --windows-icon-from-ico=assets/icon.ico ^
+  --include-data-dir=assets=assets ^
   --enable-plugin=pyside6 ^
   --include-package=dsh_host ^
   --onefile-tempdir-spec={CACHE_DIR}/DSH-Web-runtime ^
   --output-dir=build --output-filename=DSH-Web.exe --lto=yes ^
   dsh_gui_qt.py
 ```
+
+> **`--include-data-dir=assets=assets` 不能省**（2026-09-22 补记，本地命令此前漏了这条）。
+> `--windows-icon-from-ico` 只是把图标写进 exe 自身的 PE 资源（资源管理器看到的那个），
+> 而运行时 `QIcon("assets/icon.ico")` 是去**文件系统**读的 —— onefile 不会自动带上
+> `assets/`。少了这行，图标在源码里能用、**打包后静默失效**（不报错，只是没图标）。
+> CI 的 `.github/workflows/release.yml` 一直有这条，并靠"在产物上做资源自检"兜底验证。
 
 > `--include-package=dsh_host` 虽然 Nuitka 通常能自动跟随导入，但显式声明更稳妥——
 > 漏收包的表现是打出来的 exe 运行时 ImportError，很难在打包阶段察觉。
