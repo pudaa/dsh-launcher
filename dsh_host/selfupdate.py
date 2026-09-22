@@ -361,17 +361,24 @@ def build_apply_script(target: str, incoming: str, pid: int,
     done_word = "已重启" if relaunch else "已完成，未自动重启"
 
     if pid and pid > 0:
+        # 用 for /l 的循环变量计时，**不要**用 set /a 累加后再判断。
+        # 括号块里的 %VAR% 是在「块解析时」展开的，块执行期间不会刷新，
+        # 累加值拿不到 → `if %WAITED% GEQ 60` 的超时判断会失效，
+        # 实测表现为永不超时、看起来像死循环（2026-09-22 用户实测遇到的）。
+        # 延时用 ping 而不是 timeout /t：
+        # `timeout /t N` 在没有 stdin 的环境里会立即失败（自更新 bat 是以
+        # DETACHED 启动的，正是无 stdin），于是循环飞快轮询、旧进程稍慢就被
+        # 误判超时。ping -n 2 的间隔约 1 秒，任何环境都可用。
         wait_block = (
-            "set /a WAITED=0\n"
-            ":waitloop\n"
-            'tasklist /FI "PID eq %PID%" 2>nul | find.exe "%PID%" >nul\n'
-            "if not errorlevel 1 (\n"
-            "    if %WAITED% GEQ 60 goto giveup\n"
-            "    timeout /t 1 /nobreak >nul\n"
-            "    set /a WAITED+=1\n"
-            "    goto waitloop\n"
+            "for /l %%i in (1,1,60) do (\n"
+            '    tasklist /FI "PID eq %PID%" 2>nul | find.exe "%PID%" >nul\n'
+            "    if errorlevel 1 goto pid_exited\n"
+            "    ping -n 2 127.0.0.1 >nul\n"
             ")\n"
-            "echo 旧进程已退出，等待 %WAITED% 秒 >> \"%LOG%\""
+            'echo 等待超时（约 60 秒），旧进程 %PID% 仍未退出 >> "%LOG%"\n'
+            "goto giveup\n"
+            ":pid_exited\n"
+            "echo 旧进程已退出 >> \"%LOG%\""
         )
     else:
         wait_block = 'echo 未指定进程号，直接替换 >> "%LOG%"'
