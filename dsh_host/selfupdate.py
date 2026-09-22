@@ -409,6 +409,12 @@ echo 替换完成 >> "%LOG%"
 echo {done_word} >> "%LOG%"
 goto fin
 
+:giveup
+echo 等待超时（%WAITED% 秒），旧进程 %PID% 仍未退出，放弃本次替换 >> "%LOG%"
+rem 走到这里说明旧进程还活着，文件不可能被替换。
+rem 此时绝对不能 {launch} —— 那只会把"旧版本"再开一遍，甚至开出重复实例。
+goto fin
+
 :notarget
 echo 目标文件不存在 >> "%LOG%"
 goto fin
