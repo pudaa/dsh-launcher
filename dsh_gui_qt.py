@@ -660,8 +660,8 @@ class UpdateDialog(QDialog):
 
         home = contract.resolve_home() or "（由 DSH 自行决定）"
         detail = QLabel(
-            f"当前版本　{info.current}（{updater.channel_note(info.current)}）\n"
-            f"目标版本　{info.target}（{updater.channel_note(info.target)}）\n"
+            f"当前版本　{info.current}\n"
+            f"目标版本　{info.target}（{updater.channel_label(info.channel)}）\n"
             f"更新方式　npm install -g {updater.PKG_NAME}@{info.target}\n"
             f"\n"
             f"你的会话记录、登录状态与设置存放于：\n{home}\n"
@@ -690,18 +690,29 @@ class UpdateDialog(QDialog):
         self._refresh_headline()
 
     def _refresh_headline(self):
+        # 目标是稳定版、但预览通道上还躺着更新的版本时，必须顺口说一句。
+        # 否则用户切回稳定版后，会以为官方没有更新的东西了——0.1.7-rc.x
+        # 被漏掉时就是这个体感。
+        newer = self.info.newer_preview()
+        hint = ""
+        if newer and self.info.channel == "latest":
+            hint = ("\n\n另外：预览通道上已有更新的 %s。"
+                    "如需获取，请在托盘菜单里勾选「加入预览计划」。" % newer)
+
         if self.info.action == "downgrade":
             self.headline.setText(
                 f"将把 DSH 从 {self.info.current} 切回稳定版 {self.info.target}。\n\n"
                 "注意：旧版本可能打不开新版本产生的会话记录。"
                 "这些记录不会被删除，只是旧版本读不了——这是上游的格式版本机制，"
-                "我们无法规避。")
+                "我们无法规避。" + hint)
         else:
-            extra = "这是预览通道版本，官方明示可能存在破坏性变更。" \
-                if self.info.channel == "alpha" else ""
+            extra = ""
+            if self.info.channel != "latest":
+                extra = ("这是%s版，官方明示可能存在破坏性变更。"
+                         % updater.channel_short(self.info.channel))
             self.headline.setText(
                 f"将把 DSH 从 {self.info.current} 更新到 {self.info.target}。{extra}\n\n"
-                "更新只替换程序本身，不会改动你的会话记录、登录状态和设置。")
+                "更新只替换程序本身，不会改动你的会话记录、登录状态和设置。" + hint)
 
     def _load_notes(self):
         self.notes_btn.setEnabled(False)
@@ -1482,13 +1493,24 @@ class MainWindow(QMainWindow):
             if info.has_action:
                 self._show_update_dialog(info.target)
             else:
+                # 说"已是最新"必须附带一句预览通道的情况。否则用户会以为官方没发新版——
+                # 0.1.7-rc.1/rc.2 就是这么被漏掉的（当时只看了 alpha 通道）。
+                newer = info.newer_preview()
+                hint = ("\n\n预览通道上已有更新的 %s。\n"
+                        "要获取它，请在托盘菜单里勾选「加入预览计划」。" % newer
+                        ) if newer else ""
                 self._info("当前已是最新版本。\n\n"
                            "已安装　　　DSH %s\n"
                            "检查通道　　%s\n"
-                           "预览通道最新　%s"
+                           "稳定通道　　%s\n"
+                           "候选通道　　%s\n"
+                           "尝鲜通道　　%s%s"
                            % (info.current,
                               updater.channel_label(info.channel),
-                              info.alpha or "（未知）"))
+                              info.stable or "（未知）",
+                              info.next or "（未知）",
+                              info.alpha or "（未知）",
+                              hint))
             return
         if info.has_action:
             self.tray.showMessage("DSH 更新", info.summary() + "（点击查看）",
@@ -1537,12 +1559,21 @@ class MainWindow(QMainWindow):
             return
         info = self.update_info
         if not info or info.target != target:
+            # 手工指定一个目标版本（回滚 / 回归稳定版）时，按目标落在哪个通道标注。
+            # 不要用 "alpha" in target 这种字符串嗅探——rc 版本会因此被误判成稳定版。
+            if info and info.stable == target:
+                channel = "latest"
+            elif info and info.next == target:
+                channel = "next"
+            else:
+                channel = "alpha"
             info = updater.UpdateInfo(
                 current=self.handle.install.version,
                 stable=self.update_info.stable if self.update_info else target,
+                next=self.update_info.next if self.update_info else None,
                 alpha=self.update_info.alpha if self.update_info else None,
                 target=target,
-                channel="alpha" if "alpha" in target else "latest",
+                channel=channel,
                 action="upgrade" if target != self.handle.install.version else "none",
             )
         dlg = UpdateDialog(self, info, self.handle)

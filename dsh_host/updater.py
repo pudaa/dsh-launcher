@@ -14,8 +14,14 @@ package-lock 都是自洽的——手工替换目录会破坏这种自洽性，�
 
 通道策略
 --------
-    latest  稳定通道，默认
-    alpha   预览通道，只有开启「加入预览计划」后才会选中
+官方同时维护三个 dist-tag。它们是**三条并行推进的线**，不是简单的"稳定/预览"两级：
+
+    latest  稳定通道，默认跟随
+    next    候选通道 —— 下一个正式版的备选（RC 线）
+    alpha   尝鲜通道 —— 更早期的测试线
+
+历史教训见 `PRERELEASE_TAGS` 上方的注释：曾经只读 latest + alpha，
+结果 0.1.7-rc.1/rc.2 整条 RC 线在界面上完全不可见。
 """
 from __future__ import annotations
 
@@ -27,7 +33,7 @@ import urllib.request
 from dataclasses import dataclass, field
 
 from . import config, contract
-from .compat import compare, is_prerelease
+from .compat import compare, parse_version
 
 PKG_NAME = "@deepseek-ai/dsh"
 REPO = "deepseek-ai/deepseek-harness"
@@ -41,15 +47,32 @@ class UpdateInfo:
     target: str
     channel: str
     action: str                    # upgrade | downgrade | none
+    # 候选通道（RC）。放在 action 之后是为了保住字段顺序的兼容性——
+    # 之前的调用方都是关键字传参，新增字段不会破坏它们。
+    next: str | None = None
     tags: dict = field(default_factory=dict)
 
     @property
     def has_action(self) -> bool:
         return self.action != "none"
 
+    def newer_preview(self) -> str | None:
+        """预览通道里比当前已装版本更高的最高版本。
+
+        「加入预览计划」没开时，界面上说"已是最新"是**不负责任**的——
+        只要候选/尝鲜通道躺着更新的版本，就必须让用户知道，否则他会以为
+        官方没发新版（这正是 0.1.7-rc.x 被漏掉时的体验）。
+        """
+        best = None
+        for v in (self.next, self.alpha):
+            if v and compare(v, self.current) > 0 \
+                    and (best is None or compare(v, best) > 0):
+                best = v
+        return best
+
     def summary(self) -> str:
         if self.action == "upgrade":
-            label = "预览通道新版" if self.channel == "alpha" else "正式通道新版"
+            label = "稳定通道新版" if self.channel == "latest" else "预览通道新版"
             return f"发现{label} {self.target}（当前 {self.current}）"
         if self.action == "downgrade":
             return f"可回归稳定版 {self.target}（当前 {self.current}）"
@@ -60,6 +83,25 @@ class UpdateInfo:
 
 def _npm_name(tags: dict) -> str:
     return tags.get("latest", "?")
+
+
+# 除稳定通道外，官方还有哪些 dist-tag 属于"预览"。顺序**不代表优先级**——
+# 谁最高由版本号决定，见 decide()。
+#
+# 为什么不能用"稳定 / 预览"两级、更不能写死优先某个 tag：
+#
+#   实测 2026-09-24，三个 tag 同时存在且**代次错开**：
+#       latest = 0.1.5-rc.3   （稳定线停在 0.1.5）
+#       alpha  = 0.1.7-alpha.2
+#       next   = 0.1.7-rc.2   （RC 比 alpha 还新！RC 是 alpha 之后的阶段）
+#
+#   旧实现只读 latest + alpha，于是 0.1.7-rc.1/rc.2 整条 RC 线在界面上
+#   完全不可见；更糟的是已装 0.1.7-alpha.2 的用户会被告知"已是最新"，
+#   而官方其实已经发了两个更晚的 RC。
+#
+#   教训：通道之间的先后顺序会随上游发布流程变化，写死顺序迟早再错一次。
+#   所以这里只声明"哪些 tag 算预览"，高低交给版本号比较。
+PRERELEASE_TAGS = ("next", "alpha")
 
 
 def fetch_dist_tags(install: contract.DshInstall, timeout: float = 90) -> dict:
@@ -142,19 +184,44 @@ def _fetch_tags_via_registry(install: contract.DshInstall) -> dict | None:
     return None
 
 
-def decide(install: contract.DshInstall, tags: dict, prerelease_opt_in: bool) -> UpdateInfo:
-    """根据通道策略决定目标版本。"""
-    stable = tags.get("latest") or install.version
-    alpha = tags.get("alpha")
+def _highest(candidates: list[tuple[str, str]]) -> tuple[str, str] | None:
+    """从 (版本, 来源) 里取版本最高的一项；版本号无法解析的略过。
 
-    if prerelease_opt_in and alpha and compare(alpha, stable) > 0:
-        target, channel = alpha, "alpha"
-    else:
-        target, channel = stable, "latest"
+    必须显式跳过不可解析的值：compare() 对解析失败返回 0，若只看 `> 0`
+    会让第一个非法值永远霸占 best。
+    """
+    best = None
+    for ver, tag in candidates:
+        if not ver or parse_version(ver) is None:
+            continue
+        if best is None or compare(ver, best[0]) > 0:
+            best = (ver, tag)
+    return best
+
+
+def decide(install: contract.DshInstall, tags: dict, prerelease_opt_in: bool) -> UpdateInfo:
+    """根据通道策略决定目标版本。
+
+    规则：
+      - 未开启预览计划 → 只跟稳定通道
+      - 已开启预览计划 → 在稳定通道与所有预览 tag 里取**版本最高**的一个；
+        且如果预览线反而落后于稳定线（上游提版顺序变过），仍然只给稳定版，
+        免得"开启预览"变成"被降级"。
+    """
+    stable = tags.get("latest") or install.version
+    if parse_version(stable) is None:
+        stable = install.version          # 通道值不可解析时退回已装版本，别把垃圾传下去
+
+    preview = _highest([(tags.get(t), t) for t in PRERELEASE_TAGS])
+
+    target, channel = stable, "latest"
+    if prerelease_opt_in and preview and compare(preview[0], stable) > 0:
+        target, channel = preview
 
     c = compare(target, install.version)
     action = "upgrade" if c > 0 else ("downgrade" if c < 0 else "none")
-    return UpdateInfo(current=install.version, stable=stable, alpha=alpha,
+    return UpdateInfo(current=install.version, stable=stable,
+                      next=tags.get("next"), alpha=tags.get("alpha"),
                       target=target, channel=channel, action=action, tags=tags)
 
 
@@ -306,12 +373,19 @@ def fetch_release_notes(version: str, timeout: float = 12) -> str | None:
 def channel_label(channel: str) -> str:
     """给界面用的通道名字。面向使用者，不出现 dist-tag 这类词。"""
     return {
-        "alpha": "预览通道（alpha）",
-        "latest": "稳定通道（latest）",
-        "next": "预发布通道（next）",
+        "latest": "稳定通道",
+        "next": "候选通道（下一正式版的备选版本）",
+        "alpha": "尝鲜通道（更早期的测试版本）",
     }.get(channel, channel or "未知")
 
 
-def channel_note(version: str) -> str:
-    return "预览通道（预发布版本，可能包含破坏性变更）" if is_prerelease(version) \
-        else "稳定通道"
+def channel_short(channel: str) -> str:
+    """塞进句子里的短名，如「这是候选版」。
+
+    不要用 channel_label 拼句子——它带括号解释，拼出来会变成
+    "这是候选通道（下一正式版的备选版本）版"。"""
+    return {
+        "latest": "稳定",
+        "next": "候选",
+        "alpha": "尝鲜",
+    }.get(channel, "预览")

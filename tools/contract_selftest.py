@@ -13,6 +13,7 @@ import os
 import shutil
 import sys
 import time
+from types import SimpleNamespace
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -44,6 +45,66 @@ def check(name: str, ok: bool, extra: str = ""):
     print(f"    [{'OK  ' if ok else 'FAIL'}] {name}{('  ' + extra) if extra else ''}")
     if not ok:
         failures.append(name)
+
+
+def channel_logic_checks():
+    """通道判定的**纯逻辑**回归（不需要装 DSH，所以精简模式也跑）。
+
+    守卫的是 0.1.7-rc.1/rc.2 漏检事故：官方同时维护 latest / next / alpha
+    三条线，而旧实现只读 latest + alpha，把 `next` 当"暂不暴露"，
+    导致整条 RC 线在界面上不可见——已装 0.1.7-alpha.2 的用户被告知"已是最新"。
+
+    **全部用固定 tag 组合，不依赖当下官方发了什么**，否则上游一发新版
+    这些断言就跟着漂移，等于没守。
+    """
+    # A：next（RC）比 alpha 新 —— 旧实现会漏掉 RC
+    print("    离线回归 A：next（RC）比 alpha 新——旧实现会漏掉 RC")
+    A = {"latest": "0.1.5-rc.3", "next": "0.1.7-rc.2", "alpha": "0.1.7-alpha.2"}
+    old = SimpleNamespace(version="0.1.5-rc.3")
+    off, on = updater.decide(old, A, False), updater.decide(old, A, True)
+    check("预览计划关闭时只跟稳定版", off.target == "0.1.5-rc.3", off.target)
+    check("预览计划开启时取到最高版本", on.target == "0.1.7-rc.2", on.target)
+    check("命中 RC 时通道标为 next", on.channel == "next", on.channel)
+    check("三条通道版本都记进 UpdateInfo",
+          (on.stable, on.next, on.alpha) == ("0.1.5-rc.3", "0.1.7-rc.2", "0.1.7-alpha.2"))
+
+    # B：预览线反而落后时，不能把"开启预览"变成"被降级"
+    print("    离线回归 B：预览线落后于稳定线时不得降级")
+    B = {"latest": "0.2.0-rc.1", "next": "0.1.7-rc.2", "alpha": "0.1.7-alpha.2"}
+    check("预览线落后时仍跟随稳定版",
+          updater.decide(old, B, True).target == "0.2.0-rc.1")
+
+    # C：tag 缺失 / 不可解析不炸，也不把垃圾值当目标
+    print("    离线回归 C：tag 缺失 / 不可解析不炸")
+    for name, C in (("只有 latest", {"latest": "0.1.5-rc.3"}),
+                    ("latest 是垃圾值", {"latest": "garbage", "next": "0.1.7-rc.2"}),
+                    ("next 是垃圾值", {"latest": "0.1.5-rc.3", "next": "junk",
+                                       "alpha": "0.1.7-alpha.2"}),
+                    ("dist-tags 为空", {})):
+        try:
+            got = updater.decide(old, C, True).target
+            check(f"容错：{name}", bool(got) and got not in ("garbage", "junk"), got)
+        except Exception as e:                           # noqa: BLE001
+            check(f"容错：{name}", False, f"{type(e).__name__}: {e}")
+
+    # D：跟"稳定版"的路径都必须报出预览通道有没有更高版本
+    print("    离线回归 D：跟稳定版时仍须报出预览通道有更新的")
+    T = {"latest": "0.1.5-rc.3", "next": "0.1.7-rc.2", "alpha": "0.1.7-alpha.2"}
+    D = updater.decide(old, T, False)
+    check("已是最新时能指出预览通道有 0.1.7-rc.2",
+          D.action == "none" and D.newer_preview() == "0.1.7-rc.2",
+          f"action={D.action} newer={D.newer_preview()}")
+    # 真实情形：已装 0.1.7-alpha.2 > latest，关闭预览计划时动作是"回归稳定版"。
+    # 这种提示同样不能丢——否则用户只看到"降级"，不知道还有更新的 RC。
+    D3 = updater.decide(SimpleNamespace(version="0.1.7-alpha.2"), T, False)
+    check("提供回归稳定版时也报出预览通道有 0.1.7-rc.2",
+          D3.action == "downgrade" and D3.newer_preview() == "0.1.7-rc.2",
+          f"action={D3.action} newer={D3.newer_preview()}")
+    check("目标是预览版时 newer_preview 仍返回它（界面靠 channel 判重）",
+          updater.decide(SimpleNamespace(version="0.1.7-alpha.2"), T, True).newer_preview()
+          == "0.1.7-rc.2")
+    check("已装最新 RC 时不再误报预览通道有更新",
+          updater.decide(SimpleNamespace(version="0.1.7-rc.2"), T, False).newer_preview() is None)
 
 
 def main() -> int:
@@ -92,10 +153,13 @@ def main() -> int:
         for opt in (False, True):
             info = updater.decide(inst, tags, opt)
             print(f"    预览计划={'开' if opt else '关'} → {info.summary()}")
-        check("关闭预览计划时不指向 alpha",
+        check("关闭预览计划时不指向预览 tag",
               updater.decide(inst, tags, False).channel == "latest")
     except Exception as e:                               # noqa: BLE001
         check("通道查询", False, str(e)[:120])
+
+    # 通道判定的纯逻辑回归——抽成函数是为了让 CI 的精简模式也跑到它
+    channel_logic_checks()
 
     print(LINE)
     print("[4] 启动 / 就绪 / URL 发现（--port 0 系统分配）")
@@ -257,6 +321,10 @@ def main_lite() -> int:
     check("截断时不做判断（不把'没查'伪装成'查过'）",
           not fp.lost_against(contract.HomeFingerprint(
               path=fp.path, files=0, bytes=0, truncated=True)))
+
+    print(LINE)
+    print("[L2] 通道判定（三条 dist-tag 线；只读 latest+alpha 会漏掉整条 RC 线）")
+    channel_logic_checks()
 
     print(LINE)
     print("[L0] 路径规划（数据根与解包目录必须分家）")
