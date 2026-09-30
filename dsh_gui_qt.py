@@ -957,6 +957,9 @@ class MainWindow(QMainWindow):
         self._tray_hint_shown = False
         self.handle: ServiceHandle | None = None
         self.update_info: updater.UpdateInfo | None = None
+        #: 当前界面主题（供控制面板跟随）。初值取上次记住的，这样面板在标题栏
+        #: 取色探针跑出结果之前就能用对配色，不会先亮一下再翻黑。
+        self._theme_dark = bool(config.get("last_theme_dark", True))
         self.host_release = None          # 有值表示桌面壳有新版本可用
         self.view = None
         self.profile = None
@@ -1052,6 +1055,14 @@ class MainWindow(QMainWindow):
         if ok:
             host_log("标题栏上色：底色 %s（取自界面 %s）文字 %s"
                      % (dwm.to_hex(bg), dwm.to_hex(rgb), dwm.to_hex(fg)))
+
+        # 这个 `dark` 就是"界面当前是深是浅"的既有判定结果，别处（控制面板）直接复用，
+        # 不要在面板里再判一次——两处判断迟早会不一致。同时记住，下次启动能直接用。
+        self._theme_dark = bool(dark)
+        config.set(last_theme_dark=bool(dark))
+        panel = getattr(self, "_panel", None)
+        if panel is not None:
+            panel.apply_theme("dark" if dark else "light")
 
     def _set_theme_icon(self, dark_bg: bool) -> None:
         """按标题栏深浅切换窗口/托盘图标。
@@ -1301,21 +1312,24 @@ class MainWindow(QMainWindow):
         self.act_quit = QAction("退出", self)
         self.act_quit.triggered.connect(self._quit)
 
+        # 托盘只留"必要且一步到位"的项：打开、检查更新、看日志、退出。
+        #
+        # 设置类与版本管理类的项都搬到控制面板了（加入预览计划 / 回归稳定版 /
+        # 回滚 / 标题栏跟随配色 / 准备运行环境）。理由：托盘 menu 放不了说明文字，
+        # "回滚到上一版本"这种有风险的动作应该带上下文，而不是藏在二级菜单里
+        # 点一下就执行。
+        #
+        # 上面那些 QAction 仍然保留（面板走同一套回调，`_refresh_menu` 也还在
+        # 更新它们的文字与可用性），只是不再挂进菜单。
         menu.addAction(act_show)
         menu.addAction(self.act_panel)
-        menu.addAction(self.act_setup)
         menu.addSeparator()
         menu.addAction(self.act_check)
-        menu.addAction(self.act_prev)
-        menu.addAction(self.act_stable)
-        menu.addAction(self.act_rollback)
-        menu.addSeparator()
         menu.addAction(self.act_host_check)
         menu.addSeparator()
-        menu.addAction(self.act_titlebar)
+        menu.addAction(act_logs)
         menu.addAction(self.act_about)
         menu.addSeparator()
-        menu.addAction(act_logs)
         menu.addAction(self.act_quit)
 
         self.tray.setContextMenu(menu)
@@ -1757,10 +1771,15 @@ class MainWindow(QMainWindow):
                 install=lambda: self.handle.install if self.handle else None,
                 handle=lambda: self.handle,
                 host_release=lambda: self.host_release,
-                open_path=lambda p: QDesktopServices.openUrl(QUrl.fromLocalFile(p)) if p
-                                    else self._info("还没有可打开的目录。"),
+                # 主题复用标题栏取色的既有判定，面板不自己判
+                theme=lambda: "dark" if self._theme_dark else "light",
+                open_path=lambda p: QDesktopServices.openUrl(QUrl.fromLocalFile(p))
+                if p else self._info("还没有可打开的目录。"),
                 open_web=self._open_in_browser,
                 log_dir=config.log_dir,
+                flag=self._panel_flag,
+                set_flag=self._panel_set_flag,
+                action=self._panel_action,
             )
             self._panel = dsh_panel.ControlPanel(host, parent=None)
         self._panel.show()
@@ -1775,6 +1794,34 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl(self.handle.url))
         else:
             self._info("服务还没就绪，暂时没有可打开的地址。")
+
+    # ---- 控制面板的适配层 ----
+    #
+    # 面板不认识 MainWindow，只认 PanelHost 暴露的这几个窄接口。开关与动作
+    # **一律复用托盘那套既有方法**，不另写一份——否则两边行为迟早分叉。
+    # 托盘菜单项虽然不再显示，但 QAction 还在，勾选/可用性状态依旧同步。
+
+    def _panel_flag(self, name: str) -> bool:
+        return {
+            "prerelease_opt_in": bool(config.get("prerelease_opt_in")),
+            "adaptive_titlebar": bool(config.get("adaptive_titlebar")),
+        }.get(name, False)
+
+    def _panel_set_flag(self, name: str, value: bool) -> None:
+        if name == "prerelease_opt_in":
+            self._toggle_prerelease(bool(value))
+        elif name == "adaptive_titlebar":
+            self._toggle_titlebar(bool(value))
+
+    def _panel_action(self, name: str) -> None:
+        if name == "check_update":
+            self._check_update(manual=True)
+        elif name == "go_stable":
+            self._go_stable()
+        elif name == "rollback":
+            self._rollback()
+        elif name == "provision":
+            self._prepare_env()
 
     def _toggle_titlebar(self, checked: bool):
         """开关标题栏自适应配色。"""

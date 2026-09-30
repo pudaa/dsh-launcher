@@ -219,6 +219,17 @@ def menu_structure_checks(win) -> list[str]:
         failures.append("缺少控制面板入口")
         print("        实际菜单:", texts)
 
+    # 4c. 设置类项**不应**再出现在托盘（已搬进控制面板）
+    #     这条是防回退：托盘只该放"一步到位"的动作，设置与有风险的版本管理
+    #     动作应该在面板里、带说明文字。加回去就等于又变回原来的样子。
+    MOVED = ("加入预览计划", "标题栏跟随界面配色", "回归稳定版",
+             "回滚 DSH 到上一版本", "准备运行环境…")
+    still_there = [t for t in texts if t in MOVED]
+    print(f"  [{'OK  ' if not still_there else 'FAIL'}] 设置类项已从托盘移出")
+    if still_there:
+        failures.append("托盘残留设置项")
+        print("        仍在托盘里:", still_there)
+
     # 5. 退出时确实会停服务（不再有菜单项，但行为必须还在）
     stopped = []
     win._stop_service = lambda *a, **k: (stopped.append("stop"), 1)[1]
