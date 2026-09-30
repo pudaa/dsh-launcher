@@ -1,10 +1,16 @@
 # -*- coding: utf-8 -*-
-"""从 assets/deepseek.svg 生成深浅两套多尺寸 ICO。
+"""从 assets/deepseek.svg 生成三套多尺寸 ICO。
 
-为什么要两套
-------------
-DSH 的暗色主题下标题栏是深色，原来的黑色图标**看不见**。
-图标必须跟着主题走：深色标题栏配白色图标，浅色标题栏配深色图标。
+为什么要底板（2026-09-30 加）
+---------------------------
+图标原来是**透明底**的纯字形。结果是两个方向都会瞎：
+
+  · 亮色桌面上，白色鲸鱼看不见
+  · 暗色桌面上，深色鲸鱼看不见
+
+所以字形下面必须有一块**跟着一起变色的圆角底板**：白鲸配深板、深鲸配浅板。
+这样无论底下是什么颜色的壁纸/标题栏，字形总有对比。
+底板写在 SVG 里（`fill="currentPlate"`），随图标资产一起走，别的消费者也能拿到。
 
 为什么手写 ICO 而不是 QImage.save("ICO")
 ----------------------------------------
@@ -33,7 +39,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from PySide6.QtCore import QByteArray, QBuffer, QIODevice           # noqa: E402
+from PySide6.QtCore import QByteArray, QBuffer, QIODevice, Qt       # noqa: E402
 from PySide6.QtGui import QColor, QImage, QPainter                  # noqa: E402
 from PySide6.QtSvg import QSvgRenderer                              # noqa: E402
 from PySide6.QtWidgets import QApplication                          # noqa: E402
@@ -45,16 +51,31 @@ OUT_DIR = os.path.join(ROOT, "assets")
 #: 48/64 给资源管理器，128/256 给大图标视图。
 SIZES = (16, 20, 24, 32, 40, 48, 64, 128, 256)
 
-#: 深色标题栏用的白色图标（纯白）
-LIGHT_ICON_FILL = "#ffffff"
-#: 浅色标题栏用的深色图标（与 contrast_text 的深色一致，不是纯黑，
-#: 纯黑在高分屏上会显得比实际更重）
-DARK_ICON_FILL = "#181a1f"
+#: 深色标题栏用（白鲸）—— 底板用**深色**，这样白色字形永远有深色衬底。
+#: 否则落在亮色桌面上就是白底白鲸，直接看不见。
+LIGHT_FG, LIGHT_PLATE = "#ffffff", "#181a1f"
+#: 浅色标题栏用（深鲸）—— 底板用**浅色**，理由同上，方向相反。
+#: 深色值与应用深色主题一致，不是纯黑（纯黑在高分屏上显得比实际更重）。
+DARK_FG, DARK_PLATE = "#181a1f", "#f2f4f7"
+
+#: 输出产物。`icon.ico` 是 PE 资源与桌面快捷方式用的那一份：
+#: 它只可能有一种形态，取「深板 + 白鲸」——白色字形在任何壁纸下都读得出来，
+#: 深板则在亮色壁纸上把图标撑成一块清楚的方块。
+VARIANTS = (
+    ("icon-light.ico", LIGHT_FG, LIGHT_PLATE),
+    ("icon-dark.ico", DARK_FG, DARK_PLATE),
+    ("icon.ico", LIGHT_FG, LIGHT_PLATE),
+)
+
+#: 字形四边至少留这么多（占整块边长比例）。低于它说明缩放/居中参数退化了。
+MIN_GLYPH_MARGIN = 0.08
 
 
-def render_svg(svg_text: str, size: int, fill: str) -> QImage:
-    """把 SVG 渲染成指定尺寸的透明底图像。"""
-    svg = svg_text.replace("currentColor", fill)
+def render_svg(svg_text: str, size: int, fg: str, plate: str) -> QImage:
+    """把 SVG 渲染成指定尺寸的图像（底板 + 字形）。"""
+    svg = (svg_text
+           .replace("currentPlate", plate)
+           .replace("currentColor", fg))
     r = QSvgRenderer(QByteArray(svg.encode("utf-8")))
     if not r.isValid():
         raise RuntimeError("SVG 无效")
@@ -66,6 +87,25 @@ def render_svg(svg_text: str, size: int, fill: str) -> QImage:
     r.render(p)
     p.end()
     return img
+
+
+def glyph_bbox(img: QImage):
+    """字形（不含底板）的包围盒，用来校验留白。
+
+    底板是圆角矩形、贴满整块，所以直接量整图量不出字形位置——
+    这里把底板设成全透明，只让字形显形。
+    """
+    minx, miny, maxx, maxy = img.width(), img.height(), -1, -1
+    for y in range(img.height()):
+        for x in range(img.width()):
+            if img.pixelColor(x, y).alpha() > 20:
+                minx = min(minx, x)
+                maxx = max(maxx, x)
+                miny = min(miny, y)
+                maxy = max(maxy, y)
+    if maxx < 0:
+        return None
+    return minx, miny, maxx, maxy
 
 
 def png_bytes(img: QImage) -> bytes:
@@ -97,29 +137,68 @@ def main() -> int:
         return 1
     svg_text = open(SVG_SRC, encoding="utf-8").read()
     print("源文件:", SVG_SRC)
-    print("viewBox:", end=" ")
+
+    if "currentPlate" not in svg_text:
+        # 底板是图标能在任意底色上被看见的前提。没有它就别生成——
+        # 悄悄退化成透明底会重新引入"某些桌面上看不见"的问题。
+        print("  [FAIL] SVG 里没有 currentPlate 底板占位符，拒绝生成")
+        return 1
+    if "currentColor" not in svg_text:
+        print("  [FAIL] SVG 里没有 currentColor 字形占位符，拒绝生成")
+        return 1
+
     import re
     m = re.search(r'viewBox="([^"]+)"', svg_text)
-    print(m.group(1) if m else "(无)")
+    print("viewBox:", m.group(1) if m else "(无)")
 
     app = QApplication.instance() or QApplication([])                # noqa: F841
 
-    for fill, name in ((LIGHT_ICON_FILL, "icon-light.ico"),
-                       (DARK_ICON_FILL, "icon-dark.ico")):
-        imgs = [render_svg(svg_text, s, fill) for s in SIZES]
-        # 自检：渲染出来不能是全透明
-        opaque = sum(1 for im in imgs
-                     if any(im.pixelColor(x, im.height() // 2).alpha() > 0
-                            for x in range(0, im.width(), max(1, im.width() // 8))))
+    # ---- 留白自检：字形不能顶到底板边缘 ----
+    # 拿 256 这种大尺寸量，比例才有统计意义。
+    # 把底板改成 fill="none" 让它不绘制——**不要**用 #00000000 之类的 8 位十六进制：
+    # QtSvg 不认，rect 会退回继承根节点的 fill="currentColor"，于是整块被涂满，
+    # 量出来的"字形包围盒"就成了整张图。（这个坑自检第一次跑就抓到了。）
+    probe = 256
+    bare = svg_text.replace('fill="currentPlate"', 'fill="none"')
+    gimg = QSvgRenderer(QByteArray(
+        bare.replace("currentColor", "#000000").encode("utf-8")))
+    gi = QImage(probe, probe, QImage.Format.Format_ARGB32)
+    gi.fill(QColor(0, 0, 0, 0))
+    gp = QPainter(gi)
+    gp.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    gimg.render(gp)
+    gp.end()
+
+    box = glyph_bbox(gi)
+    if box is None:
+        print("  [FAIL] 只渲染字形时是空白——路径或 transform 坏了")
+        return 1
+    minx, miny, maxx, maxy = box
+    margins = (minx, probe - 1 - maxx, miny, probe - 1 - maxy)
+    worst = min(margins) / probe
+    ok = worst >= MIN_GLYPH_MARGIN
+    print("  留白自检: 左%d 右%d 上%d 下%d 像素 (最小 %.1f%%，要求 >= %.1f%%)  [%s]"
+          % (margins[0], margins[1], margins[2], margins[3],
+             worst * 100, MIN_GLYPH_MARGIN * 100, "OK" if ok else "FAIL"))
+    if not ok:
+        print("  -> 字形贴边了。检查 assets/deepseek.svg 里的 translate/scale。")
+        return 1
+
+    # ---- 生成 ----
+    for name, fg, plate in VARIANTS:
+        imgs = [render_svg(svg_text, s, fg, plate) for s in SIZES]
+        # 自检：底板必须真的画出来了（取左上角内侧一点，圆角之外应是字/板）
+        im = imgs[-1]
+        mid = im.pixelColor(im.width() // 2, im.height() // 2)
+        corner = im.pixelColor(1, 1)
         data = build_ico(imgs)
         path = os.path.join(OUT_DIR, name)
         with open(path, "wb") as f:
             f.write(data)
-        print("  生成 %-16s %6d 字节  尺寸 %s  有效尺寸数 %d/%d"
-              % (name, len(data), ",".join(str(s) for s in SIZES),
-                 opaque, len(SIZES)))
+        print("  生成 %-16s %6d 字节  尺寸 %d 档  中心色 %s  角(1,1) alpha=%d"
+              % (name, len(data), len(SIZES), mid.name(), corner.alpha()))
 
-    print("\n完成。应用会按标题栏深浅自动切换这两套图标。")
+    print("\n完成。底板的深浅由本文件上方的 LIGHT_PLATE / DARK_PLATE 决定。")
     return 0
 
 

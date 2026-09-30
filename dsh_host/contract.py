@@ -367,13 +367,19 @@ def _cache_path() -> str:
     return config.install_cache_path()
 
 
-def _load_cache() -> tuple[str, str] | None:
+def _load_cache() -> tuple[str, str, str, str] | None:
+    """读缓存，返回 (node, bin_js, version, source)。
+
+    version 可能是空串——早期版本的缓存文件没写这个字段，那种情况下调用方
+    必须退回 spawn 复验（见 try_resolve_install）。
+    """
     try:
         with open(_cache_path(), "r", encoding="utf-8") as f:
             d = json.load(f)
         node, bin_js = d.get("node"), d.get("bin_js")
         if node and bin_js and os.path.isfile(node) and os.path.isfile(bin_js):
-            return node, bin_js
+            return (node, bin_js, str(d.get("version") or ""),
+                    str(d.get("source") or "缓存"))
     except (OSError, ValueError):
         pass
     return None
@@ -389,42 +395,50 @@ def _save_cache(install: DshInstall) -> None:
         pass
 
 
-def try_resolve_install(force: bool = False) -> DshInstall | None:
+def _install_from(node: str, bin_js: str, version: str, source: str) -> DshInstall:
+    pkg_root = os.path.dirname(os.path.dirname(bin_js))
+    return DshInstall(node=node, bin_js=bin_js, pkg_root=pkg_root,
+                      prefix=prefix_of(pkg_root), npm_cli=find_npm_cli(node),
+                      version=version, source=source,
+                      profile=compat.load_profile(version))
+
+
+def try_resolve_install(force: bool = False, verify: bool = True) -> DshInstall | None:
     """定位 DSH 安装，**找不到就返回 None**（首次运行引导要用，不能抛异常）。
 
     命中缓存则跳过全量扫描（每次启动省 1-3 秒）。
     **有显式覆盖时不用缓存** —— 用户在设置里指定 dsh_bin 或环境变量 DSH_BIN，
     意图明确，不能被上一次的缓存结果顶掉。
+
+    `verify=False`：命中缓存时**直接采信缓存里的版本号，不 spawn `dsh --version`**。
+        实测这一跳要 375 ms，而且它挡在"启动服务"之前（见 tools/startup_profile.py）。
+        但复验结果并不是第一时间必须的——用户可以先进界面，之后再提示。
+        所以启动路径用 verify=False，并在启动完成后另起后台任务做一次 force=True 复验。
+        缓存里没有版本号（早期缓存）时自动退回 spawn，不会拿空版本往下走。
     """
     explicit = bool(os.environ.get("DSH_BIN") or config.get("dsh_bin"))
     if not force and not explicit:
         cached = _load_cache()
         if cached:
-            node, bin_js = cached
+            node, bin_js, cached_ver, source = cached
+            if not verify and cached_ver:
+                return _install_from(node, bin_js, cached_ver, source)
             v = read_version(node, bin_js, timeout=30)
             if v:
-                pkg_root = os.path.dirname(os.path.dirname(bin_js))
-                return DshInstall(node, bin_js, pkg_root, prefix_of(pkg_root),
-                                  find_npm_cli(node), v, "缓存", compat.load_profile(v))
+                return _install_from(node, bin_js, v, "缓存")
 
     for node, bin_js, source in _candidate_dirs():
         v = read_version(node, bin_js)
         if not v:
             continue
-        pkg_root = os.path.dirname(os.path.dirname(bin_js))
-        inst = DshInstall(
-            node=node, bin_js=bin_js, pkg_root=pkg_root,
-            prefix=prefix_of(pkg_root),
-            npm_cli=find_npm_cli(node), version=v, source=source,
-            profile=compat.load_profile(v),
-        )
+        inst = _install_from(node, bin_js, v, source)
         _save_cache(inst)
         return inst
     return None
 
 
-def resolve_install(force: bool = False) -> DshInstall:
-    inst = try_resolve_install(force)
+def resolve_install(force: bool = False, verify: bool = True) -> DshInstall:
+    inst = try_resolve_install(force, verify=verify)
     if inst is None:
         tried = [src for src, _b, _n in candidate_bin_js()]
         raise DshError(
@@ -487,13 +501,18 @@ class EnvironmentReport:
         ]
 
 
-def diagnose() -> EnvironmentReport:
-    """首次运行自检。**不抛异常** —— 把"缺什么"如实报出来，交给界面引导。"""
+def diagnose(verify: bool = True) -> EnvironmentReport:
+    """首次运行自检。**不抛异常** —— 把"缺什么"如实报出来，交给界面引导。
+
+    `verify=False` 走"信任缓存版本"的快路径（见 try_resolve_install）——
+    启动路径用它把 375 ms 的版本复验让给后台。引导页仍用默认的 True，
+    因为那里要如实报出版本。
+    """
     rep = EnvironmentReport()
 
     # 先解析安装，再决定用哪个 node —— 否则会出现"报告的版本来自 PATH 上的 node，
     # 实际用的是安装旁边的另一个 node"这种自相矛盾
-    inst = try_resolve_install()
+    inst = try_resolve_install(verify=verify)
     rep.install = inst
 
     node = (inst.node if inst else None) or find_node()

@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage
 
+import dsh_panel
 from dsh_host import config, contract, dwm, provision, selfupdate, updater
 from dsh_host.contract import DshError, ServiceHandle
 from dsh_host.version import HOST_VERSION
@@ -166,6 +167,29 @@ def resource_report() -> tuple[str, bool]:
     if packaged and not exe.lower().endswith(".exe"):
         ok = False
         lines.append("  ↑ 打包版里 current_exe 应指向 .exe")
+
+    # --- 内联 SVG 图标链路 ---
+    # 控制面板的图标是**内联 SVG**，靠 PySide6.QtSvg 在运行时渲染。
+    # 这是本项目第一次在打包产物里用到 QtSvg：如果打包时 QtSvg 的库没被收进去，
+    # 源码里一切正常、打出来的 exe 却起不来（或图标全部空白）。
+    # 资源树里有没有 SVG 文件是看不出来的（我们本来就不读文件），所以只能
+    # **真的渲染一个图标**来验。
+    try:
+        import dsh_icons
+        probe_name = "circle-check"
+        ratio = dsh_icons.ink_ratio(probe_name, 48, "#ffffff")
+        good = 0.02 < ratio < 0.60
+        icon_ok = not dsh_icons.missing([probe_name])
+        lines.append("  图标数            = %d" % len(dsh_icons.SVG))
+        lines.append("  SVG 渲染上色比例   = %.3f（%s）"
+                     % (ratio, "正常" if good else "异常"))
+        if not (good and icon_ok):
+            ok = False
+            lines.append("  ↑ QtSvg 渲染异常：打包时可能漏收了 QtSvg 的库")
+    except Exception as e:                                     # noqa: BLE001
+        ok = False
+        lines.append("  内联图标不可用     = %s: %s" % (type(e).__name__, e))
+        lines.append("  ↑ 面板图标会全部空白；多半是打包漏收了 PySide6.QtSvg")
 
     lines.append("  结论             = %s" % ("通过" if ok else "**失败**"))
     return "\n".join(lines), ok
@@ -323,8 +347,10 @@ class StartupWorker(QThread):
         try:
             # 先做环境自检：缺 Node / 缺 DSH 时不是"启动失败"，而是"还没准备好"，
             # 这两件事对用户的意义完全不同，走不同的界面
+            # verify=False：不在这里等 `dsh --version`，采信缓存里的版本号。
+            # 启动完成后由 VersionReverifyWorker 在后台补一次真实核对。
             self.progress.emit("正在检查运行环境…")
-            rep = contract.diagnose()
+            rep = contract.diagnose(verify=False)
             if not rep.ready:
                 self.needs_setup.emit(rep)
                 return
@@ -353,6 +379,39 @@ class StartupWorker(QThread):
             self.failed.emit(str(e))
         except Exception as e:                                   # noqa: BLE001
             self.failed.emit(f"{type(e).__name__}: {e}")
+
+
+class VersionReverifyWorker(QThread):
+    """启动完成后，在后台复验 DSH 版本。
+
+    为什么挪到后台
+    --------------
+    `resolve_install()` 命中缓存时默认仍会 spawn 一次 `dsh --version` 复验，
+    实测 375 ms（占我方可控启动开销的 91%，见 tools/startup_profile.py），
+    而且它挡在"启动服务"之前——启动路径为此白等一个进程。
+
+    但复验结果**不是第一时间必须的**：用户完全可以先进界面，之后再看到提示。
+    所以启动路径走 `verify=False`（采信缓存里的版本号），复验交给这里。
+
+    这里用 `force=True` 做一次全量重探：既复验版本，也顺手刷新缓存，
+    代价约 0.5 s，全部发生在后台线程里。
+    """
+    changed = Signal(object)               # 新的 DshInstall（版本与界面显示不一致时）
+
+    def __init__(self, shown_version: str):
+        super().__init__()
+        self.shown_version = shown_version
+
+    def run(self):
+        try:
+            fresh = contract.resolve_install(force=True)
+        except Exception as e:                                   # noqa: BLE001
+            host_log("版本复验失败（不影响使用）：%s: %s" % (type(e).__name__, e))
+            return
+        # 把结果对象整个带回去。**不要在界面线程里再 resolve 一次**——
+        # 那等于把刚挪走的阻塞又搬回来，等于白改。
+        if fresh.version and fresh.version != self.shown_version:
+            self.changed.emit(fresh)
 
 
 class ProvisionWorker(QThread):
@@ -1221,6 +1280,10 @@ class MainWindow(QMainWindow):
         self.act_about = QAction("关于 DSH Launcher", self)
         self.act_about.triggered.connect(self._show_about)
 
+        # 控制面板：托盘 menu 装不下的东西都在这里（状态、后续的引导与连接）
+        self.act_panel = QAction("控制面板…", self)
+        self.act_panel.triggered.connect(self._open_panel)
+
         # 标题栏自适应：视觉偏好因人而异，给一个关掉的开关
         self.act_titlebar = QAction("标题栏跟随界面配色", self)
         self.act_titlebar.setCheckable(True)
@@ -1239,6 +1302,7 @@ class MainWindow(QMainWindow):
         self.act_quit.triggered.connect(self._quit)
 
         menu.addAction(act_show)
+        menu.addAction(self.act_panel)
         menu.addAction(self.act_setup)
         menu.addSeparator()
         menu.addAction(self.act_check)
@@ -1302,8 +1366,33 @@ class MainWindow(QMainWindow):
         self.view.load(QUrl(handle.url))
         QTimer.singleShot(15000, lambda: self.stack.setCurrentIndex(1))
         self._refresh_menu()
+        # 版本复验放到后台：启动路径采信了缓存里的版本号，这里补一次真实核对。
+        # 对不上（用户在壳之外装了别的版本）时更新显示并提示，但不挡首屏。
+        self._reverify = VersionReverifyWorker(handle.install.version)
+        self._reverify.changed.connect(self._on_version_changed)
+        self._reverify.start()
         if config.get("check_update_on_start"):
             QTimer.singleShot(3000, lambda: self._check_update(manual=False))
+
+    def _on_version_changed(self, fresh):
+        """后台复验发现实际版本与界面此前显示的不一致。"""
+        shown = self.handle.install.version if self.handle else "?"
+        host_log("版本复验：界面显示 %s，实际 %s" % (shown, fresh.version))
+        if self.handle:
+            # 只换元数据。服务是用同一份 bin_js 拉起来的，版本号变了不代表
+            # 需要重启——重启反而会打断用户正在做的事。
+            self.handle.install = fresh
+            contract.save_state(self.handle)
+        self._refresh_menu()
+        self._info("检测到 DSH 版本与界面显示的不一致。\n\n"
+                   "此前显示　%s\n"
+                   "实际版本　%s\n\n"
+                   "通常意味着 DSH 在桌面壳之外被升级或降级过"
+                   "（例如手动执行过 npm install -g）。\n"
+                   "显示已按实际版本更新。"
+                   % (shown, fresh.version))
+        # 当前版本变了，之前算出的"有没有新版"就不再成立，重新算一次
+        self._check_update(manual=False)
 
     def _on_view_loaded(self, ok: bool):
         """页面加载完成回调。
@@ -1656,6 +1745,37 @@ class MainWindow(QMainWindow):
         )
         QMessageBox.about(self, "关于", text)
 
+    def _open_panel(self):
+        """打开控制面板。
+
+        面板只被创建一次，之后是 show/raise —— 反复开关不该重复构造整个界面。
+        面板与主窗口之间走 `dsh_panel.PanelHost` 这个窄接口：面板不认识 MainWindow，
+        所以主窗口内部怎么改都不会连累它。
+        """
+        if getattr(self, "_panel", None) is None:
+            host = dsh_panel.PanelHost(
+                install=lambda: self.handle.install if self.handle else None,
+                handle=lambda: self.handle,
+                host_release=lambda: self.host_release,
+                open_path=lambda p: QDesktopServices.openUrl(QUrl.fromLocalFile(p)) if p
+                                    else self._info("还没有可打开的目录。"),
+                open_web=self._open_in_browser,
+                log_dir=config.log_dir,
+            )
+            self._panel = dsh_panel.ControlPanel(host, parent=None)
+        self._panel.show()
+        self._panel.raise_()
+        self._panel.activateWindow()
+        # 面板可能停在上次看的那一页，回来时刷新一下底部状态条
+        self._panel.refresh_statusbar()
+
+    def _open_in_browser(self):
+        """用系统浏览器打开当前的 DSH 地址。"""
+        if self.handle and self.handle.url:
+            QDesktopServices.openUrl(QUrl(self.handle.url))
+        else:
+            self._info("服务还没就绪，暂时没有可打开的地址。")
+
     def _toggle_titlebar(self, checked: bool):
         """开关标题栏自适应配色。"""
         config.set(adaptive_titlebar=bool(checked))
@@ -1697,6 +1817,15 @@ class MainWindow(QMainWindow):
         真需要常驻服务的人本来就会用命令行。
         """
         host_log("用户退出，连带停止后台服务")
+        # 先收尾面板的后台线程。线程在解释器退出时还活着会让 Qt 直接 abort，
+        # 而 abort 会丢掉未刷出的日志缓冲——那会让"退出"变成一件莫名其妙的事。
+        panel = getattr(self, "_panel", None)
+        if panel is not None:
+            try:
+                if not panel.shutdown():
+                    host_log("警告：面板的后台检测线程未在超时内结束")
+            except Exception as e:                               # noqa: BLE001
+                host_log("退出时收尾面板失败：%s: %s" % (type(e).__name__, e))
         try:
             n = self._stop_service()
             host_log("已停止后台服务（%d 个进程）" % n)

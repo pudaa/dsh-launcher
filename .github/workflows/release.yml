@@ -92,6 +92,8 @@ jobs:
             --include-data-dir=assets=assets \
             --enable-plugin=pyside6 \
             --include-package=dsh_host \
+            --include-module=dsh_panel \
+            --include-module=dsh_icons \
             --onefile-tempdir-spec={CACHE_DIR}/DSH-Web-runtime \
             --output-dir=build \
             --output-filename=DSH-Web.exe \
@@ -113,7 +115,9 @@ jobs:
 
       - name: 在产物上做资源自检
         # 源码树里 assets/ 永远存在，所以单元测试全绿也证明不了"包里带了"。
-        # 这一步直接问打包产物自己：assets 解析到哪、图标能不能加载。
+        # 这一步直接问打包产物自己：assets 解析到哪、图标能不能加载、
+        # **内联 SVG 图标能不能渲染**（控制面板的图标靠 QtSvg，这是本项目
+        # 第一次在产物里用 QtSvg——漏收它的库会表现为图标全部空白）。
         # 少了这一步，图标会在发布后才被发现是坏的。
         shell: bash
         run: |

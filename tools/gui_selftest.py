@@ -210,6 +210,15 @@ def menu_structure_checks(win) -> list[str]:
     if not ok:
         failures.append("缺少关于入口")
 
+    # 4b. 控制面板入口存在
+    #     托盘 menu 装不下"看状态 / 读提示"这类内容，面板是它们的唯一去处；
+    #     这个入口一旦丢了，面板就等于不存在。
+    ok = any("控制面板" in t for t in texts)
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 提供控制面板入口")
+    if not ok:
+        failures.append("缺少控制面板入口")
+        print("        实际菜单:", texts)
+
     # 5. 退出时确实会停服务（不再有菜单项，但行为必须还在）
     stopped = []
     win._stop_service = lambda *a, **k: (stopped.append("stop"), 1)[1]
@@ -723,13 +732,19 @@ def main() -> int:
     state["titlebar_failures"] = titlebar_checks()
     print()
 
+    print("== 控制面板（无边框固定尺寸 / 图标 / 页签 / 像素级底色）==")
+    import dsh_panel
+    state["panel_failures"] = dsh_panel.selftest_checks()
+    print()
+
     if static_only:
         # 菜单结构检查不需要服务在跑——它只读菜单项文本与启用状态。
         # 但 MainWindow 的构造函数会立刻启动服务，所以这里用不启动
         # 服务的方式构造：直接跳过窗口，单独验证菜单定义。
         print("== 静态模式下跳过真实启动链路（未安装 DSH）==")
         bad = (state.get("onboarding_failures") or state.get("dialog_copy_failures")
-               or state.get("host_update_failures") or state.get("titlebar_failures"))
+               or state.get("host_update_failures") or state.get("titlebar_failures")
+               or state.get("panel_failures"))
         if bad:
             print("\n用例失败：", "、".join(bad))
             return 1

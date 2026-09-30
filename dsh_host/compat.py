@@ -159,6 +159,23 @@ BUILTIN_DEFAULTS: dict = {
     "stale_locks": [".credentials.yaml.lock"],
 
     "service_host": "127.0.0.1",
+
+    # --- 首次运行引导用的网址与命令 ---
+    # 刻意放在**适配表**里而不是写死在界面代码里：上游换下载页、换安装命令时，
+    # 改这里（或外部 compat.json）就能跟上，不需要重新打包 exe。
+    #
+    # 注意区分两类东西：
+    #   · 网址与命令  —— 是"操作"，会随上游变，所以可覆盖（放这里）
+    #   · "跑 node --version 看有没有输出" —— 是"判定"，是我们自己的契约，
+    #     写在代码里（见 dsh_panel.local_checks / provision.py）
+    # 把这两类混在一起才叫硬编码。
+    "guide": {
+        "node_download": "https://nodejs.org/zh-cn/download",
+        "node_winget": "winget install OpenJS.NodeJS.LTS",
+        "dsh_site": "https://deepseek.com/harness",
+        "dsh_repo": "https://github.com/deepseek-ai/deepseek-harness",
+        "dsh_docs": "https://deepseek-harness.github.io/deepseek-harness/",
+    },
 }
 
 # 按版本区间的覆盖项。没有实际需要时保持为空——它存在的意义是"下次破坏性更新时
@@ -173,7 +190,9 @@ BUILTIN_OVERRIDES: list[dict] = [
 
 # ------------------------------------------------------------------ 组装 profile
 
-_MERGE_KEYS = ("cli",)
+#: 这些键在外层覆盖时做**深合并**而不是整体替换，这样外部只需要写要改的那几条。
+#: （整体替换会让"只改一个网址"变成"必须抄一遍整份"。）
+_MERGE_KEYS = ("cli", "guide")
 
 
 def _merge(base: dict, patch: dict) -> dict:

@@ -107,6 +107,54 @@ def channel_logic_checks():
           updater.decide(SimpleNamespace(version="0.1.7-rc.2"), T, False).newer_preview() is None)
 
 
+def install_cache_checks():
+    """安装缓存与"版本复验"快路径的纯逻辑回归（不需要装 DSH）。
+
+    守卫的是 v2.1.6 的改动：启动路径不再为 `dsh --version` 白等 400ms，
+    改为采信缓存里的版本号，复验挪到后台。代价是这个快路径**必须**满足两条：
+      1. 缓存里确实存了版本号（否则快路径会拿到空版本）
+      2. 早期缓存（没写 version 字段）必须退回 spawn，不能返回空版本
+
+    做法是把 `_cache_path()` 临时指到临时文件上——**绝不能碰用户真实的
+    `%LOCALAPPDATA%\\DSH-Web\\install.json`**。
+    """
+    import tempfile
+    tmpdir = tempfile.mkdtemp(prefix="dsh-cache-check-")
+    fake_cache = os.path.join(tmpdir, "install.json")
+    # _load_cache 要求 node / bin_js 都真实存在，拿当前解释器与一个临时文件顶上
+    fake_bin = os.path.join(tmpdir, "bin.js")
+    open(fake_bin, "w", encoding="utf-8").close()
+    node = sys.executable
+
+    orig = contract._cache_path
+    contract._cache_path = lambda: fake_cache          # type: ignore[assignment]
+    try:
+        import json
+        with open(fake_cache, "w", encoding="utf-8") as f:
+            json.dump({"node": node, "bin_js": fake_bin,
+                       "version": "9.9.9-test", "source": "自测"}, f)
+        got = contract._load_cache()
+        check("缓存里的版本号被读出来", bool(got) and got[2] == "9.9.9-test",
+              str(got[2] if got else None))
+        check("缓存里的来源也被读出来", bool(got) and got[3] == "自测")
+
+        # 模拟早期缓存：没有 version 字段
+        with open(fake_cache, "w", encoding="utf-8") as f:
+            json.dump({"node": node, "bin_js": fake_bin}, f)
+        got2 = contract._load_cache()
+        check("旧缓存缺 version 时返回空串（而不是报错或 None）",
+              bool(got2) and got2[2] == "", repr(got2[2] if got2 else None))
+        check("旧缓存仍能给出 node/bin_js（不会退化成'未安装'）",
+              bool(got2) and got2[0] == node and got2[1] == fake_bin)
+
+        # 路径不存在 → None
+        contract._cache_path = lambda: os.path.join(tmpdir, "nope.json")
+        check("缓存文件不存在时返回 None", contract._load_cache() is None)
+    finally:
+        contract._cache_path = orig                    # type: ignore[assignment]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def main() -> int:
     if LITE:
         return main_lite()
@@ -160,6 +208,10 @@ def main() -> int:
 
     # 通道判定的纯逻辑回归——抽成函数是为了让 CI 的精简模式也跑到它
     channel_logic_checks()
+
+    print(LINE)
+    print("[3b] 安装缓存与版本复验快路径")
+    install_cache_checks()
 
     print(LINE)
     print("[4] 启动 / 就绪 / URL 发现（--port 0 系统分配）")
@@ -325,6 +377,10 @@ def main_lite() -> int:
     print(LINE)
     print("[L2] 通道判定（三条 dist-tag 线；只读 latest+alpha 会漏掉整条 RC 线）")
     channel_logic_checks()
+
+    print(LINE)
+    print("[L0] 安装缓存（启动路径靠它跳过 400ms 的版本复验）")
+    install_cache_checks()
 
     print(LINE)
     print("[L0] 路径规划（数据根与解包目录必须分家）")
