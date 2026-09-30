@@ -40,14 +40,14 @@ from __future__ import annotations
 import os
 from string import Template
 
-from PySide6.QtCore import (QAbstractAnimation, Property, QEasingCurve, QPointF,
-                           QPropertyAnimation, QRectF, QSize, Qt, QThread,
-                           QTimer, QUrl, Signal)
+from PySide6.QtCore import (QAbstractAnimation, QEvent, Property, QEasingCurve,
+                            QPointF, QPropertyAnimation, QRectF, QSize, Qt,
+                            QThread, QTimer, QUrl, Signal)
 from PySide6.QtGui import (QColor, QDesktopServices, QGuiApplication, QPainter,
                            QPainterPath, QPen)
 from PySide6.QtWidgets import (QFrame, QGraphicsOpacityEffect, QHBoxLayout,
-                               QLabel, QPushButton, QSizePolicy, QStackedWidget,
-                               QToolButton, QVBoxLayout, QWidget)
+                               QLabel, QPushButton, QScrollArea, QSizePolicy,
+                               QStackedWidget, QToolButton, QVBoxLayout, QWidget)
 
 import dsh_icons as icons
 from dsh_host import compat, config, contract, dwm, updater
@@ -117,6 +117,10 @@ PALETTE_LIGHT = {
     "ok": _css("#22c55e"),             # --dsw-alias-state-success-primary
     "bad": _css("#ec1313"),            # --dsw-alias-state-error-primary
     "warn": _css("#f59e0b"),           # --dsw-alias-state-warn-primary
+    #: 滚动指示条。官方给了两档（bg / hover），这里取 **hover 档**：
+    #: 官方滚动条是常驻的，bg 档（#e5e5e5）在白底上对比度只有 1.26:1 也够用；
+    #: 我们这根是"滚动时浮现、停下就淡出"的浮层，淡到看不见就失去意义了。
+    "scroll": _css("#d4d4d4"),         # --dsw-alias-scrollbar-hover-l1
 }
 
 #: 深色主题。色值 = 官方 `body[data-ds-dark-theme]` 下的令牌。
@@ -142,6 +146,7 @@ PALETTE_DARK = {
     "ok": _css("#22c55e"),
     "bad": _css("#f25a5a"),
     "warn": _css("#f59e0b"),
+    "scroll": _css("#545557"),         # --dsw-alias-scrollbar-hover-l1
 }
 
 PALETTES = {"light": PALETTE_LIGHT, "dark": PALETTE_DARK}
@@ -167,7 +172,10 @@ QWidget#titlebar,
 QWidget#sidebar,
 QWidget#statusbar,
 QWidget#content,
-QWidget#page       { background: transparent; }
+QWidget#page,
+QWidget#pageContent { background: transparent; }
+QScrollArea#pageScroll { background: transparent; border: none; }
+QScrollArea#pageScroll > QWidget > QWidget { background: transparent; }
 
 QLabel#panelTitle  { color: $text; font-family: $font; font-size: 13px; }
 QLabel#statusText  { color: $muted; font-family: $font; font-size: 12px; }
@@ -181,6 +189,9 @@ QToolButton#winBtn { border: none; background: transparent; border-radius: 0px; 
 QToolButton#winBtn:hover { background: $hover; }
 QToolButton#winBtn[danger="true"]:hover { background: $bad; }
 
+/* 按钮的最小尺寸不写在这里：QSS 的 min-height 是**内容区**下限，
+   padding 与 border 会再叠上去，结果比预期高一截。改在 BasePage 里统一
+   setMinimumHeight/Width，语义明确也可控。 */
 QPushButton#action  {
     color: $text; background: $btn_fill; border: 1px solid $line;
     border-radius: ${r_ctrl}px; padding: 6px 14px;
@@ -417,7 +428,7 @@ class Card(QFrame):
         self.title_lbl = QLabel(title)
         self.title_lbl.setStyleSheet(Template(
             "color: $muted; font-family: $font; font-size: 12px;"
-            " padding: 14px 16px 6px 16px; border: none;"
+            " padding: 14px 16px 8px 16px; border: none;"
         ).substitute(muted=pal["muted"], font=FONT))
         self.body.addWidget(self.title_lbl)
 
@@ -427,6 +438,22 @@ class Card(QFrame):
 
     def add(self, w: QWidget) -> None:
         self.body.addWidget(w)
+
+    def add_text(self, text: str, kind: str = "body") -> QLabel:
+        """加一段说明文字。**卡片内的纯文本必须走这个方法。**
+
+        为什么：`Card` 内部只有**标题**自带内边距，`KeyValueRow` / `CheckRow`
+        这类行控件各自带自己的内边距，而**裸 QLabel 什么都不带**——
+        直接 `add(_label(...))` 会让正文贴到卡片边框上（连接页、关于页都踩过，
+        真机截图里一眼能看到）。
+
+        与其在每个页面手动补，不如把"卡片内的纯文本要有左右 16px"这件事
+        收在这一个出口上。
+        """
+        lbl = _label(text, kind)
+        lbl.setContentsMargins(16, 3, 16, 3)
+        self.body.addWidget(lbl)
+        return lbl
 
 
 class CheckRow(QWidget):
@@ -753,16 +780,170 @@ def _label(text: str, kind: str = "body") -> QLabel:
     return lbl
 
 
+class ScrollHint(QWidget):
+    """浮动滚动指示条。
+
+    为什么不用原生 `QScrollBar`
+    --------------------------
+    原生滚动条**常驻可见、还要占掉内容宽度**，在固定尺寸的面板里就是一根多余
+    的分割线（老大明确说"不喜欢有滚动条"）。改成浮在内容右边缘的小圆角条：
+    滚动时浮现、停下约 1 秒后淡出，内容不需要滚动时根本不显示、也不占位。
+
+    颜色用官方的 `scrollbar-bg-l1` 令牌，明暗各一套，和其他配色同源。
+
+    两个实现要点：
+      · 必须 `WA_TransparentForMouseEvents`——它是浮层，绝不能挡住下面的点击。
+      · 滚动条策略设成 AlwaysOff 后**滚轮依然有效**（策略只影响条本身的显示，
+        不影响视口的滚动行为），所以"隐藏原生条"不会带来滚动能力的损失。
+    """
+
+    BAR_W = 4
+    MARGIN = 3
+    MIN_H = 32
+    IDLE_MS = 900          # 停止滚动后多久开始淡出
+    FADE_MS = 220
+
+    def __init__(self, area: QScrollArea, pal: dict, parent=None):
+        super().__init__(area.viewport())
+        self.area = area
+        self.pal = pal
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setFixedWidth(self.BAR_W)
+        self._fade = 0.0
+        self._anim = None
+        self._idle = QTimer(self)
+        self._idle.setSingleShot(True)
+        self._idle.timeout.connect(lambda: self._animate_to(0.0))
+
+        bar = area.verticalScrollBar()
+        bar.valueChanged.connect(self._on_scroll)
+        bar.rangeChanged.connect(lambda *_: self._sync())
+        area.viewport().installEventFilter(self)
+        self.hide()
+
+    # -- 淡入淡出由这个属性驱动 --
+    def get_fade(self) -> float:
+        return self._fade
+
+    def set_fade(self, v: float) -> None:
+        self._fade = float(v)
+        # 可见性绑在淡入度上：动画把它推上去时才真正 show()。
+        # 只靠 _sync() 里判断是不行的——滚动的第一瞬间 _fade 还是 0，
+        # 那时 _sync 不会显示它，之后也没有人再显示，条子就永远看不见。
+        self.setVisible(self._fade > 0.01 and self._scrollable())
+        self.update()
+
+    fade = Property(float, get_fade, set_fade)
+
+    def _scrollable(self) -> bool:
+        bar = self.area.verticalScrollBar()
+        return bar.maximum() > bar.minimum()
+
+    def set_palette_colors(self, pal: dict) -> None:
+        self.pal = pal
+        self.update()
+
+    def _animate_to(self, target: float) -> None:
+        if abs(self._fade - target) < 0.01:
+            return
+        anim = QPropertyAnimation(self, b"fade", self)
+        anim.setDuration(self.FADE_MS)
+        anim.setStartValue(self._fade)
+        anim.setEndValue(float(target))
+        anim.setEasingCurve(QEasingCurve.Type.OutQuad)
+        anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+        self._anim = anim
+
+    def _on_scroll(self, *_a) -> None:
+        self._sync()
+        if self._fade < 0.99:
+            self._animate_to(1.0)
+        self._idle.start(self.IDLE_MS)
+
+    def _sync(self) -> None:
+        """按滚动位置与内容比例摆好条子；内容不需要滚动就整条收起来。"""
+        bar = self.area.verticalScrollBar()
+        vp = self.area.viewport()
+        vh, total = vp.height(), vp.height() + bar.maximum() - bar.minimum()
+        if self._scrollable() is False or total <= vh or vh <= 0:
+            self.setVisible(False)
+            return
+        # 可用高度要扣掉上下外边距，否则滑到底时条子会越过视口下沿
+        usable = max(1, vh - 2 * self.MARGIN)
+        h = max(self.MIN_H, int(usable * vh / total))
+        span = max(0, usable - h)
+        rng = max(1, bar.maximum() - bar.minimum())
+        pos = int(span * (bar.value() - bar.minimum()) / rng)
+        self.setGeometry(vp.width() - self.BAR_W - self.MARGIN,
+                         self.MARGIN + pos, self.BAR_W, h)
+        self.raise_()
+        if self._fade > 0.01:
+            self.setVisible(True)
+
+    def eventFilter(self, obj, ev) -> bool:                        # noqa: N802
+        if ev.type() in (QEvent.Type.Resize, QEvent.Type.Show):
+            self._sync()
+        return False
+
+    def paintEvent(self, _e) -> None:                              # noqa: N802
+        a = max(0.0, min(1.0, self._fade))
+        if a <= 0.01:
+            return
+        c = QColor(self.pal["scroll"])
+        c.setAlphaF(a)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(c)
+        r = self.BAR_W / 2.0
+        p.drawRoundedRect(QRectF(0, 0, self.BAR_W, self.height()), r, r)
+        p.end()
+
+
 class BasePage(QWidget):
-    """页面基类。`on_show()` 在每次被切到时调用（含懒创建后的第一次）。"""
+    """页面基类。`on_show()` 在每次被切到时调用（含懒创建后的第一次）。
+
+    **内容放在 QScrollArea 里**，这是被真机反馈逼出来的：
+    窗口是固定 600 高的，页面内容一旦超出，QVBoxLayout 会把子项压到**低于它们
+    的最小高度**——表现是按钮被压扁、文字被裁。加滚动区之后内容再多也只是出现
+    滚动条，不会挤压任何控件。
+    """
 
     def __init__(self, host: PanelHost, pal: dict, parent=None):
         super().__init__(parent)
         self.setObjectName("page")
-        lay = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self.scroll = QScrollArea(self)
+        self.scroll.setObjectName("pageScroll")
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        # 原生条一律关掉：常驻可见且占内容宽度，改用下面的浮动指示条。
+        # 关掉只影响"条显不显示"，**滚轮照常能滚**。
+        self.scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # 视口默认会用调色板的 Base 色填底，在深色主题下会露出一块浅色。
+        # 全局样式表里的 `QWidget { background: transparent }` 已经覆盖了它，
+        # 这里再关掉自动填充，双保险。
+        self.scroll.viewport().setAutoFillBackground(False)
+
+        self.content = QWidget()
+        self.content.setObjectName("pageContent")
+        self.content.setAutoFillBackground(False)
+        lay = QVBoxLayout(self.content)
         # 内容留白放大：上一版被指出"文本与容器边界太近"
-        lay.setContentsMargins(28, 22, 28, 20)
+        lay.setContentsMargins(28, 22, 28, 22)
         lay.setSpacing(14)
+        self.scroll.setWidget(self.content)
+        outer.addWidget(self.scroll)
+
+        #: 浮动滚动指示条（浮在视口上，不占宽度）
+        self.hint = ScrollHint(self.scroll, pal)
+
         self.layout_ = lay
         self.host = host
         self.pal = pal
@@ -772,12 +953,29 @@ class BasePage(QWidget):
         if not self._built:
             self._built = True
             self.build()
+            self._fit_buttons()
+
+    def _fit_buttons(self) -> None:
+        """给按钮一个可靠的下限尺寸。
+
+        真机反馈过"按钮大小不合理、文字被内边距遮盖"。根因是内容超出固定窗口
+        高度时布局把子项压到低于最小高度——**加滚动区是主修**（见类文档），
+        这里再给一道保险，顺带让同一排按钮高度一致，观感也整齐。
+
+        （不用 QSS 的 min-height：那是内容区下限，padding 与 border 会再叠上去，
+        算出来的总高比预期大一截，反而更难看。）
+        """
+        for b in self.findChildren(QPushButton):
+            if b.objectName() in ("action", "primary"):
+                b.setMinimumHeight(30)
+                b.setMinimumWidth(76)
 
     def build(self) -> None:                                       # pragma: no cover
         pass
 
     def apply_palette(self, pal: dict) -> None:
         self.pal = pal
+        self.hint.set_palette_colors(pal)
 
     def shutdown(self, timeout_ms: int = 8000) -> bool:
         """收尾钩子。有后台线程的页面覆盖它。返回是否收尾干净。"""
@@ -921,8 +1119,8 @@ class DeployPage(BasePage):
         # 这条原本是托盘里的「准备运行环境…」。挪过来而不是删掉——能力还在，
         # 只是从"日常入口"降级成"不想自己装时的兜底"，且必须点进这一页才看得到。
         c3 = Card("不想自己装？", self.pal)
-        c3.add(_label("可以让桌面壳代劳：自动安装 Node.js 与 DeepSeek Harness。"
-                      "需要联网，中途会弹出进度窗口。"))
+        c3.add_text("可以让桌面壳代劳：自动安装 Node.js 与 DeepSeek Harness。"
+                    "需要联网，中途会弹出进度窗口。")
         holder = QWidget()
         lay = QHBoxLayout(holder)
         lay.setContentsMargins(16, 4, 16, 10)
@@ -970,7 +1168,9 @@ class DeployPage(BasePage):
         v.setWordWrap(True)
         btn = QPushButton("复制")
         btn.setObjectName("action")
-        btn.setIcon(icons.qicon("copy", self.pal["dim"], 16))
+        # 图标显式给尺寸：默认 iconSize 会取样式建议值，和 13px 文字放一起偏高
+        btn.setIconSize(QSize(14, 14))
+        btn.setIcon(icons.qicon("copy", self.pal["dim"], 14))
         btn.setEnabled(bool(cmd))
         btn.clicked.connect(lambda: self._copy(cmd, btn))
         lay.addWidget(t)
@@ -994,23 +1194,24 @@ class ConnectPage(BasePage):
         self.layout_.addWidget(_label("远程连接还在规划中，这里先说明我们打算怎么做。"))
 
         c1 = Card("规划中的形态", self.pal)
-        for line in (
+        # 用一段文本而不是三条独立 label：独立 label 之间的间距只能靠各自的
+        # 内边距堆，看起来是散的；整段交给 QLabel 自己排版更稳。
+        c1.add_text("\n".join((
             "· 把另一台设备上的 DSH 呈现在本机窗口里，多个设备各开一个窗口",
             "· 目标设备可以还没启动 DSH——由连接过程带着把它拉起来",
             "· 连接方式依托你已有的通道（SSH 隧道或组网），不额外占用端口",
-        ):
-            c1.add(_label(line))
+        )))
         self.layout_.addWidget(c1)
 
         c2 = Card("一条不会变的底线", self.pal)
-        c2.add(_label(
+        c2.add_text(
             "我们不会让 DSH 监听外网，也不会改它的绑定设置。"
             "DSH 的接口上有执行命令的能力，官方正是因为这个才把监听范围锁在本机"
             "（它自己的启动器里写着：绑定到全网段等于把远程代码执行暴露到网络上）。"
-            "绕过这条限制，等于替官方做它明确拒绝的安全决定，而且上游一加校验我们就得崩。"))
-        c2.add(_label(
+            "绕过这条限制，等于替官方做它明确拒绝的安全决定，而且上游一加校验我们就得崩。")
+        c2.add_text(
             "所以传输由我们这一侧负责：DSH 仍然只听本机，由隧道把它的本机端口借过来"
-            "——对外只需要一条通道。"))
+            "——对外只需要一条通道。")
         self.layout_.addWidget(c2)
         self.layout_.addStretch(1)
 
@@ -1140,9 +1341,9 @@ class AboutPage(BasePage):
         c2 = Card("来源与许可", self.pal)
         c2.add(KeyValueRow("桌面壳仓库", HOST_REPO, self.pal))
         c2.add(KeyValueRow("DSH 依赖", updater.PKG_NAME, self.pal))
-        c2.add(_label("界面图标来自 Lucide（ISC 许可），已内联为源码，"
-                      "运行时不读外部文件。"))
-        c2.add(_label("配色取自 DSH 官方前端的语义令牌，跟随界面主题切换。"))
+        c2.add_text("界面图标来自 Lucide（ISC 许可），已内联为源码，"
+                    "运行时不读外部文件。")
+        c2.add_text("配色取自 DSH 官方前端的语义令牌，跟随界面主题切换。")
         self.layout_.addWidget(c2)
 
         c3 = Card("目录", self.pal)
@@ -1569,6 +1770,81 @@ def selftest_checks() -> list:
     check("快速连点导航后当前页恢复可见（淡入能收尾）",
           cur is not None and eff is None,
           "等待 %dms，effect=%s" % (waited, type(eff).__name__ if eff else "已撤掉"))
+
+    # --- 真机反馈过的两个排版问题，逐页扫 ---
+    #   ① 按钮被压扁、文字被内边距裁掉
+    #   ② 卡片里的纯文本贴到卡片边框上
+    # 这两条只能等布局真的跑完再量，所以逐页 goto + 推进事件循环。
+    squeezed, touching = [], []
+    for idx in range(len(ControlPanel.PAGES)):
+        panel.goto(idx)
+        loop_events(app, 280)
+        page = panel.pages[idx]
+
+        for b in page.findChildren(QPushButton):
+            if b.objectName() not in ("action", "primary"):
+                continue
+            if b.height() < b.sizeHint().height():
+                squeezed.append("第%d页 %r %d<%d"
+                                % (idx, b.text()[:10], b.height(),
+                                   b.sizeHint().height()))
+
+        for card in page.findChildren(Card):
+            for lbl in card.findChildren(QLabel):
+                # 只看**直接挂在卡片上**的文本：行控件内部的 label 自己有边距
+                if lbl.parentWidget() is not card:
+                    continue
+                cm = lbl.contentsMargins()
+                if cm.left() < 12 and "padding" not in lbl.styleSheet():
+                    touching.append("第%d页 %r 左边距=%d"
+                                    % (idx, lbl.text()[:14], cm.left()))
+
+    check("没有按钮被压到低于自身最小高度", not squeezed, "、".join(squeezed[:4]))
+    check("卡片里的纯文本没有贴边框（左右 >= 12px）", not touching,
+          "、".join(touching[:4]))
+
+    # --- 内容超出固定窗口高度时必须可滚动，而不是挤压控件 ---
+    #  这是上面第一条的**根因**：QVBoxLayout 在空间不足时会把子项压到低于最小值。
+    scrolled = []
+    for idx in range(len(ControlPanel.PAGES)):
+        page = panel.pages[idx]
+        if not isinstance(page.scroll, QScrollArea):
+            scrolled.append("第%d页没有滚动区" % idx)
+        elif not page.scroll.widgetResizable():
+            scrolled.append("第%d页滚动区不可随窗口调整" % idx)
+        elif page.scroll.verticalScrollBarPolicy() != \
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff:
+            # 原生条常驻可见还占内容宽度，老大明确不要
+            scrolled.append("第%d页原生滚动条没关掉" % idx)
+    check("每页都有滚动区，且原生滚动条已关闭", not scrolled, "、".join(scrolled))
+
+    # --- 浮动指示条：该出现时出现、该消失时消失、别越界 ---
+    hint_bad = []
+    for idx in range(len(ControlPanel.PAGES)):
+        panel.goto(idx)
+        loop_events(app, 300)
+        page, bar = panel.pages[idx], panel.pages[idx].scroll.verticalScrollBar()
+        vp = page.scroll.viewport()
+        if bar.maximum() <= 0:
+            # 内容不超高：条子必须完全不出现（也不占位）
+            if page.hint.isVisible():
+                hint_bad.append("第%d页内容不超高却显示了指示条" % idx)
+            continue
+        # 滚到底：条子应可见，且**完全落在视口内**（滑到底不能越过下沿）
+        bar.setValue(bar.maximum())
+        loop_events(app, 120)
+        g = page.hint.geometry()
+        if not page.hint.isVisible():
+            hint_bad.append("第%d页滚动后指示条没出现" % idx)
+        if not (0 <= g.top() and g.bottom() <= vp.height()
+                and g.right() <= vp.width()):
+            hint_bad.append("第%d页指示条越界 %s（视口 %dx%d）"
+                            % (idx, g, vp.width(), vp.height()))
+        # 浮层绝不能吃鼠标事件，否则会挡住它下面的按钮
+        if not page.hint.testAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents):
+            hint_bad.append("第%d页指示条会挡鼠标" % idx)
+    check("浮动滚动指示条行为正确（不越界、不挡鼠标、不需要时不出现）",
+          not hint_bad, "、".join(hint_bad[:4]))
 
     # --- 界面里不许出现 Emoji ---
     import re
