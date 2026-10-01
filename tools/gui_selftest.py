@@ -656,6 +656,22 @@ def titlebar_checks() -> list[str]:
         failures.append("打包漏 assets")
         print("        Nuitka 不会自动带上 assets/，图标会静默失效")
 
+    #     **onefile 解包目录必须带版本后缀**（2026-10-01 实测得出）
+    #
+    #     应用内更新的做法是"替换完文件后、在旧进程还没退出时就拉起新实例"，
+    #     所以新旧**必须能同时运行**。而 Nuitka onefile 会把程序解包到一个
+    #     目录再跑：共用目录时，旧实例锁着里面那个同名 exe，新实例**根本起不来**
+    #     ——实测直接报 `failed to open ... for writing`、退出码 2、0.2 秒就死。
+    #     用户看到的是"点了重启，什么都没发生"。
+    #
+    #     这条只能在打包后暴露，源码树里怎么测都是绿的，所以必须钉住。
+    ok = ("--onefile-tempdir-spec=" in wf_text
+          and "DSH-Web-runtime-${{ github.ref_name }}" in wf_text)
+    print(f"  [{'OK  ' if ok else 'FAIL'}] onefile 解包目录带版本后缀")
+    if not ok:
+        failures.append("解包目录未按版本隔离")
+        print("        新旧版本共用解包目录时，新实例会因文件被锁而起不来")
+
     #     资源自检必须真的能改变退出码：main() 曾声明 -> None 且裸调，
     #     返回值被丢掉 → 退出码恒 0 → CI 拦不住坏产物。
     src_main = open(os.path.join(ROOT, "dsh_gui_qt.py"),

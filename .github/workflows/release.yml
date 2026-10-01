@@ -86,6 +86,18 @@ jobs:
           #
           # 正确性由下面"在产物上做资源自检"那一步兜住——
           # 它在真实产物上验证 assets 能否解析、图标能否加载。
+          #
+          # 关于 --onefile-tempdir-spec 里的版本后缀：**不能省**（2026-10-01 实测）。
+          #
+          # onefile 会把程序解包到那个目录再运行。如果新旧版本共用同一个目录，
+          # **旧实例还活着时新实例根本起不来**——里面那个 <同名的>.exe 正被旧
+          # 进程锁着，Nuitka 直接报错退出：
+          #     Error, failed to open '...\DSH-Web-runtime\probe.exe' for writing.
+          #     退出码 2（0.2 秒就死了，用户看到的是"点了重启什么都没发生"）
+          #
+          # 而"应用内就地替换"这条更新路径**必须让新旧同跑**（新实例是在旧实例
+          # 退出前被拉起来的）。所以每个版本用各自的解包目录，实测这样就能共存。
+          # 旧的解包目录由 dsh_host/selfupdate.py 的 cleanup_stale_runtimes 清理。
           python -m nuitka --onefile \
             --windows-console-mode=disable \
             --windows-icon-from-ico=assets/icon.ico \
@@ -94,7 +106,7 @@ jobs:
             --include-package=dsh_host \
             --include-module=dsh_panel \
             --include-module=dsh_icons \
-            --onefile-tempdir-spec={CACHE_DIR}/DSH-Web-runtime \
+            --onefile-tempdir-spec={CACHE_DIR}/DSH-Web-runtime-${{ github.ref_name }} \
             --output-dir=build \
             --output-filename=DSH-Web.exe \
             --lto=yes \

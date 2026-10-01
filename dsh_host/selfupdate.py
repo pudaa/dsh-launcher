@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import ssl
 import subprocess
 import sys
@@ -379,9 +380,130 @@ def remove_backup(path: str | None) -> str | None:
         return None
 
 
+#: 产物自检入口的环境变量名。
+#:
+#: 这是 **updater 与 exe 之间的契约**：updater 要用它来"预检候选版本能不能启动"
+#: （见 `preflight`），所以名字必须两边一致 —— 定义在这里，界面层 import，
+#: 不要各写一份字符串。
+SELFTEST_ENV = "DSH_HOST_RESOURCE_CHECK"
+
+
+def preflight(exe: str, timeout: float = 240) -> tuple[bool, str]:
+    """先跑一次候选 exe 的自检，确认它**真的能启动**。返回 (是否通过, 说明)。
+
+    为什么必须在**替换之前**做
+    -------------------------
+    替换之后再发现"起不来"就晚了 —— 用户面对的是"点了重启，程序消失且再没回来"。
+
+    它同时解掉了一个**打包形态带来的隐形约束**（老大 2026-10-01 追问的点）：
+
+    应用内替换要求新旧实例**能同时运行**，而 Nuitka onefile 会把程序解包到一个
+    目录再跑。若新旧共用那个目录，旧实例锁着里面同名的 exe，新实例**根本起不来**
+    ——实测：`Error, failed to open '...probe.exe' for writing`，退出码 2，
+    0.2 秒就死，用户看到的是"什么都没发生"。
+
+    我们靠 `--onefile-tempdir-spec` 带版本后缀来避开它，但那是个**构建期约定**，
+    忘了配就等着线上翻车。预检把它变成**运行时自证**：候选 exe 现在跑得起来，
+    替换后也跑得起来；跑不起来就当场中止，用户那边一个字节都没变。
+
+    这样更新逻辑就只依赖"候选 exe 能不能启动"这一件事，而**不依赖任何打包器
+    的具体行为** —— 换 PyInstaller、换 standalone 目录形态、换别的打包器，
+    这条判据都成立。
+
+    附带好处：onefile 会在这时把**新版本的解包目录**建好，真正拉起来时不用再解包。
+    """
+    if not os.path.isfile(exe):
+        return False, "候选文件不存在"
+    report = os.path.join(tempfile.gettempdir(), "dsh-preflight-report.txt")
+    try:
+        os.remove(report)
+    except OSError:
+        pass
+    env = os.environ.copy()
+    env[SELFTEST_ENV] = report
+    try:
+        p = subprocess.run(
+            [exe], env=env, timeout=timeout,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=BAT_CREATION_FLAGS,   # 同样的"不弹任何窗口"标志
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"候选版本在 {int(timeout)} 秒内没有完成自检"
+    except OSError as e:
+        return False, f"无法启动候选版本：{e}"
+
+    if p.returncode == 0:
+        return True, "自检通过"
+
+    detail = ""
+    try:
+        with open(report, encoding="utf-8") as f:
+            lines = [ln for ln in f.read().splitlines() if ln.strip()]
+        # 自检报告最后一行是"结论 = ..."，前面都只是环境信息
+        detail = "；".join(lines[-2:])[:200] if lines else ""
+    except OSError:
+        pass
+    return False, (f"候选版本自检未通过（退出码 {p.returncode}）"
+                   + (f"：{detail}" if detail else ""))
+
+
+#: onefile 解包目录的名字前缀（与 release.yml 里的 --onefile-tempdir-spec 对应）
+RUNTIME_PREFIX = "DSH-Web-runtime"
+
+
+def current_runtime_dir() -> str:
+    """当前 onefile 的解包目录；源码运行或认不出来时返回空串。
+
+    Nuitka onefile 下 `__file__` 指向解包目录里的模块文件，所以 `dirname`
+    就是解包根——这是**唯一**能知道"自己在哪个解包目录"的办法
+    （tempdir spec 是构建期展开的，运行时拿不到）。
+
+    **认不出来就返回空串，绝不返回一个猜的路径** —— 这个值会被用作"哪些目录
+    可以删"的判据，猜错就会删掉不该删的东西。
+    """
+    if not running_as_exe():
+        return ""
+    try:
+        d = os.path.dirname(os.path.abspath(__file__))
+    except Exception:                                            # noqa: BLE001
+        return ""
+    return d if os.path.basename(d).startswith(RUNTIME_PREFIX) else ""
+
+
+def cleanup_stale_runtimes() -> list[str]:
+    """删掉**其他版本**的 onefile 解包目录，返回真正删掉的目录列表。
+
+    为什么需要：为了让新旧版本能同时运行（应用内替换要求如此），
+    每个版本用各自的解包目录 —— 不清就会一版一版攒下来，每个几百 MB。
+
+    为什么"尽力而为"：正在运行的旧实例锁着自己那个目录，这时删不掉是**正常**的，
+    所以吞掉异常、不返回失败。等旧实例退出了，下一次启动自然会把它清掉。
+    当前版本自己那个目录永远不碰。
+    """
+    mine = current_runtime_dir()
+    if not mine:
+        return []
+    parent, base = os.path.dirname(mine), os.path.basename(mine)
+    removed: list[str] = []
+    try:
+        entries = os.listdir(parent)
+    except OSError:
+        return []
+    for name in entries:
+        if not name.startswith(RUNTIME_PREFIX) or name == base:
+            continue
+        path = os.path.join(parent, name)
+        if not os.path.isdir(path):
+            continue
+        shutil.rmtree(path, ignore_errors=True)     # 被占用时不报错，下次再说
+        if not os.path.exists(path):
+            removed.append(path)
+    return removed
+
+
 def _win(path: str) -> str:
     """统一成反斜杠的 Windows 路径。
-
     实测：cmd 的内建命令 `move` / `del` 对正斜杠路径不可靠——
     传 `C:/x/a.exe` 给 `move` 会静默失败（errorlevel 非零但无输出），
     反斜杠才稳定。而 bat 里路径一律放在双引号内，
@@ -554,3 +676,176 @@ def apply(rel: HostRelease, on_progress=None, relaunch: bool = True) -> str:
 
     return (f"新版本 v{rel.version} 已下载完成。\n"
             "点击「立即重启」后程序会关闭并自动完成替换，随后重新打开。")
+
+
+# ------------------------------------------------------- 应用内就地替换
+#
+# 为什么不走 bat：老大实测反馈"点了重启之后到新窗口出现之间是个黑箱，
+# 失败也看不见"。bat 那条路必须先让应用退出，于是替换期间屏幕上什么都没有。
+#
+# 而 Windows **允许重命名正在运行的 exe**（只改目录项，不动文件内容），
+# 也允许在原路径新建文件（2026-10-01 实测）。所以应用可以在自己运行期间
+# 完成整个替换——全程界面还在，进度和失败都看得见。
+#
+# 实测输出（把运行中的 exe 改名再写新文件）：
+#     [1] 重命名正在运行的 exe : 成功 -> pinger.exe.old
+#     [2] 在原路径写入新文件   : 成功
+#     [3] 旧版仍在（可回滚）   : 成功
+
+#: 更新重启时由旧实例传给新实例的"要接管的服务端口"。
+ATTACH_PORT_ARG = "--attach-port"
+
+
+def attach_port_from_argv(argv: list[str] | None = None) -> int:
+    """从命令行取"要接管的服务端口"，没有或非法则返回 0。
+
+    为什么要显式传：新实例靠 config 里的端口去探测并接管已有服务，
+    但旧实例可能是"端口被占、改用系统分配"启动的，config 里存的**不一定是
+    实际端口** —— 那样新实例会另起一个服务，留下一个孤儿进程。
+    由旧实例把实际端口直接告诉它，这条路才可靠。
+    """
+    args = list(sys.argv if argv is None else argv)
+    for i, a in enumerate(args):
+        if a == ATTACH_PORT_ARG and i + 1 < len(args):
+            try:
+                return max(0, int(args[i + 1]))
+            except ValueError:
+                return 0
+    return 0
+
+
+def _same_volume(a: str, b: str) -> bool:
+    try:
+        return (os.path.splitdrive(os.path.abspath(a))[0].lower()
+                == os.path.splitdrive(os.path.abspath(b))[0].lower())
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _copy_with_progress(src: str, dst: str, on_progress=None,
+                        chunk: int = 1024 * 1024) -> None:
+    """带进度的复制。跨盘替换时**必须**有进度——120MB 要好几秒。"""
+    total = os.path.getsize(src)
+    done = 0
+    with open(src, "rb") as fi, open(dst, "wb") as fo:
+        while True:
+            buf = fi.read(chunk)
+            if not buf:
+                break
+            fo.write(buf)
+            done += len(buf)
+            if on_progress:
+                try:
+                    on_progress(done, total)
+                except Exception:                                # noqa: BLE001
+                    pass
+
+
+def stage_inplace(incoming: str, target: str, on_progress=None) -> str:
+    """把 incoming 换到 target 的位置，旧版改名为 `.old`。返回备份路径。
+
+    三步，**任一步失败都会把现场恢复回去**：
+      1. 必要时先把新文件搬到目标同盘（跨盘时 rename 不成立）
+      2. `rename(target, target.old)` 让旧版让位
+      3. `replace(staged, target)` 新文件就位
+
+    第 2/3 步都是同盘元数据操作，实测在毫秒级 —— 所以"点了重启之后"几乎
+    没有等待，不需要任何轮询。
+    """
+    if not os.path.isfile(incoming):
+        raise SelfUpdateError("待替换的文件不存在，可能已被清理。")
+    if not os.path.isfile(target):
+        raise SelfUpdateError(f"找不到当前程序文件：{target}")
+    want = os.path.getsize(incoming)
+    if want < MIN_EXE_BYTES:
+        raise SelfUpdateError(f"待替换文件只有 {want} 字节，明显不完整，已放弃。")
+
+    backup = target + ".old"
+    remove_backup(backup)          # 上次残留先清掉（正常启动时已清，这里兜底）
+
+    staged = incoming
+    if not _same_volume(incoming, target):
+        # 跨盘：rename 不成立，必须先复制到目标同盘。这步慢，所以要进度。
+        staged = target + ".new"
+        if on_progress:
+            try:
+                on_progress(0, want)
+            except Exception:                                    # noqa: BLE001
+                pass
+        try:
+            _copy_with_progress(incoming, staged, on_progress)
+        except OSError as e:
+            remove_backup(staged)
+            raise SelfUpdateError(f"跨盘复制失败：{e}") from e
+
+    try:
+        os.rename(target, backup)      # ① 旧版让位（自己还在运行，没关系）
+    except OSError as e:
+        if staged != incoming:
+            remove_backup(staged)
+        raise SelfUpdateError(
+            f"无法为旧版本让位：{e}\n"
+            f"（目标目录可能没有写权限：{os.path.dirname(target)}）") from e
+
+    try:
+        os.replace(staged, target)     # ② 新文件就位（同盘 rename，原子且瞬时）
+    except OSError as e:
+        os.rename(backup, target)      # 回滚：把旧版改回来，程序仍可正常使用
+        raise SelfUpdateError(f"新版本就位失败，已回滚到原版本：{e}") from e
+
+    # ③ 确认新文件真的在那儿、大小对得上。宁可当场发现也不要"重启之后打不开"。
+    got = os.path.getsize(target) if os.path.isfile(target) else -1
+    if got != want:
+        os.remove(target)
+        os.rename(backup, target)
+        raise SelfUpdateError(
+            f"替换后的文件大小不对（{got} 字节，应为 {want}），已回滚。")
+    return backup
+
+
+def install_inplace(rel: "HostRelease", on_progress=None) -> dict:
+    """下载并**在本进程内**完成替换。返回 {target, backup, version}。
+
+    与 `apply()` 的区别：那个把替换交给 bat、需要应用先退出；
+    这个当场做完，所以调用方能在界面上报告进度与失败。
+
+    **不负责重启**——替换完由调用方决定什么时候拉起新实例。
+    """
+    if not running_as_exe():
+        raise SelfUpdateError("当前以源码方式运行，不支持替换自身。")
+    target = current_exe()
+    if not target or not target.lower().endswith(".exe"):
+        raise SelfUpdateError(f"当前可执行文件不是 .exe，无法替换：{target}")
+
+    incoming = download(rel, on_progress=on_progress)
+
+    # 替换**之前**先确认候选版本真的能启动。
+    # 这一步把"能不能起来"从"重启之后才知道"变成"现在就确定"，
+    # 也让整个方案不再依赖"记得给解包目录加版本后缀"这种构建期约定。
+    ok, why = preflight(incoming)
+    if not ok:
+        remove_backup(incoming)
+        raise SelfUpdateError(
+            "新版本已下载，但**无法启动**。\n"
+            "为避免重启后打不开，本次更新已中止——当前版本没有任何改动。\n\n"
+            + why)
+
+    backup = stage_inplace(incoming, target, on_progress=on_progress)
+    return {"target": target, "backup": backup, "version": rel.version}
+
+
+def relaunch(target: str, attach_port: int = 0) -> None:
+    """拉起替换后的新实例。
+
+    `attach_port` 非零时会作为命令行参数传给新实例，让它去**接管**仍然活着的
+    DSH 服务，而不是重新启动一个 —— 这样新窗口几乎立刻可用，
+    省掉"停服务 + 等就绪"的七八秒。
+    """
+    args = [target]
+    if attach_port:
+        args += [ATTACH_PORT_ARG, str(attach_port)]
+    try:
+        subprocess.Popen(args, cwd=os.path.dirname(target) or None,
+                         close_fds=True)
+    except OSError as e:
+        raise SelfUpdateError(f"无法启动新版本：{e}") from e

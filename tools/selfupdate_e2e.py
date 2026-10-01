@@ -215,6 +215,152 @@ try:
 except Exception as e:                                             # noqa: BLE001
     check("bat 执行", False, "%s: %s" % (type(e).__name__, e))
 
+# ---------------------------------------------------- 6. 应用内就地替换
+#
+# 这是 2026-10-01 新增的更新路径：不再交 bat，由应用自己在运行期间完成
+# 替换（因为 bat 那条路要求应用先退出，替换期间用户看不到任何反馈）。
+# 它依赖一个**实测得出**的事实：Windows 允许重命名正在运行的 exe。
+print("\n[6] 应用内就地替换（stage_inplace / install_inplace）")
+
+d6 = os.path.join(WORK, "inplace")
+os.makedirs(d6, exist_ok=True)
+tgt6 = fake_exe(os.path.join(d6, "app.exe"), 6 * 1024 * 1024)
+inc6 = fake_exe(os.path.join(d6, "new.exe"), 7 * 1024 * 1024)
+old_content = open(tgt6, "rb").read(2)
+
+backup6 = su.stage_inplace(inc6, tgt6)
+check("替换后目标变成新文件",
+      os.path.getsize(tgt6) == 7 * 1024 * 1024, "%d 字节" % os.path.getsize(tgt6))
+check("旧版被保留为 .old（可回滚）",
+      backup6 == tgt6 + ".old" and os.path.getsize(backup6) == 6 * 1024 * 1024)
+check("待替换的临时文件已不在原处", not os.path.exists(inc6))
+
+# --- 失败必须回滚，且现场要恢复原样 ---
+tgt7 = fake_exe(os.path.join(d6, "app2.exe"), 6 * 1024 * 1024)
+inc7 = fake_exe(os.path.join(d6, "new2.exe"), 7 * 1024 * 1024)
+_real_replace = os.replace
+
+
+def _boom(*_a, **_k):
+    raise OSError(13, "simulated failure")
+
+
+os.replace = _boom
+try:
+    su.stage_inplace(inc7, tgt7)
+    check("就位失败时抛 SelfUpdateError", False, "居然没抛异常")
+except su.SelfUpdateError as e:
+    check("就位失败时抛 SelfUpdateError", True, str(e)[:60])
+except Exception as e:                                             # noqa: BLE001
+    check("就位失败时抛 SelfUpdateError", False, "%s: %s" % (type(e).__name__, e))
+finally:
+    os.replace = _real_replace
+
+check("回滚：目标恢复成旧版",
+      os.path.getsize(tgt7) == 6 * 1024 * 1024,
+      "%d 字节" % os.path.getsize(tgt7))
+check("回滚：没有留下半成品 .old", not os.path.exists(tgt7 + ".old"))
+
+# --- 体积不足时拒绝，且不碰现场 ---
+tiny = os.path.join(d6, "tiny.exe")
+open(tiny, "wb").write(b"MZ" + b"\x00" * 100)
+tgt8 = fake_exe(os.path.join(d6, "app3.exe"), 6 * 1024 * 1024)
+try:
+    su.stage_inplace(tiny, tgt8)
+    check("待替换文件过小时拒绝", False, "居然没抛异常")
+except su.SelfUpdateError as e:
+    check("待替换文件过小时拒绝", True, str(e)[:50])
+check("被拒绝时目标原封不动",
+      os.path.getsize(tgt8) == 6 * 1024 * 1024 and not os.path.exists(tgt8 + ".old"))
+
+# --- 最关键的一条：**正在运行的文件**也能就地替换 ---
+# 这正是整个方案成立的前提。用一个真实在跑的 exe 副本验证。
+sysroot = os.environ.get("SystemRoot", r"C:\Windows")
+ping_src = os.path.join(sysroot, "System32", "ping.exe")
+if os.path.isfile(ping_src):
+    live = os.path.join(d6, "live.exe")
+    shutil.copy2(ping_src, live)
+    proc = subprocess.Popen([live, "-n", "20", "127.0.0.1"],
+                            creationflags=0x08000000,          # CREATE_NO_WINDOW
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    import time as _time
+    _time.sleep(1.0)
+    live_inc = fake_exe(os.path.join(d6, "live_new.exe"),
+                        su.MIN_EXE_BYTES + 1024 * 1024)
+    try:
+        su.stage_inplace(live_inc, live)
+        ok = (os.path.getsize(live) == su.MIN_EXE_BYTES + 1024 * 1024
+              and os.path.getsize(live + ".old") == os.path.getsize(ping_src))
+        check("正在运行的 exe 也能被就地替换（方案前提）", ok)
+    except Exception as e:                                         # noqa: BLE001
+        check("正在运行的 exe 也能被就地替换（方案前提）", False,
+              "%s: %s" % (type(e).__name__, e))
+    finally:
+        try:
+            proc.terminate(); proc.wait(timeout=5)
+        except Exception:                                          # noqa: BLE001
+            proc.kill()
+else:
+    check("正在运行的 exe 也能被就地替换（方案前提）", False, "找不到 ping.exe")
+
+# --- 源码运行时必须拒绝（否则会去替换解释器）---
+try:
+    su.install_inplace.__wrapped__                                  # noqa: BLE001
+except AttributeError:
+    pass
+_saved = su.running_as_exe
+su.running_as_exe = lambda: False
+try:
+    su.install_inplace(type("R", (), {"version": "0", "asset": None})())
+    check("源码运行时拒绝替换自身", False, "居然没抛异常")
+except su.SelfUpdateError as e:
+    check("源码运行时拒绝替换自身", True, str(e)[:40])
+except Exception as e:                                             # noqa: BLE001
+    check("源码运行时拒绝替换自身", False, "%s: %s" % (type(e).__name__, e))
+finally:
+    su.running_as_exe = _saved
+
+# --- 参数传递 ---
+check("--attach-port 能正确解析", su.attach_port_from_argv(
+    ["a.exe", "--attach-port", "3080"]) == 3080)
+check("--attach-port 缺失/非法时返回 0",
+      su.attach_port_from_argv(["a.exe"]) == 0
+      and su.attach_port_from_argv(["a.exe", "--attach-port", "x"]) == 0)
+
+# ---------------------------------------------------- 7. 替换前预检
+#
+# 预检是"不依赖打包器"的关键：它不问"你是什么打包器、解包到哪"，
+# 只问"这个候选 exe 现在能不能启动"。跑不起来就中止，用户那边一个字节没动。
+print("\n[7] 候选版本预检（preflight）")
+
+ok, why = su.preflight(os.path.join(WORK, "根本不存在的.exe"))
+check("文件不存在时判定为不可用", not ok, why)
+
+_sys32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+# 用系统自带的小程序当"候选"：不需要构建，退出码可控且语义清楚
+_zero = os.path.join(_sys32, "hostname.exe")      # 无参也正常退出 0
+_nonzero = os.path.join(_sys32, "ping.exe")       # 无参打印用法并以非零退出
+if os.path.isfile(_zero):
+    ok, why = su.preflight(_zero, timeout=30)
+    check("能正常启动的候选 -> 通过", ok, why)
+else:
+    check("能正常启动的候选 -> 通过", False, "找不到 hostname.exe")
+if os.path.isfile(_nonzero):
+    ok, why = su.preflight(_nonzero, timeout=30)
+    check("启动后非零退出的候选 -> 拒绝", not ok, why)
+else:
+    check("启动后非零退出的候选 -> 拒绝", False, "找不到 ping.exe")
+
+# 预检用的环境变量名必须和 exe 侧一致，否则预检问了个没人回答的问题
+try:
+    import dsh_gui_qt as _g                                        # noqa: E402
+    check("自检环境变量名两边一致",
+          _g.RESOURCE_CHECK_ENV == su.SELFTEST_ENV, su.SELFTEST_ENV)
+except Exception as e:                                             # noqa: BLE001
+    check("自检环境变量名两边一致", False, "%s: %s" % (type(e).__name__, e))
+
 print("\n" + "=" * 70)
 print("结果：%d 通过 / %d 失败" % (len(PASS), len(FAIL)))
 for f in FAIL:

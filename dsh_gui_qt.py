@@ -117,7 +117,9 @@ def icon_for(dark_bg: bool) -> QIcon:
 # "图标在源码里能用、打包后静默失效"这类问题，**只能在打包产物上验**。
 # 源码树里 assets/ 永远存在，测试全绿也说明不了包里带没带。
 # 所以给打包产物一个可自动化的自检入口，CI 构建后立刻跑它。
-RESOURCE_CHECK_ENV = "DSH_HOST_RESOURCE_CHECK"
+#: 产物自检入口的环境变量名。名字定义在 selfupdate 里 —— 那是 updater 与 exe
+#: 之间的契约（updater 要靠它预检候选版本），两边必须一致，不能各写一份。
+RESOURCE_CHECK_ENV = selfupdate.SELFTEST_ENV
 
 
 def resource_report() -> tuple[str, bool]:
@@ -289,6 +291,18 @@ def host_log(msg: str) -> None:
 
 
 # ------------------------------------------------------------------ 服务规划
+
+def requested_service_port() -> int:
+    """这次启动要用哪个端口去连/接管服务。
+
+    **优先用更新重启时旧实例通过命令行传进来的实际端口。**
+    理由：新实例靠 config 里的端口去探测并接管已有服务，但旧实例可能是
+    "端口被占、改用系统分配"启动的，config 里存的不一定是实际端口——
+    那样新实例会另起一个服务，把旧服务变成孤儿。由旧实例把实际端口
+    直接告诉它，这条路才可靠。
+    """
+    return selfupdate.attach_port_from_argv() or int(config.get("port") or 0)
+
 
 def plan_service(inst: contract.DshInstall, requested: int, allow_fallback: bool,
                  logf: str) -> tuple[str, int]:
@@ -493,7 +507,20 @@ class HostCheckWorker(QThread):
 
 
 class HostUpdateWorker(QThread):
-    """下载桌面壳新版本。下载完只做准备，不退出进程。"""
+    """下载桌面壳新版本，并**在本进程内**完成替换。
+
+    为什么不再交给 bat（2026-10-01 改）
+    ----------------------------------
+    老大的反馈："点了重启之后到新窗口出现之间是个黑箱，失败也看不见。"
+    bat 那条路必须先让应用退出，于是替换期间屏幕上什么都没有。
+
+    而 Windows **允许重命名正在运行的 exe**（只改目录项，不动文件内容），
+    也允许在原路径新建文件——实测确认。所以替换可以当场做完，
+    全程界面还在，进度和失败都看得见。download 阶段本来就是网络耗时，
+    进度主要花在那里。
+
+    替换完成后**不重启**：重启由用户在对话框里点，见 `_relaunch_after_update`。
+    """
     line = Signal(str)
     done = Signal(bool, str)
 
@@ -505,13 +532,17 @@ class HostUpdateWorker(QThread):
         try:
             def on_progress(got: int, total: int):
                 if total > 0:
-                    self.line.emit("已下载 %.1f / %.1f MB"
-                                   % (got / 1048576, total / 1048576))
+                    self.line.emit("已下载 %.1f / %.1f MB  (%d%%)"
+                                   % (got / 1048576, total / 1048576,
+                                      got * 100 // total if total else 0))
                 else:
                     self.line.emit("已下载 %.1f MB" % (got / 1048576))
 
-            msg = selfupdate.apply(self.rel, on_progress=on_progress)
-            self.done.emit(True, msg)
+            info = selfupdate.install_inplace(self.rel, on_progress=on_progress)
+            self.done.emit(True,
+                           "v%s 已安装到位。\n"
+                           "重启后会运行新版本——重启本身是瞬时的，"
+                           "不需要等待文件替换。" % info.get("version", ""))
         except selfupdate.SelfUpdateError as e:
             host_log("桌面壳更新失败：%s" % e)
             self.done.emit(False, str(e))
@@ -908,9 +939,9 @@ class HostUpdateDialog(QDialog):
 
         self._prepared = True
         self.log.appendPlainText("\n" + msg)
-        # 下载成功但还没替换——替换要靠我们退出后由脚本完成。
-        # 所以这里把按钮换成明确的"立即重启"，而不是自动退出：
-        # 静默退出会让用户以为程序崩了。
+        # 替换**已经做完了**（在这个窗口还开着的时候完成的），所以"重启"这一步
+        # 只是把新实例拉起来 + 自己退出，是瞬时的。
+        # 仍然给一个明确的按钮而不是自动退出：静默消失会让用户以为程序崩了。
         self.go_btn.setText("立即重启完成更新")
         self.go_btn.setEnabled(True)
         try:
@@ -979,7 +1010,7 @@ class MainWindow(QMainWindow):
         self._launch_startup()
 
     def _launch_startup(self):
-        self.starter = StartupWorker(int(config.get("port") or 0),
+        self.starter = StartupWorker(requested_service_port(),
                                      bool(config.get("port_auto_fallback")),
                                      config.service_log())
         self.starter.progress.connect(self._set_tip)
@@ -1752,10 +1783,49 @@ class MainWindow(QMainWindow):
         dlg = HostUpdateDialog(self, rel)
         result = dlg.exec()
         if result == HostUpdateDialog.RESTART_NOW:
-            host_log("桌面壳更新：用户选择立即重启，退出进程交由替换脚本接管")
-            # 托盘必须显式隐藏，否则图标会留到进程真正结束
-            self.tray.hide()
-            QApplication.quit()
+            self._relaunch_after_update()
+
+    def _relaunch_after_update(self):
+        """新版本**已经替换到位**，这里只负责"拉起新实例 + 自己退出"。
+
+        顺序不能错，每一步都有理由：
+
+        1. **先释放单实例锁。** 新实例如启动时发现管道还连得上，会把自己当成
+           重复实例直接退出——用户看到的是"点了重启，什么都没发生"。
+           实测 `QLocalServer.close()` 之后新进程就连不上了；判定依据是
+           "能否连上那根管道"，不是"有没有同名进程"。
+        2. **再拉起新实例，成功后才退出。** 起不来就留在原地报错，
+           而不是把自己关掉、把用户丢在一个空桌面前。
+        3. **不停后台服务。** 把当前服务的端口随命令行传给新实例去接管，
+           省掉"停服务 → 重新启动 → 等就绪"的七八秒。新窗口几乎立刻可用。
+        4. **直接 `os._exit`，不走 `_quit()`。** 那里会连带停服务，
+           而服务正是我们要留给新实例接管的。代价是跳过 Qt 收尾——
+           此时任何"优雅退出"都会把服务一起带走。
+        """
+        try:
+            target = selfupdate.current_exe()
+        except Exception:                                        # noqa: BLE001
+            target = ""
+        port = self.handle.port if self.handle else 0
+
+        srv = getattr(self, "_singleton_server", None)
+        if srv is not None:
+            srv.close()
+        QLocalServer.removeServer(SINGLETON_ID)
+
+        try:
+            selfupdate.relaunch(target, attach_port=port)
+        except selfupdate.SelfUpdateError as e:
+            host_log("更新重启失败：%s" % e)
+            QMessageBox.critical(
+                self, "无法启动新版本",
+                "%s\n\n当前版本仍可继续使用。" % e)
+            return
+
+        host_log("桌面壳更新：已拉起新实例（接管端口 %s），本进程退出"
+                 % (port or "自动分配"))
+        self.tray.hide()
+        os._exit(0)
 
     def _show_about(self):
         supported, reason = selfupdate.self_update_supported()
@@ -1909,22 +1979,19 @@ def activate_existing() -> None:
 
 
 def main() -> int:
-    sock = QLocalSocket()
-    sock.connectToServer(SINGLETON_ID)
-    if sock.waitForConnected(300):
-        sock.write(b"show")
-        sock.flush()
-        sock.waitForBytesWritten(300)
-        sock.close()
-        return
-
-    QLocalServer.removeServer(SINGLETON_ID)
     QApplication.setApplicationName("DSH-Web")
     QApplication.setOrganizationName("DSH")
     app = QApplication(sys.argv)
 
     # 打包产物资源自检：设了环境变量就只检查、写报告、退出，不进 GUI。
     # CI 构建完 exe 后立刻跑这个，用来兜住"包里没带 assets"这类问题。
+    #
+    # **必须排在单实例检查之前**，两个理由：
+    #   ① 自检是纯检查动作，不该因为"已经有一个实例在跑"就被跳过；
+    #   ② 更重要的：自更新要用它**预检候选版本能不能启动**
+    #      （见 dsh_host/selfupdate.preflight）。若排在单实例之后，
+    #      预检会连上旧实例、把它的窗口弹出来、然后返回 0 ——
+    #      这是个**假的"通过"**，坏包会就这么放过去。
     _rc = os.environ.get(RESOURCE_CHECK_ENV)
     if _rc:
         # 小心：报告含中文，而 CI（Windows runner）的 stdout 是 cp1252，
@@ -1949,6 +2016,19 @@ def main() -> int:
             pass
         return 0 if ok else 3
 
+    # 单实例：已经在跑就把那个窗口叫出来，然后自己退出。
+    # 判定依据是"能否连上那根管道"，不是"有没有同名进程"。
+    sock = QLocalSocket()
+    sock.connectToServer(SINGLETON_ID)
+    if sock.waitForConnected(300):
+        sock.write(b"show")
+        sock.flush()
+        sock.waitForBytesWritten(300)
+        sock.close()
+        return 0
+
+    QLocalServer.removeServer(SINGLETON_ID)
+
     # 全局图标先跟系统主题；MainWindow 取到界面色后会再切一次
     _ic = icon_for(dwm.system_uses_dark())
     if not _ic.isNull():
@@ -1969,6 +2049,17 @@ def main() -> int:
         host_log("清理旧版备份失败（不影响使用）：%s: %s"
                  % (type(e).__name__, e))
 
+    # 其他版本的 onefile 解包目录也一并清掉。
+    # 每个版本用自己的解包目录（这样新旧才能同跑，见 release.yml 的说明），
+    # 不清就会一版一版攒下来。正在运行的旧实例锁着自己那个，删不掉是正常的。
+    try:
+        gone = selfupdate.cleanup_stale_runtimes()
+        if gone:
+            host_log("已清理 %d 个旧版解包目录" % len(gone))
+    except Exception as e:                                       # noqa: BLE001
+        host_log("清理旧版解包目录失败（不影响使用）：%s: %s"
+                 % (type(e).__name__, e))
+
     server = QLocalServer()
     server.listen(SINGLETON_ID)
     holder = []
@@ -1982,6 +2073,9 @@ def main() -> int:
     server.newConnection.connect(on_conn)
 
     win = MainWindow()
+    # 单实例 server 要留给 MainWindow：更新重启时**必须先把它关掉**，
+    # 否则新实例会把自己当成重复实例直接退出（用户看到"点了重启没反应"）。
+    win._singleton_server = server
     holder.append(win)
     win.show()
     sys.exit(app.exec())
