@@ -316,6 +316,43 @@ def host_update_checks() -> list[str]:
     if not ok:
         failures.append("缺少体积校验")
 
+    # 8. 启动 bat 的 creationflags 不能带 DETACHED_PROCESS
+    #    ------------------------------------------------------------------
+    #    这是一条**踩过才知道**的断言。MSDN 明写 `CREATE_NO_WINDOW` 与
+    #    `DETACHED_PROCESS` 同用时会被忽略，而 DETACHED 让 cmd 完全没有控制台，
+    #    于是 bat 里跑的 `tasklist` / `find.exe` / `ping` 各自被分配一个新控制台
+    #    **窗口** —— 更新时会冒出一个标题为 find.exe 的窗口，且不会自己关。
+    #    （2026-10-01 老大实测报上来。）只断言"有 NO_WINDOW"是不够的，
+    #    必须同时断言"没有 DETACHED"，因为这个 bug 正是两者叠加造成的。
+    flags = su.BAT_CREATION_FLAGS
+    has_nowindow = bool(flags & 0x08000000)
+    has_detached = bool(flags & 0x00000008)
+    ok = has_nowindow and not has_detached
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 启动 bat 用 NO_WINDOW 且不带 DETACHED"
+          f"（flags=0x{flags:08X}）")
+    if not ok:
+        failures.append("bat 启动标志会弹控制台")
+        print("        NO_WINDOW=%s DETACHED=%s" % (has_nowindow, has_detached))
+
+    # 9. 上次自更新留下的 .old 能被清理
+    import os as _os
+    import tempfile as _tf
+    d = _tf.mkdtemp(prefix="su-old-")
+    try:
+        p = _os.path.join(d, "app.exe.old")
+        open(p, "wb").write(b"old")
+        removed = su.remove_backup(p)
+        ok1 = removed == p and not _os.path.exists(p)
+        ok2 = su.remove_backup(None) is None          # 没有备份不算错
+        ok3 = su.remove_backup(_os.path.join(d, "无此文件.old")) is None
+        ok = ok1 and ok2 and ok3
+        print(f"  [{'OK  ' if ok else 'FAIL'}] 旧版备份可被清理且缺文件不报错")
+        if not ok:
+            failures.append("旧版备份清理")
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
     return failures
 
 
@@ -781,6 +818,16 @@ def main() -> int:
         print("  port   :", handle.port)
         print("  url    :", handle.url)
         print("  webview:", "已创建" if win.view is not None else "未创建")
+        # 右键必须交还给网页。默认情况下 QWebEngineView 每次右键都弹它自己的
+        # 标准菜单（刷新/保存），而且那是在 widget 层生成的、**网页 preventDefault
+        # 拦不住**，会盖住网页自己的右键菜单。（老大实测反馈过。）
+        if win.view is not None:
+            pol = win.view.contextMenuPolicy()
+            ok = pol == g.Qt.ContextMenuPolicy.NoContextMenu
+            print(f"  [{'OK  ' if ok else 'FAIL'}] webview 右键已交还网页"
+                  f"（contextMenuPolicy={pol.name}）")
+            if not ok:
+                state.setdefault("webview_failures", []).append("右键菜单未交还网页")
         print("  栈页数 :", win.stack.count())
         print("  菜单项 :", [a.text() for a in win.tray.contextMenu().actions()
                              if not a.isSeparator()])
@@ -801,9 +848,12 @@ def main() -> int:
     QTimer.singleShot(90000, app.quit)
     app.exec()
 
+    # 失败项集中在这里汇总。**静态与非静态两条路径必须查同一批 key**——
+    # 之前非静态这条路漏了 panel_failures，等于面板自测在冒烟测试里形同虚设。
     bad = (state.get("onboarding_failures") or state.get("feedback_failures")
            or state.get("dialog_copy_failures") or state.get("host_update_failures")
-           or state.get("titlebar_failures") or state.get("menu_failures"))
+           or state.get("titlebar_failures") or state.get("menu_failures")
+           or state.get("panel_failures") or state.get("webview_failures"))
     if "handle" in state and not bad:
         print("\nGUI 冒烟测试通过")
         return 0

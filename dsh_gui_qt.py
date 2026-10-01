@@ -1018,6 +1018,16 @@ class MainWindow(QMainWindow):
         self.view = QWebEngineView(self)
         self.page = QWebEnginePage(self.profile, self.view)
         self.view.setPage(self.page)
+        # 右键交还给网页自己处理。
+        #
+        # 默认情况下 QWebEngineView 会在**每一次**右键时弹出 Qt 自己的
+        # 标准菜单（刷新 / 保存网页 / 前进后退…），而且它是在 widget 层生成的，
+        # **网页里 preventDefault 拦不住** —— 结果是网页自己的右键菜单被它盖住。
+        # （老大实测反馈："弹出来的好像是 PySide6 的右键菜单"。）
+        #
+        # NoContextMenu 只是让 Qt 不出这个菜单；右键的鼠标事件**照常转发给
+        # Chromium**，所以网页里自己的 contextmenu 处理与 DOM 菜单都会正常工作。
+        self.view.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         self.stack.addWidget(self.view)
 
     # ----------------------------------------------------------- 标题栏自适应
@@ -1943,6 +1953,21 @@ def main() -> int:
     _ic = icon_for(dwm.system_uses_dark())
     if not _ic.isNull():
         app.setWindowIcon(_ic)
+
+    # 上次自更新留下的 `.old` 备份，到这里可以删了。
+    #
+    # 位置刻意选在"能跑到主窗口"之后、且在服务启动之前的极早期：
+    # 能走到这一行就说明**新版 exe 已经真的起来了**，那份退路不再需要。
+    # 反过来，如果新版是坏文件，它根本起不来，`.old` 就一直留着——
+    # 这正是我们想要的保护，所以清理只能放在"启动成功"这一侧，
+    # 不能放进 bat 里"替换完就删"。
+    try:
+        removed = selfupdate.cleanup_leftover_backup()
+        if removed:
+            host_log("已清理上次自更新留下的备份：%s" % removed)
+    except Exception as e:                                       # noqa: BLE001
+        host_log("清理旧版备份失败（不影响使用）：%s: %s"
+                 % (type(e).__name__, e))
 
     server = QLocalServer()
     server.listen(SINGLETON_ID)

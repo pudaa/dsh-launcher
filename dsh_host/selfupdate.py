@@ -319,6 +319,66 @@ def _bat_path() -> str:
     return os.path.join(tempfile.gettempdir(), "DSH-Web-selfupdate.bat")
 
 
+#: 启动替换脚本用的 creationflags：`CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`。
+#:
+#: **绝对不能加 `DETACHED_PROCESS`（0x00000008）。** MSDN 明写
+#: `CREATE_NO_WINDOW` 与它同用时会被忽略，而 `DETACHED_PROCESS` 会让 cmd
+#: 完全没有控制台——于是 bat 里跑的 `tasklist` / `find.exe` / `ping` 这些
+#: **控制台程序各自被 Windows 分配一个新控制台窗口**，更新时就会冒出一个
+#: 标题为 `find.exe` 的窗口。2026-10-01 老大实测报过这个现象。
+#:
+#: 提成模块常量是为了能在自测里直接断言，而不是靠读代码。
+BAT_CREATION_FLAGS = 0x00000200 | 0x08000000       # NEW_PROCESS_GROUP | NO_WINDOW
+
+
+def leftover_backup_path() -> str | None:
+    """上次自更新留下的 `.old` 备份路径；不该有或不存在时返回 None。"""
+    if not running_as_exe():
+        return None
+    try:
+        target = current_exe()
+    except Exception:                                            # noqa: BLE001
+        return None
+    if not target or not target.lower().endswith(".exe"):
+        return None
+    path = target + ".old"
+    return path if os.path.isfile(path) else None
+
+
+def cleanup_leftover_backup() -> str | None:
+    """删掉上次自更新留下的 `.old`，返回被删掉的路径（没有则 None）。
+
+    为什么**不在 bat 里替换完就删**
+    -------------------------------
+    `.old` 是替换失败时**唯一的退路**：如果新版 exe 是坏下载或被截断，
+    用户手里至少还有旧版能改回去。所以不能一替换完就删。
+
+    为什么放在"启动成功之后"删
+    --------------------------
+    能跑到这里，说明**新版已经真的起来了**——退路已经不需要了。
+    这一刻删掉，安全性一分不减，用户也不用每次自己收拾桌面。
+
+    （老大实测反馈：每次更新后桌面都留一个 `DSH-Web.exe.old` 要手动删。）
+    """
+    return remove_backup(leftover_backup_path())
+
+
+def remove_backup(path: str | None) -> str | None:
+    """删除一个备份文件，返回实际删掉的路径。
+
+    抽成独立函数是为了能直接测——`cleanup_leftover_backup()` 依赖
+    `running_as_exe()`，在自测里永远是 False，没法覆盖删除逻辑本身。
+    删不掉不算错误（可能被杀软占用或只读），下次启动会再试。
+    """
+    if not path:
+        return None
+    try:
+        os.remove(path)
+        return path
+    except OSError:
+        return None
+
+
 def _win(path: str) -> str:
     """统一成反斜杠的 Windows 路径。
 
@@ -466,12 +526,24 @@ def apply(rel: HostRelease, on_progress=None, relaunch: bool = True) -> str:
     with open(bat, "w", encoding="utf-8", newline="\r\n") as f:
         f.write(build_apply_script(target, incoming, pid, relaunch=relaunch))
 
-    # DETACHED + 不继承句柄：bat 必须活过我们的退出
-    DETACHED = 0x00000008 | 0x00000200 | 0x08000000  # DETACHED | NEW_GROUP | NO_WINDOW
+    # 启动 bat。**这里只能用 CREATE_NO_WINDOW，不能加 DETACHED_PROCESS。**
+    #
+    # 这是个很隐蔽的陷阱（2026-10-01 老大实测报上来）：
+    #   · MSDN 明写 `CREATE_NO_WINDOW` 与 `DETACHED_PROCESS` 同用时**会被忽略**；
+    #   · 而 `DETACHED_PROCESS` 让 cmd 拿到的是"**完全没有控制台**"的进程；
+    #   · bat 里要跑 `tasklist` / `find.exe` / `ping`，它们都是**控制台程序**，
+    #     父进程没有控制台可继承 → **Windows 给每一个都新分配一个控制台窗口**。
+    # 表现就是更新时冒出一个标题为 `find.exe` 的控制台，而且不会自己关。
+    #
+    # `CREATE_NO_WINDOW` 给 cmd 一个**有控制台但无窗口**的环境，它的子进程
+    # 都继承这个控制台，于是再也不会弹窗。
+    #
+    # `CREATE_NEW_PROCESS_GROUP` 保留：让 bat 不属于我们的进程组，
+    # 免得外部的控制台信号波及它（它与 CREATE_NO_WINDOW 可以共存）。
     try:
         subprocess.Popen(
             ["cmd.exe", "/c", bat],
-            creationflags=DETACHED,
+            creationflags=BAT_CREATION_FLAGS,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
