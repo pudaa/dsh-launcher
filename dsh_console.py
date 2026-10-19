@@ -279,15 +279,24 @@ class NativeCapture:
             self.buffer.append_text(decoder.decode(chunk))
 
     def stop(self) -> None:
-        """停止采集并恢复原 fd（测试用；正常进程退出不需要调）。"""
+        """关闭采集：恢复原 fd，让读线程自然退出。
+
+        顺序很关键：先把 1/2 指回原句柄（或关掉），管道的**写端**随之消失，
+        读线程的 `read` 立刻返回 0 → 自己结束。反过来在别的线程里
+        `close(read_fd)` 会让阻塞中的 read 行为未定义。
+        """
         if not self.started:
             return
-        try:
-            os.dup2(self._orig_out, 1) if self._orig_out >= 0 else None
-            os.dup2(self._orig_err, 2) if self._orig_err >= 0 else None
-        except OSError:
-            pass
         self.started = False
+        for attr, fd in (("_orig_out", 1), ("_orig_err", 2)):
+            orig = getattr(self, attr)
+            try:
+                if orig >= 0:
+                    os.dup2(orig, fd)
+                else:
+                    os.close(fd)
+            except OSError:
+                pass
 
 
 def _drain_on_exit() -> None:
@@ -350,6 +359,19 @@ def install(log_path: str | None = None) -> bool:
             "  终端页只能显示这一行；日志文件仍可在 logs\\ 目录查看。）\n")
     _install_dump_hook()
     return ok
+
+
+def shutdown() -> None:
+    """关掉采集（开发者模式关闭时调用）。
+
+    只停线程与 fd 接管，**不清空**缓冲：重新打开时还能看到关闭前的历史。
+    缓冲有 8000 行上限，最坏情况也就几 MB，不会随运行时长增长。
+    """
+    global _capture
+    with _capture_lock:
+        cap, _capture = _capture, None
+    if cap is not None:
+        cap.stop()
 
 
 def capture() -> NativeCapture | None:

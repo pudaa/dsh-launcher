@@ -1095,6 +1095,7 @@ def main() -> int:
 
     def on_ready(handle):
         state["handle"] = handle
+        state["ready_checks_done"] = False
         print("  ready  :", handle.install.describe())
         print("  port   :", handle.port)
         print("  url    :", handle.url)
@@ -1139,6 +1140,50 @@ def main() -> int:
         if not ok:
             state.setdefault("webview_failures", []).append("页面策略未挂上")
 
+        # --- 资源纪律：开发者模式关闭时不该有任何采集在跑 ---
+        # 老大的硬要求："没启用就不该占资源"。这里逐项验证接线而不是"标志位"。
+        import dsh_console
+        from PySide6.QtWebEngineCore import QWebEnginePage as _Page
+
+        err_lvl = _Page.JavaScriptConsoleMessageLevel.ErrorMessageLevel
+        check_off = []
+        ok = dsh_console.capture() is None
+        print(f"  [{'OK  ' if ok else 'FAIL'}] 关闭时不安装进程输出采集"
+              f"（thread={'无' if ok else '有'}）")
+        if not ok:
+            state.setdefault("webview_failures", []).append("关闭时仍在采集进程输出")
+
+        ok = win.page.capture_console is False
+        print(f"  [{'OK  ' if ok else 'FAIL'}] 关闭时页面不采集控制台")
+        if not ok:
+            state.setdefault("webview_failures", []).append("关闭时仍采集控制台")
+
+        before = len(win.recorder.since_console(0))
+        win.page.javaScriptConsoleMessage(err_lvl, "off-probe", 1, "probe.js")
+        ok = len(win.recorder.since_console(0)) == before
+        print(f"  [{'OK  ' if ok else 'FAIL'}] 关闭时控制台消息不入库")
+        if not ok:
+            state.setdefault("webview_failures", []).append("关闭时仍记录控制台")
+
+        win._apply_dev_mode(True)
+        try:
+            ok = dsh_console.capture() is not None and win.page.capture_console is True
+            print(f"  [{'OK  ' if ok else 'FAIL'}] 开启后采集与页面记录同时就位")
+            if not ok:
+                state.setdefault("webview_failures", []).append("开启后采集未就位")
+            win.page.javaScriptConsoleMessage(err_lvl, "on-probe", 1, "probe.js")
+            ok = any(e.message == "on-probe" for e in win.recorder.since_console(0))
+            print(f"  [{'OK  ' if ok else 'FAIL'}] 开启后控制台消息能入库")
+            if not ok:
+                state.setdefault("webview_failures", []).append("开启后未记录控制台")
+        finally:
+            win._apply_dev_mode(False)
+
+        ok = dsh_console.capture() is None and win.page.capture_console is False
+        print(f"  [{'OK  ' if ok else 'FAIL'}] 再次关闭后采集被真正停掉")
+        if not ok:
+            state.setdefault("webview_failures", []).append("关闭后采集未停止")
+
         # 新窗口请求：Qt 的 QWebEngineNewWindowRequest **没有** accept()/reject()，
         # 误调会抛异常，而异常点在"交给浏览器"之前 → 表现是"点了没反应"。
         # 用一个只有 requestedUrl() 的假对象来钉住这条：不许再碰别的成员。
@@ -1172,6 +1217,7 @@ def main() -> int:
             "回滚": win.act_rollback.isEnabled(),
             "预览计划(勾选)": win.act_prev.isChecked(),
         })
+        state["ready_checks_done"] = True
         QTimer.singleShot(800, app.quit)
 
     def on_failed(msg):
@@ -1192,6 +1238,10 @@ def main() -> int:
            or state.get("panel_failures") or state.get("webview_failures")
            or state.get("devtools_failures") or state.get("theme_failures")
            or state.get("console_failures") or state.get("terminal_failures"))
+    # on_ready 里一旦抛异常，后面的检查会被静默跳过、测试却仍然"通过"。
+    # 用一个完成标记把这种情况变成失败。
+    if "handle" in state and not state.get("ready_checks_done"):
+        bad = list(bad or []) + ["ready 检查未跑完（on_ready 中途异常）"]
     if "handle" in state and not bad:
         print("\nGUI 冒烟测试通过")
         return 0

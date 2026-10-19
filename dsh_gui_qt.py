@@ -1099,12 +1099,14 @@ class MainWindow(QMainWindow):
             return
         self.profile = QWebEngineProfile("dsh-profile", self)
         self.profile.setPersistentStoragePath(config.profile_dir())
-        # 网络记录器只在开发者模式开启时才真的记录（每次请求都会回调进来，
-        # 关闭状态下这里只是读一个布尔值）。挂在这里是唯一时机：
-        # interceptor 必须在请求发生前就挂到 profile 上。
-        self.recorder.net_enabled = bool(config.get("dev_mode"))
+        # 拦截器**不在关闭时挂载**：挂上之后每个请求都会回调进 Python
+        # （图片、字体、轮询都算），"关闭状态只读一个布尔值"也是有成本的。
+        # 关闭时干脆不挂，开关打开时再挂（见 _apply_dev_mode）。
+        dev_on = bool(config.get("dev_mode"))
+        self.recorder.net_enabled = dev_on
         self.interceptor = dsh_devtools.RequestRecorder(self.recorder, self.profile)
-        self.profile.setUrlRequestInterceptor(self.interceptor)
+        if dev_on:
+            self.profile.setUrlRequestInterceptor(self.interceptor)
         self.view = QWebEngineView(self)
         # 页面策略（外链出口 + 控制台采集）在 ShellPage 里，不写在界面方法里：
         # 这样它可以脱离主窗口单独测（见 dsh_devtools.selftest_checks）。
@@ -1114,6 +1116,7 @@ class MainWindow(QMainWindow):
             recorder=self.recorder,
             open_external=self._open_external_url,
             view=self.view,
+            capture_console=dev_on,
         )
         self.view.setPage(self.page)
         # 右键交还给网页自己处理。
@@ -1996,7 +1999,7 @@ class MainWindow(QMainWindow):
         关：停止记录并收起我们自己那些窗口，但**不清空**已记录的内容（误关还能再看）。
         """
         config.set(dev_mode=bool(on))
-        self.recorder.net_enabled = bool(on)
+        self._apply_dev_mode(bool(on))
         host_log("开发者模式 → %s" % ("开" if on else "关"))
         if on:
             self._open_inspector()
@@ -2004,6 +2007,31 @@ class MainWindow(QMainWindow):
             for win in (self._inspector, self._devwin):
                 if win is not None:
                     win.close()
+
+    def _apply_dev_mode(self, on: bool) -> None:
+        """按开关接线：控制台采集、请求拦截器、终端 fd 采集。
+
+        **关闭时必须真的停下来**，而不是"挂在那里但不记录"：
+        - 不接管 fd、不起读线程、不写 console.log（dsh_console.shutdown）；
+        - 不挂请求拦截器（挂上就代表每个请求都要回调进 Python）；
+        - 页面不再收集 console 消息。
+        这样"关闭开发者模式"在任务管理器里应当看不出差别。
+
+        不碰任何窗口：自测可以直接调它验证资源状态。
+        """
+        page = getattr(self, "page", None)
+        if page is not None:
+            page.set_capture_console(bool(on))
+        self.recorder.net_enabled = bool(on)
+
+        if on:
+            dsh_console.install()
+            if self.profile is not None and self.interceptor is not None:
+                self.profile.setUrlRequestInterceptor(self.interceptor)
+        else:
+            if self.profile is not None:
+                self.profile.setUrlRequestInterceptor(None)
+            dsh_console.shutdown()
 
     def _open_inspector(self):
         """打开 Chromium 开发者工具（窗口关闭即释放那个渲染实例）。"""
@@ -2162,10 +2190,11 @@ def activate_existing() -> None:
 
 
 def main() -> int:
-    # 装在最前面：打包成 windowed exe 后没有控制台，Chromium 的 `js: ...`、
-    # 崩溃栈这类 C++ 层输出会写向无效的 fd 2。这一行把它们接进环形缓冲，
-    # 开发者面板的「终端」页才有东西可看。有控制台时仍会照常回显。
-    dsh_console.install()
+    # 只有开发者模式开启时才接管 fd 1/2。它要起一个读线程、重定向 stdout/stderr，
+    # 属于"一直存在"的资源开销 —— 不开就不装，这是硬约束。
+    # （运行中开关也能补装，见 MainWindow._apply_dev_mode。）
+    if bool(config.get("dev_mode")):
+        dsh_console.install()
 
     QApplication.setApplicationName("DSH-Web")
     QApplication.setOrganizationName("DSH")

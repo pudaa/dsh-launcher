@@ -263,10 +263,13 @@ class ShellPage(QWebEnginePage):
     """
 
     def __init__(self, profile, parent, base_url=None, recorder=None,
-                 open_external=None, view=None):
+                 open_external=None, view=None, capture_console: bool = False):
         super().__init__(profile, parent)
         self._base_url = base_url or (lambda: "")
         self.recorder = recorder or Recorder()
+        #: 控制台采集**默认关**：开发者模式没开时不该有任何后台记录。
+        #: 每次 console 消息都会回调进 Python，虽然便宜，但不是零成本。
+        self.capture_console = bool(capture_console)
         self._open_external = open_external
         #: Qt6 的 QWebEnginePage **不再有 `view()`**（那是 Qt5 的 API），
         #: 所以视图引用必须由调用方显式传进来。
@@ -331,7 +334,12 @@ class ShellPage(QWebEnginePage):
 
     # ---- 控制台 ----
 
+    def set_capture_console(self, on: bool) -> None:
+        self.capture_console = bool(on)
+
     def javaScriptConsoleMessage(self, level, message, line, source):  # noqa: N802
+        if not self.capture_console:
+            return
         try:
             self.recorder.add_console(LEVEL_NAMES.get(level, "log"), message,
                                       line, source)
@@ -633,6 +641,8 @@ class TerminalView(QWidget):
 
         self.setStyleSheet(_terminal_style(pal))
 
+        # 定时器的 parent 是本控件：DevTools 窗口关闭即销毁，它随之消失，
+        # 不会在后台留下一个每 300ms 醒一次的轮询。
         self._timer = QTimer(self)
         self._timer.setInterval(300)
         self._timer.timeout.connect(self.tick)
