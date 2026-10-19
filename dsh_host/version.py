@@ -82,6 +82,16 @@ def version_tuple(v: str) -> tuple:
 
 
 
+def is_prerelease(v: str) -> bool:
+    """版本串是否带预发布段（如 `2.4.0-beta.1`）。
+
+    只做文本判断，用途是"这条 release 能不能推给稳定用户"。
+    判据必须与 `version_tuple()` 一致：都是"第一个 `-` 之后还有内容"。
+    """
+    core = v.strip().lstrip("v").partition("+")[0]
+    return bool(core.partition("-")[2])
+
+
 def is_newer(candidate: str, current: str) -> bool:
     """candidate 是否比 current 新。解析失败时保守返回 False（不提示更新）。"""
     try:

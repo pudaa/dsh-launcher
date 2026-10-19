@@ -205,8 +205,10 @@ KEEP_LOCALES="zh-CN zh-TW en-US en-GB"     # 加语言 = 往这里加名字
 
 1. **Release 页面上要勾 `prerelease`**。GitHub 的 `releases/latest` 会跳过
    预发布版，稳定用户就不会被推上测试版。
-   但注意：`fetch_latest_release()` 的降级路径（列全部 release）**目前不过滤
-   `prerelease`**，所以只在"latest 拿不到"时仍可能把 beta 当成更新。这条待定。
+   三条获取路径（API latest → API 列表 → 页面/Atom 降级）现在**共用
+   `accept_release()` 一个判据**（2026-10-19 落地）：不取预发布时，降级路径也不取。
+   判据取"或"——API 的 `prerelease` 标记，**或者** tag 文本自带预发布段；
+   后者是为了兜住"发 beta 时忘了勾 prerelease"这种情况。
 2. `--onefile-tempdir-spec` 里的 `${{ github.ref_name }}` 会变成
    `DSH-Web-runtime-v2.4.0-beta.1`，目录名合法，无需改动。
 

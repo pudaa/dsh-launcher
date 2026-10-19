@@ -46,7 +46,8 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
 from . import config
-from .version import HOST_ASSET_NAME, HOST_REPO, HOST_VERSION, is_newer
+from .version import (HOST_ASSET_NAME, HOST_REPO, HOST_VERSION, is_newer,
+                      is_prerelease)
 
 #: 用我们自己的 UA，便于在 GitHub 侧区分流量来源
 UA = f"dsh-launcher/{HOST_VERSION}"
@@ -229,51 +230,83 @@ def _release_from_tag(tag: str, notes: str = "", published_at: str = "",
     )
 
 
-def _parse_atom_release(text: str) -> HostRelease | None:
-    """解析 releases.atom 的第一条 entry。
+def accept_release(rel: HostRelease | None, include_prerelease: bool = False) -> bool:
+    """这条 release 能否作为「可升级目标」。
+
+    **三条获取路径必须共用这一个判据**（2026-10-19 定）：
+    优先不取预发布版时，降级路径也不能取。否则会出现一种很难查的现象——
+    平时正常（latest 接口本来就跳过预发布），可一旦 API 撞上 60 次/小时的
+    限额、降到"列全部 release"，稳定用户就会被推荐装测试版。
+
+    判据取"或"：
+      - API 给的 `prerelease` 标记；
+      - tag 文本自带预发布段（`v2.4.0-beta.1`）。
+    为什么不能只看标记：我们发测试版时版本号就写在 tag 里，万一 Release
+    页面上漏勾 prerelease，标记是 False、版本却确实是 beta。
+    """
+    if rel is None:
+        return False
+    if include_prerelease:
+        return True
+    return not (rel.prerelease or is_prerelease(rel.version))
+
+
+def _parse_atom_release(text: str, include_prerelease: bool = False) -> HostRelease | None:
+    """解析 releases.atom，返回**第一条合格的** entry。
 
     feed 里同时有标题、发布时间和正文，正好补上 API 拿不到的说明。
+    必须遍历而不是只取第一条：最新一条可能就是我们自己的 beta，
+    而稳定用户应该拿到后面那条正式版。
     """
     try:
         root = ET.fromstring(text)
     except ET.ParseError:
         return None
     ns = {"a": "http://www.w3.org/2005/Atom"}
-    entry = root.find("a:entry", ns)
-    if entry is None:
-        return None
-    link = entry.find("a:link", ns)
-    tag = _tag_from_release_url(link.get("href", "") if link is not None else "")
-    if not tag:
-        return None
-    title = (entry.findtext("a:title", "", ns) or "").strip()
-    updated = (entry.findtext("a:updated", "", ns) or "").strip()
-    content = entry.findtext("a:content", "", ns) or ""
-    # Atom 的 content 本身就是 HTML，保留给 NotesView 渲染；不要压成纯文本。
-    notes = content.strip() or title
-    return _release_from_tag(tag, notes=notes, published_at=updated[:10],
-                             notes_format="html")
+    for entry in root.findall("a:entry", ns):
+        link = entry.find("a:link", ns)
+        tag = _tag_from_release_url(link.get("href", "") if link is not None else "")
+        if not tag:
+            continue
+        title = (entry.findtext("a:title", "", ns) or "").strip()
+        updated = (entry.findtext("a:updated", "", ns) or "").strip()
+        content = entry.findtext("a:content", "", ns) or ""
+        # Atom 的 content 本身就是 HTML，保留给 NotesView 渲染；不要压成纯文本。
+        notes = content.strip() or title
+        rel = _release_from_tag(tag, notes=notes, published_at=updated[:10],
+                                notes_format="html")
+        if accept_release(rel, include_prerelease):
+            return rel
+    return None
 
 
-def _fallback_release(timeout: float = 20) -> HostRelease | None:
+def _fallback_release(timeout: float = 20,
+                      include_prerelease: bool = False) -> HostRelease | None:
     """API 不可用时的兜底：`releases/latest` 的 302 跳转 + Atom feed。
 
     两个入口都是 github.com 的普通页面，不占 API 配额。**先看 302**：
     "最新版本是哪个"以它为准；Atom 只用来补说明和发布时间。
     如果 Atom 还没刷到同一个 tag（CDN 缓存），就只带版本号返回，
     不要把旧版本的说明挂到新版本上。
+
+    **两条入口都要过 `accept_release`**：这是与主路径行为一致的关键。
+    302 指向的是"最近一次发布"，它完全可能就是我们自己的 beta；
+    这时不能返回它，要退到 Atom 里第一条合格的（更早的正式版）。
     """
     redirect = _http_read(f"https://github.com/{HOST_REPO}/releases/latest", timeout)
     latest_tag = _tag_from_release_url(redirect[0]) if redirect else None
 
     atom = _http_read(f"https://github.com/{HOST_REPO}/releases.atom", timeout)
-    atom_rel = (_parse_atom_release(atom[1].decode("utf-8", "ignore"))
+    atom_rel = (_parse_atom_release(atom[1].decode("utf-8", "ignore"), include_prerelease)
                 if atom else None)
 
     if latest_tag:
-        if atom_rel is not None and atom_rel.tag == latest_tag:
-            return atom_rel
-        return _release_from_tag(latest_tag)
+        candidate = _release_from_tag(latest_tag)
+        if accept_release(candidate, include_prerelease):
+            if atom_rel is not None and atom_rel.tag == latest_tag:
+                return atom_rel
+            return candidate
+        return atom_rel
     return atom_rel
 
 
@@ -309,6 +342,22 @@ def _parse_release(data: dict) -> HostRelease | None:
     )
 
 
+def _pick_release(items, include_prerelease: bool = False) -> HostRelease | None:
+    """从 API 的 release 列表里挑**第一条合格的**。
+
+    列表接口按发布时间倒序，第一条往往就是最新的那条。单独抽出来是为了
+    让"跳过 beta 取后面正式版"这条逻辑可被离线测试——它是最容易写错、
+    又最难在线上发现的一步（错了只会在 API 限额时偶发）。
+    """
+    if not isinstance(items, list):
+        return None
+    for item in items:
+        rel = _parse_release(item)
+        if accept_release(rel, include_prerelease):
+            return rel
+    return None
+
+
 def fetch_latest_release(timeout: float = 20,
                          include_prerelease: bool = False) -> HostRelease | None:
     """取最新 release。
@@ -320,21 +369,22 @@ def fetch_latest_release(timeout: float = 20,
       1. GitHub API（有说明与资产大小，但未登录只有 60 次/小时/IP）
       2. Atom feed（不占配额，有说明）
       3. `releases/latest` 302 跳转解析 tag（不占配额，只有版本号）
+
+    **三路共用 `accept_release` 这一个判据**：不取预发布版时，降级路径也不取。
+    否则"API 撞限额"这个偶发条件会改变用户拿到的东西——那是最难复现的一类 bug。
     """
     if not include_prerelease:
         data = _http_json(f"https://api.github.com/repos/{HOST_REPO}/releases/latest", timeout)
         rel = _parse_release(data) if data else None
-        if rel:
+        if accept_release(rel, include_prerelease):
             return rel
         # latest 接口在没有正式 release 时返回 404，退回去列全部
     data = _http_json(f"https://api.github.com/repos/{HOST_REPO}/releases?per_page=10", timeout)
-    if isinstance(data, list):
-        for item in data:
-            rel = _parse_release(item)
-            if rel:
-                return rel
+    rel = _pick_release(data, include_prerelease)
+    if rel:
+        return rel
     # API 可能 403（未登录限额）或整体不可达；页面/Atom 不占配额。
-    return _fallback_release(timeout)
+    return _fallback_release(timeout, include_prerelease)
 
 
 def check_host_update(timeout: float = 20) -> tuple[HostRelease | None, str]:

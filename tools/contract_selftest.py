@@ -422,6 +422,25 @@ def main_lite() -> int:
     check("预发布序号按数值比较（beta.10 > beta.9）",
           is_newer("2.4.0-beta.10", "2.4.0-beta.9"))
 
+    # 可升级目标的判据：**不取预发布时，三条获取路径都不能返回 beta**。
+    # 平时 latest 接口自己会跳过预发布，所以这条只在 API 撞限额时暴露。
+    from dsh_host.selfupdate import HostRelease, accept_release
+    from dsh_host.version import is_prerelease
+
+    def _rel(version, prerelease=False):
+        return HostRelease(version=version, tag="v" + version, notes="",
+                           html_url="", published_at="", prerelease=prerelease)
+
+    check("is_prerelease 与版本号判据一致",
+          is_prerelease("2.4.0-beta.1") and not is_prerelease("2.4.0"))
+    check("正式版可被当作更新", accept_release(_rel("2.4.0")))
+    check("tag 带 beta 的 release 被拦下（未勾 prerelease 标记也一样）",
+          not accept_release(_rel("2.4.0-beta.1")))
+    check("勾了 prerelease 标记的 release 被拦下",
+          not accept_release(_rel("2.4.0-beta.1", prerelease=True)))
+    check("明确要求预发布时 beta 放行",
+          accept_release(_rel("2.4.0-beta.1"), include_prerelease=True))
+
     print(LINE)
     if failures:
         print("失败项：", "、".join(failures))

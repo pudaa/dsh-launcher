@@ -344,6 +344,89 @@ def host_update_checks() -> list[str]:
     finally:
         su._http_json, su._http_read = orig_json, orig_read
 
+    # 1c. **三条获取路径的预发布过滤必须一致**（2026-10-19 老大要求）。
+    #     平时 latest 接口本身就跳过预发布，所以这类 bug 只在"API 撞限额、
+    #     降级到列表/页面"时暴露——那是用户端最难复现、也最不该被推荐的时刻。
+    beta_item = {
+        "tag_name": "v9.9.9-beta.1", "prerelease": False,
+        "body": "beta", "html_url": "https://example.invalid/beta",
+        "published_at": "2026-10-19T00:00:00Z", "assets": [],
+    }
+    stable_item = {
+        "tag_name": "v9.9.8", "prerelease": False,
+        "body": "stable", "html_url": "https://example.invalid/stable",
+        "published_at": "2026-10-18T00:00:00Z", "assets": [],
+    }
+    two_entries = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <link rel="alternate" href="https://github.com/pudaa/dsh-launcher/releases/tag/v9.9.9-beta.1"/>
+    <title>beta</title><updated>2026-10-19T00:00:00Z</updated>
+  </entry>
+  <entry>
+    <link rel="alternate" href="https://github.com/pudaa/dsh-launcher/releases/tag/v9.9.8"/>
+    <title>stable</title><updated>2026-10-18T00:00:00Z</updated>
+  </entry>
+</feed>"""
+
+    def fake_json(url, timeout=20):
+        if url.endswith("/releases/latest"):
+            return None                      # 模拟 latest 拿不到
+        return [beta_item, stable_item]      # 列表：beta 在前，稳定版在后
+
+    def fake_read_beta_latest(url, timeout=20):
+        if url.endswith("/releases/latest"):
+            # 模拟"最近一次发布就是 beta"——302 会指向它
+            return ("https://github.com/pudaa/dsh-launcher/releases/tag/v9.9.9-beta.1", b"")
+        if url.endswith("/releases.atom"):
+            return ("https://github.com/pudaa/dsh-launcher/releases.atom",
+                    two_entries.encode("utf-8"))
+        return None
+
+    consistency = []
+    try:
+        # A. 列表路径：跳过 beta 取后面的稳定版
+        su._http_json = fake_json
+        su._http_read = lambda *a, **k: None
+        r = su.fetch_latest_release(timeout=1)
+        consistency.append(("列表跳过 beta", r is not None and r.version == "9.9.8"))
+
+        # B. 降级路径：302 指向 beta 时也要退到稳定版
+        su._http_json = lambda *a, **k: None
+        su._http_read = fake_read_beta_latest
+        r = su.fetch_latest_release(timeout=1)
+        consistency.append(("302 指向 beta 时退到稳定版",
+                            r is not None and r.version == "9.9.8"))
+
+        # C. 整条链路只有 beta 时，宁可返回 None（提示"无法获取"），
+        #    也不能把测试版推给稳定用户
+        su._http_json = lambda *a, **k: [beta_item]
+        su._http_read = lambda *a, **k: None
+        r = su.fetch_latest_release(timeout=1)
+        consistency.append(("只有 beta 时不返回 beta", r is None))
+
+        # D. 反向断言：明确要预发布时，列表路径必须能拿到 beta
+        su._http_json = fake_json
+        r = su.fetch_latest_release(timeout=1, include_prerelease=True)
+        consistency.append(("要求预发布时能拿到 beta",
+                            r is not None and r.version == "9.9.9-beta.1"))
+
+        # E. 反向断言：降级路径同样（302 指向 beta 时直接返回它）
+        su._http_json = lambda *a, **k: None
+        su._http_read = fake_read_beta_latest
+        r = su.fetch_latest_release(timeout=1, include_prerelease=True)
+        consistency.append(("要求预发布时 302 的 beta 可用",
+                            r is not None and r.version == "9.9.9-beta.1"))
+    finally:
+        su._http_json, su._http_read = orig_json, orig_read
+
+    bad = [name for name, ok in consistency if not ok]
+    print(f"  [{'OK  ' if not bad else 'FAIL'}] 预发布过滤在三条路径上一致")
+    if bad:
+        failures.append("预发布过滤一致性")
+        print("        异常用例:", bad)
+
+
     # 2. 源码运行时不支持自更新（避免替换掉开发的 py 文件）
     supported, reason = su.self_update_supported()
     ok = (supported is False) and bool(reason)
