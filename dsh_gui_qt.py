@@ -29,18 +29,48 @@ try:
 except (AttributeError, OSError, ValueError):
     pass
 
+
+def _system_ui_language() -> str:
+    """Windows 的界面语言（BCP-47，如 `zh-CN`）。取不到返回空串。
+
+    为什么需要它：QtWebEngine **不会**自动把系统 UI 语言传给 Chromium，
+    没设 `--lang` 时内核一律按 en-US 起，DevTools 也就永远是英文
+    （截图里那条 "DevTools is now available in Chinese!" 正是这么来的）。
+    """
+    if os.name != "nt":
+        return ""
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(85)
+        n = ctypes.windll.kernel32.GetUserDefaultLocaleName(buf, len(buf))
+        return buf.value if n else ""
+    except Exception:                                          # noqa: BLE001
+        return ""
+
+
+# 必须在**任何 PySide6 导入之前**设置：Chromium 在 QtWebEngine 初始化时
+# 一次性读取这组 flags，之后再改就来不及了。
+_UI_LANG = _system_ui_language()
+if _UI_LANG:
+    _flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+    if "--lang=" not in _flags:
+        os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
+            _flags + " --lang=" + _UI_LANG).strip()
+
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QUrl
 from PySide6.QtGui import QIcon, QAction, QDesktopServices, QImage
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QSystemTrayIcon, QMenu, QDialog, QMessageBox,
+    QApplication, QMainWindow, QSystemTrayIcon, QDialog,
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QProgressBar, QStackedWidget,
     QPlainTextEdit, QPushButton,
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage
+from PySide6.QtWebEngineCore import QWebEngineProfile
 
+import dsh_devtools
 import dsh_panel
+import dsh_theme
 from dsh_host import config, contract, dwm, provision, selfupdate, updater
 from dsh_host.contract import DshError, ServiceHandle
 from dsh_host.version import HOST_VERSION
@@ -622,6 +652,7 @@ class OnboardingDialog(QDialog):
         lay.setSpacing(14)
 
         intro = QLabel("运行 DSH 需要先准备好运行环境。点「开始安装」，程序会自动完成。")
+        intro.setObjectName("dlgBody")
         intro.setWordWrap(True)
         lay.addWidget(intro)
 
@@ -632,6 +663,7 @@ class OnboardingDialog(QDialog):
         lay.addWidget(holder)
 
         self.hint = QLabel()
+        self.hint.setObjectName("dlgHint")
         self.hint.setWordWrap(True)
         lay.addWidget(self.hint)
 
@@ -655,6 +687,8 @@ class OnboardingDialog(QDialog):
             row.addWidget(b)
         lay.addLayout(row)
 
+        self.go_btn.setObjectName("primary")
+        dsh_theme.style_dialog(self)
         self._render()
 
     # -------------------------------------------------- 渲染
@@ -745,6 +779,7 @@ class UpdateDialog(QDialog):
         lay.setSpacing(12)
 
         self.headline = QLabel()
+        self.headline.setObjectName("dlgBody")
         self.headline.setWordWrap(True)
         lay.addWidget(self.headline)
 
@@ -758,6 +793,7 @@ class UpdateDialog(QDialog):
             f"（如需自行备份，复制上面这个目录即可）"
         )
         detail.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        detail.setObjectName("dlgHint")
         lay.addWidget(detail)
 
         self.log = QPlainTextEdit()
@@ -777,6 +813,8 @@ class UpdateDialog(QDialog):
         row.addWidget(self.close_btn)
         lay.addLayout(row)
 
+        self.go_btn.setObjectName("primary")
+        dsh_theme.style_dialog(self)
         self._refresh_headline()
 
     def _refresh_headline(self):
@@ -870,6 +908,7 @@ class HostUpdateDialog(QDialog):
             "这是桌面壳程序自身的更新，与 DSH 无关——\n"
             "更新后你的 DSH 版本、会话记录、登录状态都不受影响。")
         headline.setWordWrap(True)
+        headline.setObjectName("dlgBody")
         lay.addWidget(headline)
 
         size_txt = ""
@@ -883,6 +922,7 @@ class HostUpdateDialog(QDialog):
             f"　　{selfupdate.current_exe()}.old\n"
             f"可手工改回。")
         detail.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        detail.setObjectName("dlgHint")
         lay.addWidget(detail)
 
         self.log = QPlainTextEdit()
@@ -901,6 +941,9 @@ class HostUpdateDialog(QDialog):
         row.addWidget(self.go_btn)
         row.addWidget(self.close_btn)
         lay.addLayout(row)
+
+        self.go_btn.setObjectName("primary")
+        dsh_theme.style_dialog(self)
 
         if rel.notes:
             self.log.setPlainText(rel.notes.strip())
@@ -994,6 +1037,12 @@ class MainWindow(QMainWindow):
         self.host_release = None          # 有值表示桌面壳有新版本可用
         self.view = None
         self.profile = None
+        # 页面观测记录在窗口创建之前就存在：开发者模式可能在运行中被打开，
+        # 那时要能回看"打开之前"发生的报错。
+        self.recorder = dsh_devtools.Recorder()
+        self.interceptor = None
+        self._devwin = None               # 轻量日志窗口（按需创建，关闭只隐藏）
+        self._inspector = None            # Chromium DevTools 窗口（关闭即销毁）
         self._theme_timer = None          # 主题跟踪定时器（低频）
         self._last_titlebar_rgb = None    # 上次上色用的界面色，用于变更比对
 
@@ -1023,6 +1072,7 @@ class MainWindow(QMainWindow):
 
     def _build_loading_page(self):
         page = QWidget()
+        page.setObjectName("loadingPage")
         lay = QVBoxLayout(page)
         lay.setContentsMargins(0, 0, 0, 0)
         bar = QProgressBar()
@@ -1030,12 +1080,15 @@ class MainWindow(QMainWindow):
         bar.setTextVisible(False)
         bar.setFixedHeight(3)
         self.tip = QLabel("正在启动 DSH 服务…")
+        self.tip.setObjectName("loadingTip")
         self.tip.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.tip.setWordWrap(True)
         lay.addWidget(bar)
         lay.addStretch(1)
         lay.addWidget(self.tip)
         lay.addStretch(1)
+        # 深色界面下不要让启动瞬间先闪一片系统白
+        dsh_theme.style_loading_page(page)
         self.stack.addWidget(page)
 
     def _set_tip(self, text: str):
@@ -1046,8 +1099,22 @@ class MainWindow(QMainWindow):
             return
         self.profile = QWebEngineProfile("dsh-profile", self)
         self.profile.setPersistentStoragePath(config.profile_dir())
+        # 网络记录器只在开发者模式开启时才真的记录（每次请求都会回调进来，
+        # 关闭状态下这里只是读一个布尔值）。挂在这里是唯一时机：
+        # interceptor 必须在请求发生前就挂到 profile 上。
+        self.recorder.net_enabled = bool(config.get("dev_mode"))
+        self.interceptor = dsh_devtools.RequestRecorder(self.recorder, self.profile)
+        self.profile.setUrlRequestInterceptor(self.interceptor)
         self.view = QWebEngineView(self)
-        self.page = QWebEnginePage(self.profile, self.view)
+        # 页面策略（外链出口 + 控制台采集）在 ShellPage 里，不写在界面方法里：
+        # 这样它可以脱离主窗口单独测（见 dsh_devtools.selftest_checks）。
+        self.page = dsh_devtools.ShellPage(
+            self.profile, self.view,
+            base_url=lambda: self.handle.url if self.handle else "",
+            recorder=self.recorder,
+            open_external=self._open_external_url,
+            view=self.view,
+        )
         self.view.setPage(self.page)
         # 右键交还给网页自己处理。
         #
@@ -1104,6 +1171,20 @@ class MainWindow(QMainWindow):
         panel = getattr(self, "_panel", None)
         if panel is not None:
             panel.apply_theme("dark" if dark else "light")
+        # 开发者窗口也跟主题走（同一套官方令牌，不另调色）
+        dev = getattr(self, "_devwin", None)
+        if dev is not None:
+            dev.apply_theme("dark" if dark else "light")
+        insp = getattr(self, "_inspector", None)
+        if insp is not None:
+            try:
+                insp.apply_theme("dark" if dark else "light")
+            except RuntimeError:
+                pass        # 窗口已销毁
+        # 托盘菜单是独立弹窗，不吃窗口样式表，主题变了要重新套一遍
+        menu = getattr(self, "_menu", None)
+        if menu is not None:
+            dsh_theme.apply_menu(menu, dsh_theme.palette_now())
 
     def _set_theme_icon(self, dark_bg: bool) -> None:
         """按标题栏深浅切换窗口/托盘图标。
@@ -1295,7 +1376,11 @@ class MainWindow(QMainWindow):
         想单独留服务的人可以用「仅退出窗口」的替代操作。
         """
         self.tray = QSystemTrayIcon(self.windowIcon(), self)
-        menu = QMenu()
+        # 菜单是系统弹窗，默认样式与 DSH 差得最远（直角、系统字体、灰分隔线）。
+        # 圆角要靠 WA_TranslucentBackground；dsh_theme.Menu 还会在每次显示时
+        # 清掉 QWindows11Style 装上的、会被窗口裁掉右下的投影。
+        menu = dsh_theme.Menu()
+        self._menu = menu
 
         act_show = QAction("显示主窗口", self)
         act_show.triggered.connect(self._show_main)
@@ -1606,11 +1691,11 @@ class MainWindow(QMainWindow):
         还可能直接把它拦掉。两条叠加，用户看到的就是"点了没反应"。
         """
         self._show_main()
-        QMessageBox.information(self, "DSH", text)
+        dsh_theme.MessageDialog.info(self, "DSH", text)
 
     def _warn(self, text: str):
         self._show_main()
-        QMessageBox.warning(self, "DSH", text)
+        dsh_theme.MessageDialog.warn(self, "DSH", text)
 
     def _check_update(self, manual: bool):
         if getattr(self, "_checking", False):
@@ -1817,7 +1902,7 @@ class MainWindow(QMainWindow):
             selfupdate.relaunch(target, attach_port=port)
         except selfupdate.SelfUpdateError as e:
             host_log("更新重启失败：%s" % e)
-            QMessageBox.critical(
+            dsh_theme.MessageDialog.error(
                 self, "无法启动新版本",
                 "%s\n\n当前版本仍可继续使用。" % e)
             return
@@ -1837,7 +1922,7 @@ class MainWindow(QMainWindow):
             f"　{('从 GitHub Release 拉取新版本并自动替换。' if supported else reason)}\n\n"
             f"DSH 更新　走官方 npm 通道，与桌面壳更新互不影响。\n"
         )
-        QMessageBox.about(self, "关于", text)
+        dsh_theme.MessageDialog.about(self, "关于 DSH Launcher", text)
 
     def _open_panel(self):
         """打开控制面板。
@@ -1875,6 +1960,88 @@ class MainWindow(QMainWindow):
         else:
             self._info("服务还没就绪，暂时没有可打开的地址。")
 
+    def _open_external_url(self, url):
+        """把页面里的异源链接交给系统默认浏览器。
+
+        为什么不自己开一个 QWebEngineView：那等于为一次点击再加 100~300MB
+        的渲染进程；系统浏览器本来就是为看网页存在的，还带用户自己的
+        登录态与扩展。老大明确要求优先走系统浏览器。
+
+        链接里的令牌一律打码后再进日志——日志会长期留在磁盘上。
+        """
+        qurl = url if isinstance(url, QUrl) else QUrl(str(url or ""))
+        shown = dsh_devtools.redact(qurl.toString())
+        if not QDesktopServices.openUrl(qurl):
+            host_log("系统浏览器未能打开：%s" % shown)
+            self._warn("链接没能交给系统浏览器：\n%s" % shown)
+        else:
+            host_log("外链交给系统浏览器：%s" % shown)
+
+    # ------------------------------------------------------ 开发者模式
+
+    def _toggle_dev_mode(self, on: bool):
+        """开关开发者模式。
+
+        开：挂上网络记录，并直接打开 **Chromium 自带的开发者工具**
+            （Elements / Console / Network / Sources 全都在里面，老大明确要求用现成的）。
+        关：停止记录并收起我们自己那些窗口，但**不清空**已记录的内容（误关还能再看）。
+        """
+        config.set(dev_mode=bool(on))
+        self.recorder.net_enabled = bool(on)
+        host_log("开发者模式 → %s" % ("开" if on else "关"))
+        if on:
+            self._open_inspector()
+        else:
+            for win in (self._inspector, self._devwin):
+                if win is not None:
+                    win.close()
+
+    def _open_inspector(self):
+        """打开 Chromium 开发者工具（窗口关闭即释放那个渲染实例）。"""
+        if self.view is None or getattr(self, "page", None) is None:
+            self._info("DSH 界面还没加载好，稍后再试。")
+            return
+        if self._inspector is not None:
+            self._inspector.show()
+            self._inspector.raise_()
+            self._inspector.activateWindow()
+            return
+        try:
+            self._inspector = dsh_devtools.InspectorWindow(
+                self.page, "dark" if self._theme_dark else "light")
+        except Exception as e:                                 # noqa: BLE001
+            self._inspector = None
+            host_log("开发者工具打不开：%s: %s" % (type(e).__name__, e))
+            self._warn("开发者工具打不开：%s: %s" % (type(e).__name__, e))
+            return
+        self._inspector.destroyed.connect(self._on_inspector_gone)
+        self._inspector.show()
+        self._inspector.raise_()
+        self._inspector.activateWindow()
+        host_log("已打开开发者工具（Chromium DevTools）")
+
+    def _on_inspector_gone(self, *_a):
+        self._inspector = None
+
+    def _open_dev_window(self):
+        """打开轻量日志窗口（只创建一次，之后是 show/raise）。
+
+        它是给"工具没开时也想回看报错"用的：控制台与请求记录**常开**，
+        而 DevTools 只能看到它自己打开之后的控制台。布局页只是坐标快照，
+        不要拿它替代 Elements。
+        """
+        if self.view is None or getattr(self, "page", None) is None:
+            self._info("DSH 界面还没加载好，稍后再试。")
+            return
+        if self._devwin is None:
+            self._devwin = dsh_devtools.DevWindow(
+                page=self.page, recorder=self.recorder,
+                theme="dark" if self._theme_dark else "light",
+                open_inspector=self._open_inspector)
+        self._devwin.show()
+        self._devwin.raise_()
+        self._devwin.activateWindow()
+
     # ---- 控制面板的适配层 ----
     #
     # 面板不认识 MainWindow，只认 PanelHost 暴露的这几个窄接口。开关与动作
@@ -1885,6 +2052,7 @@ class MainWindow(QMainWindow):
         return {
             "prerelease_opt_in": bool(config.get("prerelease_opt_in")),
             "adaptive_titlebar": bool(config.get("adaptive_titlebar")),
+            "dev_mode": bool(config.get("dev_mode")),
         }.get(name, False)
 
     def _panel_set_flag(self, name: str, value: bool) -> None:
@@ -1892,6 +2060,8 @@ class MainWindow(QMainWindow):
             self._toggle_prerelease(bool(value))
         elif name == "adaptive_titlebar":
             self._toggle_titlebar(bool(value))
+        elif name == "dev_mode":
+            self._toggle_dev_mode(bool(value))
 
     def _panel_action(self, name: str) -> None:
         if name == "check_update":
@@ -1902,6 +2072,10 @@ class MainWindow(QMainWindow):
             self._rollback()
         elif name == "provision":
             self._prepare_env()
+        elif name == "open_devtools":
+            self._open_inspector()
+        elif name == "open_devlog":
+            self._open_dev_window()
 
     def _toggle_titlebar(self, checked: bool):
         """开关标题栏自适应配色。"""

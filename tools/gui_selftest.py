@@ -772,6 +772,122 @@ def titlebar_checks() -> list[str]:
     return failures
 
 
+def theme_checks() -> list[str]:
+    """DSH 美术转译层（dsh_theme）的回归断言。
+
+    重点不是"好不好看"，而是三件会被静默破坏的事：
+      1. 提示窗不能退回系统 QMessageBox（配色/字体全不受控）；
+      2. 托盘菜单必须真的套上样式，且圆角前提（半透明底）在；
+      3. 转译层的调色板必须与面板同源，不能出现第二份色表。
+    """
+    failures: list[str] = []
+
+    def check(name: str, ok: bool, extra: str = "") -> None:
+        print(f"  [{'OK  ' if ok else 'FAIL'}] {name}{('  ' + extra) if extra else ''}")
+        if not ok:
+            failures.append(name)
+
+    import dsh_panel
+    import dsh_theme
+    from PySide6.QtWidgets import (QGraphicsDropShadowEffect, QMenu,
+                                   QMessageBox)
+
+    pal = dsh_theme.palette("light")
+    check("转译层调色板与面板同源",
+          all(pal[k] == dsh_panel.palette("light")[k] for k in ("bg", "text", "line")))
+    check("圆角表对齐官方 --dsw-radius-*",
+          (dsh_theme.RADIUS["sm"], dsh_theme.RADIUS["md"], dsh_theme.RADIUS["lg"],
+           dsh_theme.RADIUS["xl"], dsh_theme.RADIUS["panel"]) == (8, 12, 16, 20, 28))
+    check("字号阶梯用 px 且含 14/13/12 三档",
+          {14, 13, 12} <= {t[0] for t in dsh_theme.TYPE.values()})
+
+    dlg = dsh_theme.MessageDialog(None, "测试标题",
+                                  "这是一段正文，用来检查提示窗的字体与配色。", "warn")
+    dlg.show()
+    QApplication.processEvents()
+    check("提示窗不是系统 QMessageBox", not dlg.findChildren(QMessageBox))
+    check("提示窗套上了官方样式（非空样式表）", bool(dlg.styleSheet()))
+    body = dlg.findChild(g.QLabel, "dlgBody")
+    check("正文用了 dlgBody 字级", body is not None)
+    check("主按钮是 primary 形态", dlg.btn_ok.objectName() == "primary")
+    # 像素级：窗口底色必须等于**当前主题**的 bg 令牌
+    expect = dsh_theme.palette_now()["bg"].lower()
+    img = dlg.grab().toImage()
+    c = img.pixelColor(max(2, img.width() // 2), max(2, img.height() - 6))
+    check("提示窗底色等于官方 bg 令牌", c.name().lower() == expect,
+          "%s（应 %s）" % (c.name(), expect))
+    dlg.close()
+
+    menu = QMenu()
+    dsh_theme.apply_menu(menu, dsh_theme.palette("dark"))
+    check("菜单套上了样式", "border-radius" in menu.styleSheet())
+    check("菜单开了半透明底（圆角前提）",
+          menu.testAttribute(g.Qt.WidgetAttribute.WA_TranslucentBackground))
+    # 半透明圆角 + 原生窗口阴影 = 阴影按矩形裁切，表现为右下黑边。
+    check("菜单关掉了原生窗口阴影",
+          bool(menu.windowFlags() & g.Qt.WindowType.NoDropShadowWindowHint))
+    check("菜单是无边框窗口（阴影不再沿矩形边缘画）",
+          bool(menu.windowFlags() & g.Qt.WindowType.FramelessWindowHint))
+    # 真正的元凶（2026-10-19 实测）：QWindows11Style::polish() 给每个 QMenu
+    # 装了 QGraphicsDropShadowEffect(blur 3, offset 3,3)。效果画在窗口内部，
+    # 而窗口和菜单同大 → 右/下被硬裁一条。它不是 DWM 阴影，
+    # NoDropShadowWindowHint / DWMWA_NCRENDERING_POLICY 都管不到。
+    check("菜单已挂上「显示时清阴影」的钩子",
+          bool(getattr(menu, "_dsh_shadow_hooked", False)))
+    eff = QGraphicsDropShadowEffect(menu)
+    eff.setBlurRadius(3)
+    eff.setOffset(3, 3)
+    menu.setGraphicsEffect(eff)
+    check("strip_shadow 能移除 Qt 的裁切阴影",
+          bool(dsh_theme.strip_shadow(menu)) and menu.graphicsEffect() is None)
+    check("strip_shadow 没有阴影时安全返回",
+          dsh_theme.strip_shadow(menu) is False)
+    menu.deleteLater()
+
+    # 真实显示路径：polish() 在 show 时才跑（此时才装阴影），showEvent 清掉。
+    live = dsh_theme.Menu(pal=dsh_theme.palette("light"))
+    # 要够高：像素扫描只取直边中段，太矮的菜单整段都在圆角里。
+    for i in range(9):
+        live.addAction("菜单项 %d" % i)
+    # 先手动装一个同样的投影：offscreen 平台用的是 fusion，QWindows11Style
+    # 不会自己装；这样断言在任何平台上都能真正验证 showEvent 的清理。
+    manual = QGraphicsDropShadowEffect(live)
+    manual.setBlurRadius(3)
+    manual.setOffset(3, 3)
+    live.setGraphicsEffect(manual)
+    live.show()
+    QApplication.processEvents()
+    check("菜单显示后不带 Qt 裁切阴影", live.graphicsEffect() is None,
+          repr(live.graphicsEffect()))
+    # 像素级反向断言：右/下 3px 内不应有"半透明且暗"的像素。
+    # 修复前 offset(3,3) 的阴影正是以 a≈180、rgb≈59 出现在整条直边里；
+    # 只扫中间 60% —— 圆角处的描边抗锯齿也会产生半透明像素，那是正常的。
+    img = live.grab().toImage()
+    dark = 0
+    y0, y1 = img.height() // 5, img.height() * 4 // 5
+    for x in range(max(0, img.width() - 3), img.width()):
+        for y in range(y0, y1):
+            c = img.pixelColor(x, y)
+            if 20 < c.alpha() < 240 and c.red() < 200:
+                dark += 1
+    x0, x1 = img.width() // 5, img.width() * 4 // 5
+    for y in range(max(0, img.height() - 3), img.height()):
+        for x in range(x0, x1):
+            c = img.pixelColor(x, y)
+            if 20 < c.alpha() < 240 and c.red() < 200:
+                dark += 1
+    check("菜单右下没有半透明暗边（阴影未裁切）", dark == 0,
+          "半透明暗像素 %d" % dark)
+    live.close()
+
+    # 防止以后有人把菜单换回裸 QMenu：裸 QMenu 的 show() 不经过 aboutToShow。
+    src = open(os.path.join(ROOT, "dsh_gui_qt.py"), encoding="utf-8").read()
+    check("托盘菜单走 dsh_theme.Menu（不退回裸 QMenu）",
+          "dsh_theme.Menu()" in src and "QMenu()" not in src)
+
+    return failures
+
+
 def main() -> int:
     #: CI 里没有装 DSH，起不了真实服务。设此变量只跑不依赖 DSH 的部分
     #: （引导窗口渲染、对话框文案、自更新纯逻辑），
@@ -801,6 +917,15 @@ def main() -> int:
     state["panel_failures"] = dsh_panel.selftest_checks()
     print()
 
+    print("== 美术转译层（提示窗 / 托盘菜单 / 令牌同源）==")
+    state["theme_failures"] = theme_checks()
+    print()
+
+    print("== 开发者模式（外链出口策略 / 记录器）==")
+    import dsh_devtools
+    state["devtools_failures"] = dsh_devtools.selftest_checks()
+    print()
+
     if static_only:
         # 菜单结构检查不需要服务在跑——它只读菜单项文本与启用状态。
         # 但 MainWindow 的构造函数会立刻启动服务，所以这里用不启动
@@ -808,7 +933,8 @@ def main() -> int:
         print("== 静态模式下跳过真实启动链路（未安装 DSH）==")
         bad = (state.get("onboarding_failures") or state.get("dialog_copy_failures")
                or state.get("host_update_failures") or state.get("titlebar_failures")
-               or state.get("panel_failures"))
+               or state.get("panel_failures") or state.get("devtools_failures")
+               or state.get("theme_failures"))
         if bad:
             print("\n用例失败：", "、".join(bad))
             return 1
@@ -844,6 +970,61 @@ def main() -> int:
                   f"（contextMenuPolicy={pol.name}）")
             if not ok:
                 state.setdefault("webview_failures", []).append("右键菜单未交还网页")
+
+        # 外链策略：异源必须被拦下并交给"外部打开"回调，同源必须留在内核里。
+        # 这两条是 2026-10-01 那个"点超链接没反应"的直接回归断言。
+        from PySide6.QtCore import QUrl
+        from PySide6.QtWebEngineCore import QWebEnginePage
+        nav = QWebEnginePage.NavigationType.NavigationTypeLinkClicked
+        opened: list = []
+        real_open = win.page._open_external
+        win.page._open_external = lambda u: opened.append(u.toString())
+        try:
+            ext = win.page.acceptNavigationRequest(
+                QUrl("https://example.com/account"), nav, True)
+            inner = QUrl(handle.url)
+            inner.setPath("/chat")
+            same = win.page.acceptNavigationRequest(inner, nav, True)
+        finally:
+            win.page._open_external = real_open
+        ok = (ext is False and same is True and bool(opened)
+              and "example.com" in opened[0])
+        print(f"  [{'OK  ' if ok else 'FAIL'}] 外链交系统浏览器、同源留在内核"
+              f"（external={ext} same={same} opened={opened[:1]}）")
+        if not ok:
+            state.setdefault("webview_failures", []).append("外链策略未生效")
+
+        ok = (isinstance(win.page, dsh_devtools.ShellPage)
+              and win.interceptor is not None)
+        print(f"  [{'OK  ' if ok else 'FAIL'}] 页面已换成 ShellPage 且挂了网络记录器")
+        if not ok:
+            state.setdefault("webview_failures", []).append("页面策略未挂上")
+
+        # 新窗口请求：Qt 的 QWebEngineNewWindowRequest **没有** accept()/reject()，
+        # 误调会抛异常，而异常点在"交给浏览器"之前 → 表现是"点了没反应"。
+        # 用一个只有 requestedUrl() 的假对象来钉住这条：不许再碰别的成员。
+        class _FakeReq:
+            def __init__(self, u):
+                self._u = QUrl(u)
+
+            def requestedUrl(self):
+                return self._u
+
+        popup: list = []
+        real_open = win.page._open_external
+        win.page._open_external = lambda u: popup.append(u.toString())
+        detail = ""
+        try:
+            win.page._on_new_window(_FakeReq("https://platform.deepseek.com/usage"))
+            ok = any("platform.deepseek.com" in u for u in popup)
+        except Exception as e:                                 # noqa: BLE001
+            ok, detail = False, f"{type(e).__name__}: {e}"
+        finally:
+            win.page._open_external = real_open
+        print(f"  [{'OK  ' if ok else 'FAIL'}] target=_blank 的异源链接交给浏览器"
+              f"{('  ' + detail) if detail else ''}")
+        if not ok:
+            state.setdefault("webview_failures", []).append("新窗口请求未交浏览器")
         print("  栈页数 :", win.stack.count())
         print("  菜单项 :", [a.text() for a in win.tray.contextMenu().actions()
                              if not a.isSeparator()])
@@ -869,7 +1050,8 @@ def main() -> int:
     bad = (state.get("onboarding_failures") or state.get("feedback_failures")
            or state.get("dialog_copy_failures") or state.get("host_update_failures")
            or state.get("titlebar_failures") or state.get("menu_failures")
-           or state.get("panel_failures") or state.get("webview_failures"))
+           or state.get("panel_failures") or state.get("webview_failures")
+           or state.get("devtools_failures") or state.get("theme_failures"))
     if "handle" in state and not bad:
         print("\nGUI 冒烟测试通过")
         return 0

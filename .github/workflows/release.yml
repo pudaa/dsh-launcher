@@ -105,6 +105,8 @@ jobs:
             --enable-plugin=pyside6 \
             --include-package=dsh_host \
             --include-module=dsh_panel \
+            --include-module=dsh_theme \
+            --include-module=dsh_devtools \
             --include-module=dsh_icons \
             --onefile-tempdir-spec={CACHE_DIR}/DSH-Web-runtime-${{ github.ref_name }} \
             --output-dir=build \

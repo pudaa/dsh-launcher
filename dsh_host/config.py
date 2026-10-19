@@ -121,6 +121,9 @@ DEFAULTS: dict = {
     "port_auto_fallback": True,
     # 「加入预览计划」：开启后才跟 alpha 通道
     "prerelease_opt_in": False,
+    # 开发者模式：开启后才采集网络请求，并允许打开开发者窗口。
+    # 默认关——普通用户不该为观测层付任何开销。
+    "dev_mode": False,
     # 启动时静默检查更新（只检查与提示，安装永远需要手动确认）
     "check_update_on_start": True,
     # 手工覆盖项（留空表示自动探测）

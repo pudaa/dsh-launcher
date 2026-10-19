@@ -1224,3 +1224,203 @@ ok, why = preflight(candidate_exe)     # 替换之前，先让候选版本自己
 `apply()` / `build_apply_script()` **暂时保留**（`tools/selfupdate_e2e.py` 仍在覆盖）。
 理由：应用内替换还没在真机上走通过一次，留着它作为可快速回退的备选。
 **等真机验证通过后再删** —— 留死代码是有代价的，这里只是把它当保险绳用一次。
+
+## 14. 外链出口与开发者模式（2026-10-19）
+
+### 14.1 现象：点超链接没有反应
+
+学生查看账号信息时点那个链接，窗口毫无变化。不是"跳错页"，是**什么都没发生**。
+
+拆开看是两条完全不同的路径，恰好都表现为"没反应"：
+
+| 触发方式 | Qt 的行为 | 结果 |
+|---|---|---|
+| `<a target="_blank">` / `window.open()` | 发 `newWindowRequested`；没人处理时回落到 `createWindow()`，而 `QWebEngineView` 默认返回 `None` | 请求被**静默丢弃** |
+| 同窗口内的异源 `<a href>` | 内核自己导航过去 | DSH 界面被顶掉，用户以为程序坏了 |
+
+第一条是主因。Qt 6 的正确接法是监听 **`QWebEnginePage.newWindowRequested`**，
+但**这个请求对象没有 `accept()` / `reject()`**（见 14.1.1）。
+
+### 14.1.1 第二次翻车：`QWebEngineNewWindowRequest` 没有 reject()
+
+第一版处理器写成"先 `request.reject()` 再决定去哪"，结果终端里刷出：
+
+```
+AttributeError: 'PySide6.QtWebEngineCore.QWebEngineNewWindowRequest'
+                object has no attribute 'reject'
+```
+
+这个类只有 **`openIn(WebWindowType)`** 一个出口（交给 Qt 自己开窗），
+**不调用任何方法就等于拒绝**。而异常发生在"交给系统浏览器"之前，
+所以外链**永远打不开** —— 症状和修之前一模一样，只是原因换了。
+
+教训：`dir()` 里没有的方法不能凭 Qt5/直觉假设；这类"信号参数对象"的 API
+在 Qt6 被重写过（`accept/reject` → `openIn`）。现在的写法是**只读 URL，不碰请求对象**，
+并在自测里用字节码检查 `_on_new_window` 没有引用 `accept`/`reject`。
+
+> **Qt 6 的坑**：`QWebEnginePage` 已经没有 `view()`（那是 Qt 5 的 API）。
+> 想在新窗口处理里拿视图，必须由调用方把 `QWebEngineView` 传进来，
+> 否则运行时才炸 `AttributeError: 'ShellPage' object has no attribute 'view'`。
+
+### 14.2 策略：同源留内，异源出圈
+
+判据收在一个纯函数里（`dsh_devtools.nav_disposition`），因为它要被自测直接覆盖：
+
+```
+http(s) + (host, port) 与当前服务一致  → internal（内核内加载）
+http(s) + 不同 host 或不同 port        → external（系统默认浏览器）
+mailto: / tel:                          → external
+javascript: / data: / blob: / about:    → internal（页面内部行为，外抛必失效）
+空地址                                  → ignore
+```
+
+几条刻意的取舍：
+
+- **只拦 `NavigationTypeLinkClicked`。** 重定向、表单提交、刷新、前进后退一律放行。
+  全拦会把登录跳转这类流程一起打掉，而那种"功能莫名其妙坏掉"极难排查。
+- **同主机不同端口也算外部。** DSH 的端口是随机的，不能靠"反正是本机"猜。
+  `localhost` 与 `127.0.0.1` 同理，不视为同源。
+- **基址未知时按内部处理。** 服务就绪前宁可不开外链，也不要把自家页面甩进浏览器。
+- **同源新窗口用当前视图打开**，不为它再起一个 WebEngine 实例（那是 100MB 起）。
+- **外链一律走系统浏览器**（老大明确要求）：省下渲染进程，还带用户自己的登录态。
+  日志里的 URL 过一遍 `redact()`，`token=` 打码 —— 日志会长期留在磁盘上。
+
+### 14.3 开发者模式：直接用 Chromium 自带的开发者工具
+
+开关在 **控制面板 → 概览 → 开发者**，默认关闭，落在 `settings.json` 的 `dev_mode`。
+
+| | 关闭（默认） | 开启 |
+|---|---|---|
+| 控制台采集 | 常开 | 常开 |
+| 网络拦截 | **不挂** | 挂上 `QWebEngineUrlRequestInterceptor` |
+| 开发者工具 | 按钮禁用 | 开关一开就打开 |
+
+**主入口是 `InspectorWindow`：Chromium 自带的 DevTools**（`devtools://devtools/bundled/inspector.html`）。
+第一版自己画了一个"布局表"，被老大当场否掉 —— 盒模型、计算样式、强制状态、
+Sources 断点、Network 状态码与瀑布图、Application 存储，这些现成能力不可能自绘对齐。
+接法是 `devtools_page.setInspectedPage(page)`（Qt 6.3+）；2.5 秒后前端还没起来就退回
+`page.setDevToolsPage(devtools_page)`。代价是第二个渲染实例（约 100~200MB），
+所以窗口 `WA_DeleteOnClose`：**关掉即释放**（已用 `shiboken6.isValid()` 验证对象真的销毁）。
+
+`DevWindow` 降级为**轻量日志窗口**（第二个按钮），保留它是为了补 DevTools 的一个盲区：
+DevTools 只能看到它自己打开之后的控制台，而我们的控制台采集是常开的 ——
+"错误发生在你决定要看之前"时，这里还有记录。四页：控制台 / 网络 / 布局快照 / 环境，
+布局页只给坐标尺寸快照，页内明写"要看盒模型请用完整开发者工具"。
+
+控制台采集常开的理由：一句一条，代价可以忽略。
+网络拦截按需的理由：`interceptRequest` 是**每个请求一次 Python 回调**（图片、字体、轮询都算），
+不该让普通用户为观测层付钱。
+
+- **控制台** —— `javaScriptConsoleMessage` 采集的 log/info/warning/error，带来源与行号，
+  可按"只看错误"过滤；页面加载起止、渲染进程退出也写成说明行进这里。
+- **网络** —— 拦截器记录的 时间/类型/方法/地址。拦截器只看得到"开启之后"的请求，
+  所以另给一个「读取已加载资源」：从 `performance.getEntriesByType('resource')`
+  回填开启之前的资源与大小/耗时，按 URL 合并到同一行，不重复记。
+- **布局快照** —— 注入 JS 枚举**可见**元素（上限 1200），列出选择器、尺寸、坐标、display、overflow。
+  选中任意一行会在页面里描红并滚到可视区（`outline: 2px solid #ff3b30`）。
+  它回答的是"这个控件被挤到哪去了"，**不替代** Elements 的盒模型与实时编辑。
+- **环境** —— URL / 标题 / 视口 / DPR / DOM 节点数 / UA，外加
+  「重新加载」「清缓存并重载」「复制诊断信息」「打开完整开发者工具」。
+
+数据通道：环形缓冲（各 2000 条）+ 自增序号，主线程 400ms 增量拉取。
+**不用跨线程信号** —— 每个请求发一次信号会把事件循环塞满高频小事件，
+而"看日志"本来就是秒级的活。
+
+### 14.4 必须记住的坑：`runJavaScript` 的返回值
+
+PySide6 6.11 实测：**返回 array / object 一律得到空字符串**。
+
+```python
+page.runJavaScript("(function(){return [1,2];})()", cb)   # cb 收到 ''
+page.runJavaScript("JSON.stringify([1,2])", cb)           # cb 收到 '[1,2]'
+```
+
+所以三支注入脚本（布局 / 性能条目 / 环境）统一 `JSON.stringify`，
+Python 侧走 `_as_json()`（新老行为都能吃）。**先怀疑返回值通道，再怀疑脚本本身** ——
+这类故障的表现是"没报错、也没数据"，最容易误判成 JS 写错了。
+
+### 14.5 验证
+
+- `dsh_devtools.selftest_checks()`，挂在 GUI 自测的**两条分支**上：
+  8 条外链判据 + 令牌打码 + 记录器并发写入 / 序号递增 / 增量读取 +
+  **`QWebEngineNewWindowRequest` 没有 accept/reject 的 API 事实** +
+  **`_on_new_window` 字节码里不出现 accept/reject**（防 14.1.1 回退）。
+- 真机冒烟（`tools/gui_selftest.py`，起真实 DSH）：异源 `acceptNavigationRequest` 返回 `False`
+  且外部回调收到 URL；同源返回 `True`；页面类型是 `ShellPage` 且拦截器已挂；
+  再拿一个**只有 `requestedUrl()` 的假请求对象**喂给 `_on_new_window`，
+  必须把 `platform.deepseek.com` 交出去且不抛异常（这条直接对应那 24 次 AttributeError）。
+- 无头（离屏 WebEngine）：布局扫描 → 选中 → 高亮（`outline: rgb(255, 59, 48) solid 2px`）；
+  网络页补出 document + resource 两条；`InspectorWindow` 的页面 URL 变为
+  `devtools://devtools/bundled/inspector.html`、`ready=True`，关闭后 `shiboken6.isValid()` 为 False。
+
+### 14.6 语言与置顶（2026-10-19 下午）
+
+**语言。** QtWebEngine **不会**把系统 UI 语言传给 Chromium：没设 `--lang` 时内核按 en-US 起，
+DevTools 也就永远是英文（截图里那条 `DevTools is now available in Chinese!` 正是这么来的）。
+
+修法：在**任何 PySide6 导入之前**读 Windows 的 `GetUserDefaultLocaleName`，拼进
+`QTWEBENGINE_CHROMIUM_FLAGS=--lang=zh-CN`。Chromium 只在这组 flags 初始化时读一次，
+放到 `QApplication` 之后再设就无效——这条顺序是硬约束。
+
+实测：`navigator.language` 与 `navigator.languages` 都变成 `zh-CN`。
+
+但 **DevTools 自己的 UI 文案还有一层**：它按"浏览器 UI 语言"决定资源包，当前 PySide6
+6.11 里仍显示英文。它自己的「Switch DevTools to Chinese」会把这个偏好写进 **profile**，
+而原来的 DevTools 页用的是临时 profile —— 关窗即丢。现在改成持久 profile：
+
+```
+%LOCALAPPDATA%\DSH-Web\devtools-profile\
+```
+
+用户在 DevTools 里切一次语言（或设置里选语言）就会记住，下次不用再点。
+
+**置顶。** DevTools 窗口顶部加了一条 32px 的工具条（我们的 QWidget，不碰它的内部布局），
+右侧是「置顶」。`setWindowFlag(WindowStaysOnTopHint)` 之后**必须再 `show()`** 才生效
+（Qt 会先隐藏窗口）；DevTools 页面不会重载，断点与选中的元素都还在。
+
+## 15. 控制台里那些 404 与账号读取失败，是不是我们的问题
+
+老大在 DevTools 里看到：
+
+```
+:3080/api/changes.subscribe...&seq=3634  Failed to load resource: 404
+client.js:4502 [deepseek-account] account read failed  {field: "profile"}
+```
+
+**结论：不是桌面壳的。** 三条证据：
+
+1. **壳不碰 API 流量。** 它只做两件事：拦导航（`LinkClicked`）、记录请求（只读）。
+   没有改写、注入、代理；拦截器里连 header 都不动。
+2. **同一个 404 用裸 HTTP 客户端也能复现。** 直接
+   `GET http://127.0.0.1:<port>/api/changes.subscribe?seq=0` → `404 not found`，
+   与浏览器里那条一模一样。响应由 DSH 自己给出，与谁在请求无关。
+3. **账号读取失败是服务端"正常返回"的一种结果。** `getProfile` 的结果 schema
+   本身就包含 `{status:"failed"}`，客户端只是把它记成 error。同一次请求里
+   `balance` 成功、`profile` 失败 —— 若是壳坏了 cookie/网络，**两个都会失败**。
+
+两条报错的性质也不同：
+
+- `changes.subscribe` 是"重连安全的变更流"，`404` 表示这个订阅序号已经无效
+  （服务重启、日志代次变化），客户端会带着新 seq 重连。DevTools 把它标红属于正常现象。
+- `account read failed` 是 DSH 服务端访问 DeepSeek 平台侧的接口失败（网络或账号资料），
+  壳这一侧没有可修的东西；真要排查，看 DSH 服务日志而不是壳。
+
+**留一个可复现手法**：以后遇到"是不是壳的问题"，先看这个报错在**裸 HTTP**下是否同样出现。
+出现 → 服务端；不出现 → 才轮到壳、cookie、缓存。
+
+### 15.1 DevTools 自己的 `Autofill.*` 报错
+
+打开开发者工具后终端会刷：
+
+```
+js: Request Autofill.enable failed. {"code":-32601,"message":"'Autofill.enable' wasn't found"}
+js: Request Autofill.setAddresses failed. {"code":-32601,"message":"'Autofill.setAddresses' wasn't found"}
+[ERROR:CONSOLE(1)] "Request Autofill.enable failed...", source: devtools://devtools/bundled/core/protocol_client.js
+```
+
+**不是错误，是 DevTools 在探测可选能力。** DevTools 前端启动时会尝试启用若干 CDP 域，
+`Autofill` 是浏览器自动填充用的；**QtWebEngine 没有自动填充服务，也就没实现这个域**，
+于是 CDP 返回 `-32601 Method not found`。
+
+判据很简单：`source:` 指向 `devtools://devtools/bundled/...`，而不是被检查的页面。
+它不影响 Elements / Console / Network / 断点，也无法通过我们这侧关掉。按噪音处理。

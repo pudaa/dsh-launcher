@@ -187,6 +187,10 @@ QLabel#kv_v        { color: $text; font-family: $font; font-size: 13px; }
 
 QToolButton#winBtn { border: none; background: transparent; border-radius: 0px; }
 QToolButton#winBtn:hover { background: $hover; }
+/* 关闭键贴在窗口右上角：它的红色悬停底必须自己带一个同半径的圆角，
+   否则那块矩形会盖在窗口自绘的圆角之上——子控件不会被父控件的
+   paintEvent 裁剪路径约束，"溢出"就是这么来的。 */
+QToolButton#winBtn[danger="true"] { border-top-right-radius: ${r_win}px; }
 QToolButton#winBtn[danger="true"]:hover { background: $bad; }
 
 /* 按钮的最小尺寸不写在这里：QSS 的 min-height 是**内容区**下限，
@@ -229,6 +233,7 @@ def build_style(pal: dict) -> str:
     return _STYLE.substitute(
         text=pal["text"], dim=pal["dim"], muted=pal["muted"], hover=pal["hover"],
         line=pal["line"], bad=pal["bad"], font=FONT, r_ctrl=R_CONTROL,
+        r_win=R_WINDOW,
         btn_fill=pal["btn_fill"], btn_hover=pal["btn_hover"],
         primary_fill=pal["primary_fill"], primary_hover=pal["primary_hover"],
         primary_text=pal["primary_text"],
@@ -1052,6 +1057,47 @@ class OverviewPage(BasePage):
         acts.addWidget(btn_log)
         acts.addStretch(1)
         self.layout_.addWidget(holder2)
+
+        # --- 开发者 ---
+        # 默认关：观测层不该让普通用户付开销（网络拦截是"每个请求一次回调"）。
+        # 开启后立刻弹开发者窗口——开关的意思就是"现在要看"。
+        c3 = Card("开发者", self.pal)
+        self.toggles["dev_mode"] = ToggleRow(
+            "开发者模式",
+            "开启后直接打开 Chromium 自带的开发者工具"
+            "（Elements / Console / Network / Sources 与浏览器完全一致），"
+            "同时开始记录网络请求。",
+            self.host.flag("dev_mode"), self.pal,
+            lambda on: self.host.set_flag("dev_mode", on))
+        c3.add(self.toggles["dev_mode"])
+
+        dev_row = QWidget()
+        dl = QHBoxLayout(dev_row)
+        dl.setContentsMargins(16, 4, 16, 4)
+        dl.setSpacing(8)
+        self.btn_dev = QPushButton("开发者工具")
+        self.btn_dev.setObjectName("action")
+        self.btn_dev.setToolTip("Chromium 自带的完整开发者工具；"
+                                "关闭窗口即释放它占用的渲染实例")
+        self.btn_dev.clicked.connect(lambda: self.host.action("open_devtools"))
+        self.btn_log = QPushButton("轻量日志")
+        self.btn_log.setObjectName("action")
+        self.btn_log.setToolTip("控制台与请求记录一直保留在内存里，"
+                                "工具没开着的时候也能回看报错（布局页只是坐标快照）")
+        self.btn_log.clicked.connect(lambda: self.host.action("open_devlog"))
+        for b in (self.btn_dev, self.btn_log):
+            b.setEnabled(self.host.flag("dev_mode"))
+            if not self.host.flag("dev_mode"):
+                b.setToolTip("先开启上方的开发者模式")
+        # 开关与按钮状态联动：面板不重进这一页也能看到按钮变可用
+        self.toggles["dev_mode"].btn.toggled.connect(self.btn_dev.setEnabled)
+        self.toggles["dev_mode"].btn.toggled.connect(self.btn_log.setEnabled)
+        dl.addWidget(self.btn_dev)
+        dl.addWidget(self.btn_log)
+        dl.addStretch(1)
+        c3.add(dev_row)
+        self.layout_.addWidget(c3)
+
         self.layout_.addStretch(1)
         self.refresh()
 
@@ -1068,6 +1114,10 @@ class OverviewPage(BasePage):
             self.kv_svc.set("未启动")
         for name, row in getattr(self, "toggles", {}).items():
             row.set_checked(self.host.flag(name))
+        if hasattr(self, "btn_dev"):
+            on = self.host.flag("dev_mode")
+            for b in (self.btn_dev, self.btn_log):
+                b.setEnabled(on)
 
     def on_show(self) -> None:
         if not self._built:
@@ -1744,6 +1794,20 @@ def selftest_checks() -> list:
     check("标题栏按钮底色是深色（不是系统默认浅色）", not bad_light,
           "、".join(bad_light))
 
+    # --- 关闭键的红色悬停底不能溢出窗口圆角 ---
+    # 子控件不会被父控件的 paintEvent 裁剪，红底是矩形的就会盖在圆角上。
+    # 反向验证过：去掉 border-top-right-radius 后，这个角会变成 #ec1313 实心。
+    from PySide6.QtTest import QTest
+    btn_close = panel.titlebar.btn_close
+    QTest.mouseMove(btn_close, btn_close.rect().center())
+    loop_events(app, 140)
+    hot = panel.grab().toImage()
+    corner_c = hot.pixelColor(W - 2, 1)
+    check("关闭键悬停底色不溢出圆角（角上仍是透明）",
+          corner_c.alpha() <= 40, "%s a=%d" % (corner_c.name(), corner_c.alpha()))
+    QTest.mouseMove(panel.titlebar, panel.titlebar.rect().center())
+    loop_events(app, 80)
+
     # --- 主题切换 ---
     panel.apply_theme("light")
     loop_events(app, 220)
@@ -1860,7 +1924,13 @@ def selftest_checks() -> list:
     ov = panel.pages.get(0)
     toggles = getattr(ov, "toggles", {}) if ov is not None else {}
     check("概览页承载了从托盘搬来的开关",
-          "prerelease_opt_in" in toggles, "、".join(toggles) or "无")
+          {"prerelease_opt_in", "dev_mode"} <= set(toggles),
+          "、".join(toggles) or "无")
+    # 开发者模式下才给入口：默认关着的时候按钮必须是灰的，否则用户点了
+    # 会被"还没开启"顶回来，属于无意义交互。
+    check("开发者按钮在模式关闭时不可点",
+          ov is not None and hasattr(ov, "btn_dev")
+          and not ov.btn_dev.isEnabled() and not ov.btn_log.isEnabled())
 
     check("后台检测线程能干净收尾", panel.shutdown(15000))
 
