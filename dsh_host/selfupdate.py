@@ -281,7 +281,8 @@ def _parse_atom_release(text: str, include_prerelease: bool = False) -> HostRele
 
 
 def _fallback_release(timeout: float = 20,
-                      include_prerelease: bool = False) -> HostRelease | None:
+                      include_prerelease: bool = False
+                      ) -> tuple[HostRelease | None, bool]:
     """API 不可用时的兜底：`releases/latest` 的 302 跳转 + Atom feed。
 
     两个入口都是 github.com 的普通页面，不占 API 配额。**先看 302**：
@@ -292,6 +293,10 @@ def _fallback_release(timeout: float = 20,
     **两条入口都要过 `accept_release`**：这是与主路径行为一致的关键。
     302 指向的是"最近一次发布"，它完全可能就是我们自己的 beta；
     这时不能返回它，要退到 Atom 里第一条合格的（更早的正式版）。
+
+    返回 `(release, reachable)`。`reachable` 表示"页面确实读到了"——
+    即使读到的全是被过滤掉的预发布版。调用方需要它来区分
+    "没有可用的正式版"（对用户就是已是最新）和"根本没连上"。
     """
     redirect = _http_read(f"https://github.com/{HOST_REPO}/releases/latest", timeout)
     latest_tag = _tag_from_release_url(redirect[0]) if redirect else None
@@ -299,15 +304,16 @@ def _fallback_release(timeout: float = 20,
     atom = _http_read(f"https://github.com/{HOST_REPO}/releases.atom", timeout)
     atom_rel = (_parse_atom_release(atom[1].decode("utf-8", "ignore"), include_prerelease)
                 if atom else None)
+    reachable = bool(latest_tag) or atom is not None
 
     if latest_tag:
         candidate = _release_from_tag(latest_tag)
         if accept_release(candidate, include_prerelease):
             if atom_rel is not None and atom_rel.tag == latest_tag:
-                return atom_rel
-            return candidate
-        return atom_rel
-    return atom_rel
+                return atom_rel, True
+            return candidate, True
+        return atom_rel, reachable
+    return atom_rel, reachable
 
 
 def _parse_release(data: dict) -> HostRelease | None:
@@ -359,7 +365,8 @@ def _pick_release(items, include_prerelease: bool = False) -> HostRelease | None
 
 
 def fetch_latest_release(timeout: float = 20,
-                         include_prerelease: bool = False) -> HostRelease | None:
+                         include_prerelease: bool = False,
+                         with_status: bool = False):
     """取最新 release。
 
     单次 `releases/latest` 会跳过预发布版；要拿到预发布就得列全部再挑。
@@ -372,19 +379,36 @@ def fetch_latest_release(timeout: float = 20,
 
     **三路共用 `accept_release` 这一个判据**：不取预发布版时，降级路径也不取。
     否则"API 撞限额"这个偶发条件会改变用户拿到的东西——那是最难复现的一类 bug。
+
+    `with_status=True` 时返回 `(release, reachable)`。`reachable` 表示
+    "连通正常、确实读到了 release 数据"，哪怕读到的全是被过滤掉的预发布版。
+    调用方需要它来区分两种 None：
+      - reachable=True  → 没有比当前更新的**正式版**，对用户就是"已是最新"
+      - reachable=False → 压根没拿到数据，必须如实说检查失败
+    少了这个区分，网络挂掉时也会显示"已是最新"，那是更糟的静默失败。
     """
+    list_reachable = False
+
     if not include_prerelease:
         data = _http_json(f"https://api.github.com/repos/{HOST_REPO}/releases/latest", timeout)
         rel = _parse_release(data) if data else None
         if accept_release(rel, include_prerelease):
-            return rel
+            return (rel, True) if with_status else rel
         # latest 接口在没有正式 release 时返回 404，退回去列全部
+
     data = _http_json(f"https://api.github.com/repos/{HOST_REPO}/releases?per_page=10", timeout)
-    rel = _pick_release(data, include_prerelease)
-    if rel:
-        return rel
+    if isinstance(data, list):
+        list_reachable = True
+        rel = _pick_release(data, include_prerelease)
+        if rel:
+            return (rel, True) if with_status else rel
+        # 列表读到了、但没有合格的（例如只有测试版）：继续走页面兜底，
+        # 万一列表的 10 条之外还有更早的正式版。
+
     # API 可能 403（未登录限额）或整体不可达；页面/Atom 不占配额。
-    return _fallback_release(timeout, include_prerelease)
+    rel, fallback_reachable = _fallback_release(timeout, include_prerelease)
+    reachable = list_reachable or fallback_reachable
+    return (rel, reachable) if with_status else rel
 
 
 def check_host_update(timeout: float = 20) -> tuple[HostRelease | None, str]:
@@ -394,12 +418,18 @@ def check_host_update(timeout: float = 20) -> tuple[HostRelease | None, str]:
     此时状态说明是给用户看的原因文本。
     """
     try:
-        rel = fetch_latest_release(timeout=timeout)
+        rel, reachable = fetch_latest_release(timeout=timeout, with_status=True)
     except Exception as e:
         return None, f"检查失败：{e}"
 
     if rel is None:
-        return None, ("无法获取发行信息（GitHub API 限额、网络问题，或尚未发布任何版本）。\n"
+        if reachable:
+            # 连通正常，只是没有比当前更新的**正式版**（列表里可能只有测试版）。
+            # 对用户而言这就是"已是最新"：预发布版存在与否，不该改变结论。
+            # 这也保证了链路一致——同一个用户在不同时刻、不同降级路径下，
+            # 得到的答复相同，不会因为"刚巧赶上 beta 的可见窗口"就装上测试版。
+            return None, f"已是最新版本（v{HOST_VERSION}）。"
+        return None, ("无法获取发行信息（GitHub API 限额或网络问题）。\n"
                       f"可直接到 https://github.com/{HOST_REPO}/releases 查看。")
 
     if not is_newer(rel.version, HOST_VERSION):

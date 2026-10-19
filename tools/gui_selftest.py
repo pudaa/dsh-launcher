@@ -426,6 +426,32 @@ def host_update_checks() -> list[str]:
         failures.append("预发布过滤一致性")
         print("        异常用例:", bad)
 
+    # 1d. 两种"没有更新"必须给出**不同**答复（2026-10-19 老大定：链路一致优先）。
+    #     - 连通正常、只有测试版 → "已是最新"：预发布是否存在不该改变结论，
+    #       否则"刷新前能看到 beta、刷新后只能看到正式版"会让行为漂移。
+    #     - 完全拿不到数据 → "无法获取"：不能伪装成"已是最新"，那是静默失败。
+    only_beta_ok = offline_ok = False
+    msg1 = msg2 = ""
+    try:
+        su._http_json = lambda *a, **k: [beta_item]
+        su._http_read = lambda *a, **k: None
+        _, msg1 = su.check_host_update(timeout=1)
+        only_beta_ok = "已是最新" in msg1
+
+        su._http_json = lambda *a, **k: None
+        su._http_read = lambda *a, **k: None
+        _, msg2 = su.check_host_update(timeout=1)
+        offline_ok = "无法获取" in msg2
+    finally:
+        su._http_json, su._http_read = orig_json, orig_read
+
+    ok = only_beta_ok and offline_ok
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 只有测试版报「已是最新」，拿不到数据才报「无法获取」")
+    if not ok:
+        failures.append("更新检查文案")
+        print(f"        只有 beta={only_beta_ok}  全失败={offline_ok}"
+              f"  实际: {msg1[:40]!r} / {msg2[:40]!r}")
+
 
     # 2. 源码运行时不支持自更新（避免替换掉开发的 py 文件）
     supported, reason = su.self_update_supported()
