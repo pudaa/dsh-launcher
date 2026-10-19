@@ -76,6 +76,11 @@ jobs:
 
       - name: 打包
         shell: bash
+        env:
+          # 要保留的 Chromium 语言包（决定网页右键菜单 / PDF 查看器 / 错误页的文案）。
+          # **加语言就往这里加名字**，不用改下面的逻辑。
+          # 裁掉的语言会回退到 en-US —— 不会空白，只是英文。
+          KEEP_LOCALES: "zh-CN zh-TW en-US en-GB"
         run: |
           # 关于 --include-data-dir：**不能省**。
           #
@@ -98,6 +103,32 @@ jobs:
           # 而"应用内就地替换"这条更新路径**必须让新旧同跑**（新实例是在旧实例
           # 退出前被拉起来的）。所以每个版本用各自的解包目录，实测这样就能共存。
           # 旧的解包目录由 dsh_host/selfupdate.py 的 cleanup_stale_runtimes 清理。
+          #
+          # ---------------------------------------------------------------
+          # 裁剪（2026-10-19，实测 467 MB/443 文件 → 327 MB/94 文件）
+          #
+          # 体积只降 15%，但**每次启动快 1.0~1.5 s**（冷启动 2.4 s）。原因是
+          # onefile 解包/校验的成本按**文件数**走，不是按字节数：裁掉的 353 个
+          # 文件里，语言包占 349 个。详见 docs/packaging-trim.md。
+          #
+          # ⚠️ `--noinclude-data-files` 是**最终过滤器**：想"先全排、再用
+          # --include-data-files 把白名单补回来"是行不通的，补的会被一起吃掉
+          # （实测 dist 里 translations 直接为空）。所以只能精确排除。
+          # ---------------------------------------------------------------
+          PYSIDE_DIR=$(python -c "import PySide6, os; print(os.path.dirname(PySide6.__file__))")
+          NOINC=()
+          for f in "$PYSIDE_DIR"/translations/qtwebengine_locales/*.pak; do
+            NAME=$(basename "$f" .pak)
+            KEEP=0
+            for k in $KEEP_LOCALES; do
+              if [ "$NAME" = "$k" ]; then KEEP=1; break; fi
+            done
+            if [ "$KEEP" = "0" ]; then
+              NOINC+=("--noinclude-data-files=PySide6/translations/qtwebengine_locales/$(basename "$f")")
+            fi
+          done
+          echo "保留语言包: $KEEP_LOCALES"
+          echo "排除语言包: ${#NOINC[@]} 个"
           python -m nuitka --onefile \
             --windows-console-mode=disable \
             --windows-icon-from-ico=assets/icon.ico \
@@ -114,7 +145,67 @@ jobs:
             --output-filename=DSH-Web.exe \
             --lto=yes \
             --assume-yes-for-downloads \
+            --noinclude-data-files="*.debug.pak" \
+            --noinclude-data-files="PySide6/translations/*.qm" \
+            --noinclude-dlls="qt6pdf.dll" \
+            --noinclude-dlls="PySide6/qt-plugins/imageformats/qpdf.dll" \
+            "${NOINC[@]}" \
             dsh_gui_qt.py
+
+      - name: 确认裁剪生效
+        # 排除参数写错**不会报错**，只会静默把 143 MB / 353 个文件塞回来
+        # （"产物存在"那步的下限是 20 MB，拦不住）。
+        # 所以直接查 Nuitka 留下的 dist 目录 —— 它是 onefile payload 的原料，
+        # 看它等于看包里到底有什么。
+        shell: bash
+        run: |
+          python - <<'PY'
+          import glob
+          import os
+          import sys
+
+          DIST = "build/dsh_gui_qt.dist"
+          KEEP = {"zh-CN", "zh-TW", "en-US", "en-GB"}
+          bad = []
+
+          if not os.path.isdir(DIST):
+              print("::error::找不到 %s，无法核对裁剪结果" % DIST)
+              sys.exit(1)
+
+          # 1. DevTools 调试符号资源不该在（单个 76 MB）
+          for p in glob.glob(os.path.join(DIST, "*.debug.pak")):
+              bad.append("调试资源未裁掉: " + os.path.basename(p))
+
+          # 2. Qt6Pdf 及其图像插件不该在
+          for rel in ("qt6pdf.dll",
+                      os.path.join("PySide6", "qt-plugins", "imageformats", "qpdf.dll")):
+              if os.path.exists(os.path.join(DIST, rel)):
+                  bad.append("未裁掉: " + rel)
+
+          # 3. Qt 框架翻译（.qm）不该在
+          qm = glob.glob(os.path.join(DIST, "PySide6", "translations", "*.qm"))
+          if qm:
+              bad.append("Qt 翻译未裁掉: %d 个 .qm" % len(qm))
+
+          # 4. Chromium 语言包必须**恰好**等于白名单
+          loc = os.path.join(DIST, "PySide6", "translations", "qtwebengine_locales")
+          got = ({os.path.splitext(f)[0] for f in os.listdir(loc)}
+                 if os.path.isdir(loc) else set())
+          if got != KEEP:
+              bad.append("语言包集合不对，实际=%s" % sorted(got))
+
+          # 5. 文件数兜底（裁剪前 443；参数全失效时会立刻露馅）
+          total = sum(len(fn) for _, _, fn in os.walk(DIST))
+          print("dist 文件总数: %d（裁剪前 443）" % total)
+          if total > 130:
+              bad.append("文件数 %d 偏多，裁剪可能没生效" % total)
+
+          if bad:
+              for b in bad:
+                  print("::error::" + b)
+              sys.exit(1)
+          print("裁剪核对通过：语言包=%s，文件数=%d" % (sorted(got), total))
+          PY
 
       - name: 确认产物存在
         shell: bash
