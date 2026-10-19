@@ -33,13 +33,40 @@ HOST_ASSET_NAME = "DSH-Web.exe"
 DSH_PKG = "@deepseek-ai/dsh"
 
 
+def _prerelease_key(pre: str) -> tuple:
+    """把预发布段拆成可比较的键（semver 规则）。
+
+    为什么不能直接拿字符串比
+    ------------------------
+    `beta.10` 在字典序下**小于** `beta.9`（'1' < '9'），语义上却更新。
+    发到第四五个预发布版就会漏掉更新提示，而且现象是"明明有新 beta 却
+    告诉我已是最新"——与 0.1.7 漏读 next 通道那次是同一类静默失败。
+
+    规则（semver 2.0.0 §11）：
+      - 按 `.` 分段；纯数字段按**数值**比，其余按 ASCII 比
+      - 数字段的优先级**低于**非数字段（`-1` < `-alpha`）
+      - 段数少的更小（`-beta` < `-beta.1`）
+    """
+    key = []
+    for seg in pre.split("."):
+        if seg.isdigit():
+            # 三元组的第 1 位是"数字 vs 非数字"的优先级标记
+            key.append((0, int(seg), ""))
+        else:
+            key.append((1, 0, seg))
+    return tuple(key)
+
+
 def version_tuple(v: str) -> tuple:
     """把版本串拆成可比较的元组。
 
     只用于桌面壳自己的版本比较（我们发的是规范的 semver），
     所以这里可以放心地用严格规则，不需要 compat.py 里那套代数比较。
+
+    `X.Y.Z-beta.N` 这类预发布版**排在同一个 X.Y.Z 正式版之前**。
     """
     core = v.strip().lstrip("v")
+    core = core.partition("+")[0]          # 构建元数据不参与比较
     main, _, pre = core.partition("-")
     nums = []
     for part in main.split("."):
@@ -49,8 +76,10 @@ def version_tuple(v: str) -> tuple:
             nums.append(0)
     while len(nums) < 3:
         nums.append(0)
-    # 有预发布后缀的排在正式版之前（-1 < 0）
-    return tuple(nums[:3]) + ((0, pre) if pre else (1, ""))
+    # 第 4 位是发布阶段标记：0=预发布，1=正式版。
+    # 同阶段之间比后面的键，预发布那边是拆好的段元组。
+    return tuple(nums[:3]) + ((0, _prerelease_key(pre)) if pre else (1, ()),)
+
 
 
 def is_newer(candidate: str, current: str) -> bool:

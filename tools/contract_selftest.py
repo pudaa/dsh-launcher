@@ -414,6 +414,13 @@ def main_lite() -> int:
     print("[Host] 桌面壳版本号")
     check("版本号可解析为三段", len(version_tuple(HOST_VERSION)) >= 3, HOST_VERSION)
     check("同版本不比自身新", not is_newer(HOST_VERSION, HOST_VERSION))
+    # 预发布版（`X.Y.Z-beta.N`）的排序：测试版必须低于同号正式版，
+    # 序号必须按数值比 —— 用字符串比时 beta.10 会小于 beta.9，
+    # 表现为"发了新 beta 却提示已是最新"。
+    check("预发布版低于同号正式版",
+          not is_newer("2.4.0-beta.1", "2.4.0"))
+    check("预发布序号按数值比较（beta.10 > beta.9）",
+          is_newer("2.4.0-beta.10", "2.4.0-beta.9"))
 
     print(LINE)
     if failures:

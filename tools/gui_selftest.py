@@ -254,11 +254,27 @@ def host_update_checks() -> list[str]:
     failures: list[str] = []
 
     # 1. 版本比较
+    #    预发布段必须按 semver 语义比，不能比字符串：字典序下
+    #    `beta.10` < `beta.9`，会让第 10 个 beta 被当成"比当前旧"
+    #    而漏掉更新提示（2026-10-19 实测过这个错判）。
     cases = [
         ("2.0.1", "2.0.0", True),
         ("2.0.0", "2.0.1", False),
         ("2.1.0", "2.0.9", True),
         ("2.0.0", "2.0.0", False),
+        # 预发布 < 同号正式版
+        ("2.4.0-beta.1", "2.4.0", False),
+        ("2.4.0", "2.4.0-beta.1", True),
+        # 预发布之间：序号按数值，段数少的更小
+        ("2.4.0-beta.2", "2.4.0-beta.1", True),
+        ("2.4.0-beta.10", "2.4.0-beta.9", True),
+        ("2.4.0-beta.1", "2.4.0-beta", True),
+        ("2.4.0-alpha.9", "2.4.0-beta.1", False),
+        # 数字段优先级低于字母段（semver §11）
+        ("2.4.0-2", "2.4.0-alpha", False),
+        ("2.4.0-alpha", "2.4.0-2", True),
+        # 带构建元数据时只看前面的版本
+        ("2.4.0+build9", "2.4.0", False),
     ]
     bad = [f"{a}>{b}" for a, b, exp in cases if is_newer(a, b) != exp]
     print(f"  [{'OK  ' if not bad else 'FAIL'}] 版本比较逻辑正确")
