@@ -965,6 +965,58 @@ def theme_checks() -> list[str]:
     return failures
 
 
+def terminal_checks() -> list[str]:
+    """开发者面板「终端」页：能否读到输出、整段复制、暂停/归位、搜索。"""
+    failures: list[str] = []
+
+    def check(name: str, ok: bool, extra: str = "") -> None:
+        print(f"  [{'OK  ' if ok else 'FAIL'}] {name}{('  ' + extra) if extra else ''}")
+        if not ok:
+            failures.append(name)
+
+    import dsh_console
+    import dsh_devtools
+    import dsh_theme
+
+    buf = dsh_console.ConsoleBuffer()
+    buf.append_text("INFO 启动完成\n")
+    buf.append_text("[ERROR:CONSOLE(1)] boom 失败\n")
+    view = dsh_devtools.TerminalView(dsh_theme.palette("light"), console=buf)
+    view.resize(900, 500)
+    view.show()
+    QApplication.processEvents()
+    view.tick()
+
+    text = view.editor.toPlainText()
+    check("终端页读到采集缓冲", "ERROR:CONSOLE" in text and "启动完成" in text)
+    check("高亮器已挂上", view.highlighter is not None)
+    check("状态栏报出错误数", "错误 1" in view.status.text(), view.status.text())
+
+    view._copy_all()
+    clip = QApplication.clipboard().text()
+    check("复制全部拿到完整历史（可连续粘贴）",
+          "boom" in clip and clip.count("\n") >= 1, "%d 字符" % len(clip))
+
+    view.btn_follow.setChecked(False)
+    buf.append_text("暂停期间的一行\n")
+    view.tick()
+    check("暂停时不再自动追加到底部",
+          "暂停期间的一行" in view.editor.toPlainText())  # 仍会入缓冲
+    check("暂停状态文字提示新输出", "已暂停" in view.status.text(), view.status.text())
+    view.jump_to_end()
+    check("回到底部恢复跟随", view.btn_follow.isChecked())
+
+    view.search.setText("boom")
+    view._search()
+    check("搜索能选中命中项", "boom" in view.editor.textCursor().selectedText(),
+          view.editor.textCursor().selectedText()[:20])
+
+    view.apply_theme(dsh_theme.palette("dark"))
+    check("终端页能跟随主题切换", view.pal["bg"] == dsh_theme.palette("dark")["bg"])
+    view.close()
+    return failures
+
+
 def main() -> int:
     #: CI 里没有装 DSH，起不了真实服务。设此变量只跑不依赖 DSH 的部分
     #: （引导窗口渲染、对话框文案、自更新纯逻辑），
@@ -1003,6 +1055,15 @@ def main() -> int:
     state["devtools_failures"] = dsh_devtools.selftest_checks()
     print()
 
+    print("== 终端输出采集（切行 / 环形 / 打码）==")
+    import dsh_console
+    state["console_failures"] = dsh_console.selftest_checks()
+    print()
+
+    print("== 开发者面板终端页（复制 / 暂停 / 归位 / 搜索）==")
+    state["terminal_failures"] = terminal_checks()
+    print()
+
     if static_only:
         # 菜单结构检查不需要服务在跑——它只读菜单项文本与启用状态。
         # 但 MainWindow 的构造函数会立刻启动服务，所以这里用不启动
@@ -1011,7 +1072,8 @@ def main() -> int:
         bad = (state.get("onboarding_failures") or state.get("dialog_copy_failures")
                or state.get("host_update_failures") or state.get("titlebar_failures")
                or state.get("panel_failures") or state.get("devtools_failures")
-               or state.get("theme_failures"))
+               or state.get("theme_failures") or state.get("console_failures")
+               or state.get("terminal_failures"))
         if bad:
             print("\n用例失败：", "、".join(bad))
             return 1
@@ -1128,7 +1190,8 @@ def main() -> int:
            or state.get("dialog_copy_failures") or state.get("host_update_failures")
            or state.get("titlebar_failures") or state.get("menu_failures")
            or state.get("panel_failures") or state.get("webview_failures")
-           or state.get("devtools_failures") or state.get("theme_failures"))
+           or state.get("devtools_failures") or state.get("theme_failures")
+           or state.get("console_failures") or state.get("terminal_failures"))
     if "handle" in state and not bad:
         print("\nGUI 冒烟测试通过")
         return 0

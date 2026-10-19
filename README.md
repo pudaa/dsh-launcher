@@ -27,7 +27,7 @@ DSH 官方只发 CLI。要用 Web UI 得自己开终端跑 `dsh web`，从输出
 | 通道透明 | 「已是最新」也会报出预览通道上有没有更高版本，不会只说一句"已是最新" |
 | 控制面板 | 自绘面板（无边框 880x600、圆角）：概览 / 本机部署 / 连接 / 状态检测 / 关于 |
 | 外链处理 | 异源链接交给系统默认浏览器（顺带省下渲染开销），同源留在窗口内；`target="_blank"` 不会再"点了没反应" |
-| 开发者模式 | 面板里开启后直接打开 **Chromium 自带的开发者工具**（Elements / Console / Network / Sources，与 Chrome 一致），关窗即释放；另有轻量日志窗口，记录常开，可在工具没开时回看报错 |
+| 开发者模式 | 面板里开启后打开 **Chromium 自带的开发者工具**（Elements / Console / Network / Sources，与 Chrome 一致），关窗即释放；顶部可切到**终端页**，查看打包后本来看不到的进程输出（可整段复制、着色、搜索、暂停跟随） |
 | 配色跟随 | 明暗两套配色取自 DSH 官方前端的语义令牌，跟随界面主题自动切换 |
 | 桌面壳更新 | 从 GitHub Release 拉取新版本，自动替换自身并重启 |
 | 数据安全 | 更新前后统计 DSH_HOME 指纹，记录异常减少 |
@@ -151,6 +151,7 @@ GitHub Actions 会自动跑自测、构建 exe、创建 Release。
 | `dsh_host/provision.py` | L2 首次运行环境供给。winget 装 Node、私有 prefix 装 DSH |
 | `dsh_devtools.py` | 网页层策略与观测。外链出口判定、控制台/网络记录、原生开发者窗口、Chromium DevTools 宿主 |
 | `dsh_theme.py` | DSH 官方美术在 Qt 侧的转译层。字号/圆角/间距/动效、菜单与对话框样式、`MessageDialog` |
+| `dsh_console.py` | 宿主进程输出采集。接管 fd 1/2，把打包后看不见的终端收进开发者面板 |
 | `dsh_gui_qt.py` | 界面层。PySide6 + QtWebEngine |
 
 ## 目录规划

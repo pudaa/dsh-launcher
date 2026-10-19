@@ -1455,3 +1455,70 @@ js: Request Autofill.setAddresses failed. {"code":-32601,"message":"'Autofill.se
 
 判据很简单：`source:` 指向 `devtools://devtools/bundled/...`，而不是被检查的页面。
 它不影响 Elements / Console / Network / 断点，也无法通过我们这侧关掉。按噪音处理。
+
+## 16. 把"打包后看不见的终端"收进开发者面板（v2.3.2）
+
+### 16.1 问题
+
+打包是 `--windows-console-mode=disable`：进程没有控制台。
+
+- Python 的 `sys.stdout` 往往是 `None`，`print` 直接丢；
+- QtWebEngine（Chromium）的 C++ 日志写向一个无效的 fd 2，
+  控制台里那些 `js: ...`、`[ERROR:CONSOLE] ...`、崩溃前的栈全部消失。
+
+而这几类输出恰恰是定位问题的第一手证据。用户装着 exe 出问题时，
+我们手上什么都没有。
+
+### 16.2 做法：接管 fd 1/2，而不是包 `sys.stdout`
+
+只包 Python 的 `sys.stdout` 在**打包后没有意义**（它是 None），
+更关键是**抓不到 Chromium 的 C++ 输出**。所以直接在进程最早期做 fd 级重定向：
+
+```
+os.pipe()  →  os.dup(1)/os.dup(2) 保存原句柄  →  os.dup2(w, 1) / os.dup2(w, 2)
+                                                    ↓
+                         读线程：read → 解码 → 入环形缓冲 → 回显原句柄 → 落 console.log
+```
+
+要点：
+
+- **必须在 `QApplication` 之前安装**（`dsh_console.install()` 是 main 的第一行），
+  Qt 自己初始化时的输出也要能收；
+- 读线程用**增量 UTF-8 解码器**：`os.read` 会在多字节字符中间切断，
+  直接 `decode(..., "replace")` 会把中文切坏；
+- **回显只写一个句柄**：fd 1/2 已经合并进同一根管道，两个都写会让每行在终端出现两次
+  （第一版就是这么翻的）；
+- 读线程是 daemon，进程退出时管道里最后几 KB 会丢——注册 `atexit` 睡 50ms 放它收尾。
+  崩溃前最后一段往往最值钱；
+- 缓冲是**按行 + 自增序号**的环形队列（8000 行），面板按序号增量取；
+  行内 `token=...` 在入缓冲前就打码——这份文本是要粘给 agent 的。
+
+### 16.3 面板：一个窗口两页
+
+开发者工具窗口顶部加分段按钮 **「开发者工具 / 终端」**，下面是 `QStackedWidget`：
+
+- DevTools 页：原来的 `QWebEngineView`，切换时不销毁、不重载，断点与选中元素都保留；
+- 终端页：`TerminalView`
+  - **复制全部**：从缓冲取全文（不是只看得到的那屏），粘贴给 agent 是连续的；
+  - **复制选中** / Ctrl+C：常规选择复制；
+  - **着色**：`QSyntaxHighlighter` 只改颜色不改文本（ERROR/FATAL/Traceback→红，
+    WARN→黄，`js:`/`[ERROR:CONSOLE]`→蓝），复制出来的内容保持原样；
+  - **跟随 / 暂停**：新输出到达自动滚底；用户用滚轮往上翻会**自动**暂停跟随，
+    状态栏提示"已暂停（新 N 条）"；
+  - **回到底部**：跳回最新一行并恢复跟随；
+  - **搜索**：回车下一个、Shift+回车上一个，绕回另一端继续；
+  - **另存为**：把缓冲导出成 txt；
+  - **清空**：只清缓冲，不影响 `logs\console.log`。
+
+### 16.4 自测
+
+- `dsh_console.selftest_checks()`：跨块拼行、半行不提前入库、环形上限、
+  序号单调、级别判定、令牌打码、flush 尾巴；
+- `tools/gui_selftest.py::terminal_checks()`：面板能读到缓冲、错误计数、
+  复制全部（含换行）、暂停提示、归位恢复跟随、搜索选中、主题切换；
+- 真机验证：`os.write(2, b"PROBE-ERROR-42 ...")` 能进缓冲且级别为 error，
+  同时终端里照常看到（回显没有重复）。
+
+现场导出：设置 `DSH_CONSOLE_DUMP=<文件>`（可配 `DSH_CONSOLE_DUMP_WAIT`，默认 6 秒）
+会在若干秒后把缓冲落盘。打包后的 exe 没有控制台，这条让"用户机器上的现场"
+能一次性导出来，不用教用户截图。

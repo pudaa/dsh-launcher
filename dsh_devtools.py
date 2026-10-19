@@ -34,15 +34,20 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
-from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtCore import QRegularExpression, Qt, QTimer, QUrl
+from PySide6.QtGui import (QColor, QFont, QTextCharFormat, QTextCursor,
+                           QTextDocument, QSyntaxHighlighter)
 from PySide6.QtWebEngineCore import (QWebEnginePage, QWebEngineProfile,
                                      QWebEngineUrlRequestInterceptor)
 from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWidgets import (QAbstractItemView, QFrame, QHBoxLayout, QLabel,
-                               QLineEdit, QPlainTextEdit, QPushButton,
-                               QSizePolicy, QTabWidget, QTableWidget,
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup,
+                               QFileDialog,
+                               QFrame, QHBoxLayout, QLabel, QLineEdit,
+                               QPlainTextEdit, QPushButton, QSizePolicy,
+                               QStackedWidget, QTabWidget, QTableWidget,
                                QTableWidgetItem, QVBoxLayout, QWidget)
 
+import dsh_console
 from dsh_host import config
 from dsh_host.version import HOST_VERSION
 from dsh_panel import FONT, palette
@@ -456,6 +461,12 @@ QWidget#inspectorBar { background: %(side)s; border-bottom: 1px solid %(line)s; 
 QLabel#inspectorTitle { color: %(text)s; font-family: %(font)s;
                         font-size: 12px; font-weight: 600; }
 QLabel#inspectorTarget { color: %(muted)s; font-family: %(mono)s; font-size: 11px; }
+QPushButton#segBtn { color: %(dim)s; background: transparent;
+    border: 1px solid %(line)s; border-radius: 6px; padding: 2px 10px;
+    font-family: %(font)s; font-size: 12px; }
+QPushButton#segBtn:hover { color: %(text)s; background: %(hover)s; }
+QPushButton#segBtn:checked { color: %(text)s; background: %(nav_active)s;
+                             border-color: %(line)s; font-weight: 600; }
 QPushButton#pinBtn { color: %(dim)s; background: transparent;
     border: 1px solid %(line)s; border-radius: 6px; padding: 2px 10px;
     font-family: %(font)s; font-size: 12px; }
@@ -464,7 +475,8 @@ QPushButton#pinBtn:checked { color: %(accent)s; border-color: %(accent)s;
                              background: %(hover)s; font-weight: 600; }
 """ % {"side": pal["side"], "line": pal["line"], "text": pal["text"],
        "dim": pal["dim"], "muted": pal["muted"], "hover": pal["hover"],
-       "accent": pal["accent"], "font": FONT, "mono": _mono()})
+       "accent": pal["accent"], "nav_active": pal["nav_active"],
+       "font": FONT, "mono": _mono()})
 
 
 def _style(pal: dict) -> str:
@@ -501,6 +513,319 @@ QLineEdit { background: %(card)s; color: %(text)s; border: 1px solid %(line)s;
         "nav_active": pal["nav_active"], "btn_fill": pal["btn_fill"],
         "btn_hover": pal["btn_hover"], "accent": pal["accent"],
     })
+
+
+def _terminal_style(pal: dict) -> str:
+    """终端页的样式。日志区用等宽字体、不换行，与真正的终端一致。"""
+    return """
+QWidget#termBar { background: %(side)s; border-bottom: 1px solid %(line)s; }
+QLabel#termStatus { color: %(muted)s; font-family: %(font)s; font-size: 11px; }
+QPlainTextEdit#termLog {
+    background: %(card)s; color: %(text)s; border: none;
+    selection-background-color: %(nav_active)s; selection-color: %(text)s;
+    font-family: %(mono)s; font-size: 12px; padding: 6px 8px;
+}
+QLineEdit#termSearch {
+    background: %(card)s; color: %(text)s; border: 1px solid %(line)s;
+    border-radius: 6px; padding: 3px 8px;
+    font-family: %(font)s; font-size: 12px;
+}
+QPushButton#termBtn {
+    color: %(dim)s; background: transparent; border: 1px solid transparent;
+    border-radius: 6px; padding: 3px 9px;
+    font-family: %(font)s; font-size: 12px;
+}
+QPushButton#termBtn:hover { background: %(hover)s; color: %(text)s; }
+QPushButton#termBtn:checked { color: %(accent)s; background: %(hover)s; }
+QPushButton#termBtn:disabled { color: %(line)s; }
+QScrollBar:vertical, QScrollBar:horizontal {
+    background: transparent; width: 9px; height: 9px; margin: 2px;
+}
+QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
+    background: %(scroll)s; border-radius: 4px; min-height: 28px; min-width: 28px;
+}
+QScrollBar::add-line, QScrollBar::sub-line { width: 0px; height: 0px; }
+QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+""" % {
+        "side": pal["side"], "line": pal["line"], "muted": pal["muted"],
+        "card": pal["card"], "text": pal["text"], "hover": pal["hover"],
+        "nav_active": pal["nav_active"], "accent": pal["accent"],
+        "scroll": pal["scroll"], "dim": pal["dim"], "font": FONT,
+        "mono": '"Cascadia Mono", "Consolas", monospace',
+    }
+
+
+class _LogHighlighter(QSyntaxHighlighter):
+    """按级别给日志着色。**只改颜色，不改文本**——复制出来的内容必须是原样。"""
+
+    def __init__(self, document, pal: dict):
+        super().__init__(document)
+        self.set_palette(pal)
+
+    def set_palette(self, pal: dict) -> None:
+        def fmt(color: str, bold: bool = False) -> QTextCharFormat:
+            f = QTextCharFormat()
+            f.setForeground(QColor(color))
+            if bold:
+                f.setFontWeight(QFont.Weight.Bold)
+            return f
+
+        ci = QRegularExpression.PatternOption.CaseInsensitiveOption
+        self._rules = [
+            (QRegularExpression(
+                r"\[ERROR|\[FATAL|\bERROR\b|\bFATAL\b|\bCRITICAL\b|"
+                r"Traceback|\bException\b|Segmentation fault", ci),
+             fmt(pal["bad"], True)),
+            (QRegularExpression(r"\[WARN|\[WARNING|\bWARN(ING)?\b", ci),
+             fmt(pal["warn"])),
+            (QRegularExpression(r"^(js:|\[ERROR:CONSOLE|CONSOLE\()"),
+             fmt(pal["accent"])),
+        ]
+        self.rehighlight()
+
+    def highlightBlock(self, text: str) -> None:            # noqa: N802 (Qt 命名)
+        for rx, form in self._rules:
+            it = rx.globalMatch(text)
+            while it.hasNext():
+                m = it.next()
+                self.setFormat(m.capturedStart(), m.capturedLength(), form)
+
+
+class TerminalView(QWidget):
+    """宿主进程的输出面板（stdout / stderr，含 Chromium 的 C++ 日志）。
+
+    打包成 windowed exe 后没有控制台，这份输出去哪了？
+      · Python 的 print → 进程没有 stdout；
+      · Chromium 的 `js: ...`、`[ERROR:CONSOLE]` → 写向无效的 fd 2。
+    两条都看不见，而这恰恰是定位问题的第一手证据。`dsh_console.install()`
+    在启动最早期把 fd 1/2 接进环形缓冲，这里负责把它读出来、染上颜色、
+    并且**保证可以整段复制**——复制出去直接粘给 agent 就能复现问题。
+    """
+
+    def __init__(self, pal: dict, console=None, parent=None):
+        super().__init__(parent)
+        self.pal = pal
+        self.console = console or dsh_console.CONSOLE
+        self._seq = 0
+        self._pending = 0
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        lay.addWidget(self._build_bar())
+
+        self.editor = QPlainTextEdit()
+        self.editor.setObjectName("termLog")
+        self.editor.setReadOnly(True)
+        self.editor.setUndoRedoEnabled(False)
+        self.editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        # 比采集缓冲略大：多出来的部分只是显示余量，真正的内容由环形缓冲决定
+        self.editor.setMaximumBlockCount(dsh_console.MAX_LINES + 100)
+        font = QFont("Consolas")
+        font.setPointSize(9)
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        self.editor.setFont(font)
+        self.highlighter = _LogHighlighter(self.editor.document(), pal)
+        lay.addWidget(self.editor, 1)
+
+        # 用户主动滚上去就暂停跟随（用 actionTriggered，避免被程序滚动误触）
+        self.editor.verticalScrollBar().actionTriggered.connect(self._on_user_scroll)
+
+        self.setStyleSheet(_terminal_style(pal))
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(300)
+        self._timer.timeout.connect(self.tick)
+        self._timer.start()
+        self.tick()
+
+    # ---- 顶部工具条 ----
+
+    def _build_bar(self) -> QWidget:
+        bar = QWidget()
+        bar.setObjectName("termBar")
+        bar.setFixedHeight(34)
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(10, 0, 8, 0)
+        row.setSpacing(4)
+
+        self.btn_copy_all = self._button("复制全部", "复制全部输出（可直接粘给 agent）")
+        self.btn_copy_all.clicked.connect(self._copy_all)
+        self.btn_copy_sel = self._button("复制选中", "复制当前选中的内容")
+        self.btn_copy_sel.clicked.connect(self._copy_selected)
+        self.btn_clear = self._button("清空", "清空缓冲（不影响日志文件）")
+        self.btn_clear.clicked.connect(self._clear)
+
+        self.btn_follow = self._button("跟随", "新输出到达时自动滚到底部")
+        self.btn_follow.setCheckable(True)
+        self.btn_follow.setChecked(True)
+        self.btn_follow.toggled.connect(self._on_follow)
+
+        self.btn_bottom = self._button("回到底部", "跳到最新一行并恢复跟随")
+        self.btn_bottom.clicked.connect(self.jump_to_end)
+        self.btn_save = self._button("另存为…", "把当前缓冲导出为文本文件")
+        self.btn_save.clicked.connect(self._save)
+
+        self.search = QLineEdit()
+        self.search.setObjectName("termSearch")
+        self.search.setPlaceholderText("搜索（回车下一个，Shift+回车上一个）")
+        self.search.setFixedWidth(240)
+        self.search.returnPressed.connect(self._search)
+
+        self.status = QLabel("0 行")
+        self.status.setObjectName("termStatus")
+
+        for b in (self.btn_copy_all, self.btn_copy_sel, self.btn_clear):
+            row.addWidget(b)
+        row.addSpacing(6)
+        row.addWidget(self.btn_follow)
+        row.addWidget(self.btn_bottom)
+        row.addWidget(self.btn_save)
+        row.addWidget(self.search)
+        row.addStretch(1)
+        row.addWidget(self.status)
+        return bar
+
+    def _button(self, text: str, tip: str) -> QPushButton:
+        b = QPushButton(text)
+        b.setObjectName("termBtn")
+        b.setToolTip(tip)
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        b.setFlat(True)
+        return b
+
+    # ---- 数据 ----
+
+    def tick(self) -> None:
+        entries = self.console.since(self._seq)
+        if entries:
+            self._seq = entries[-1].seq
+            self._append(entries)
+        self._refresh_status()
+
+    def _append(self, entries) -> None:
+        if len(entries) > 400:
+            # 启动瞬间可能一次几百行：整段插入比逐行 append 快一个量级
+            self.editor.setUpdatesEnabled(False)
+            try:
+                cursor = QTextCursor(self.editor.document())
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                cursor.insertText("\n".join(e.text for e in entries) + "\n")
+            finally:
+                self.editor.setUpdatesEnabled(True)
+        else:
+            for e in entries:
+                self.editor.appendPlainText(e.text)
+        if self.btn_follow.isChecked():
+            self.jump_to_end(scroll_only=True)
+        else:
+            self._pending += len(entries)
+
+    def _refresh_status(self) -> None:
+        total, _seq = self.console.stats()
+        if self.btn_follow.isChecked():
+            self.status.setText("%d 行 · 跟随中" % total)
+        else:
+            self.status.setText("%d 行 · 已暂停%s"
+                                % (total, ("（新 %d 条）" % self._pending)
+                                   if self._pending else ""))
+        self.pal_hint()
+
+    def pal_hint(self) -> None:
+        """错误计数放在状态文字里（不额外占位）：有错误时用错误色。"""
+        total, _seq = self.console.stats()
+        try:
+            errors = sum(1 for e in self.console.since(0) if e.level == "error")
+        except Exception:                                      # noqa: BLE001
+            errors = 0
+        if errors:
+            self.status.setText(self.status.text() + " · 错误 %d" % errors)
+            self.status.setStyleSheet("color:%s;" % self.pal["bad"])
+        else:
+            self.status.setStyleSheet("")
+
+    def _on_follow(self, on: bool) -> None:
+        if on:
+            self._pending = 0
+            self.jump_to_end()
+        self._refresh_status()
+
+    def _on_user_scroll(self, _action: int) -> None:
+        if self.btn_follow.isChecked() and not self._at_bottom():
+            self.btn_follow.setChecked(False)
+
+    def _at_bottom(self) -> bool:
+        bar = self.editor.verticalScrollBar()
+        return bar.value() >= bar.maximum() - 2
+
+    def jump_to_end(self, scroll_only: bool = False) -> None:
+        bar = self.editor.verticalScrollBar()
+        bar.setValue(bar.maximum())
+        if not scroll_only:
+            self._pending = 0
+            if not self.btn_follow.isChecked():
+                self.btn_follow.setChecked(True)
+        self._refresh_status()
+
+    # ---- 动作 ----
+
+    def _flash(self, button: QPushButton, text: str, restore: str) -> None:
+        button.setText(text)
+        QTimer.singleShot(1400, lambda: button.setText(restore))
+
+    def _copy_all(self) -> None:
+        from PySide6.QtWidgets import QApplication
+        text = self.console.text_all()
+        QApplication.clipboard().setText(text)
+        lines, _ = self.console.stats()
+        self._flash(self.btn_copy_all, "已复制 %d 行" % lines, "复制全部")
+
+    def _copy_selected(self) -> None:
+        self.editor.copy()
+
+    def _clear(self) -> None:
+        self.console.clear()
+        self._seq = 0
+        self._pending = 0
+        self.editor.clear()
+        self._refresh_status()
+
+    def _save(self) -> None:
+        import time as _t
+        name = "dsh-console-%s.txt" % _t.strftime("%Y%m%d-%H%M%S")
+        path, _f = QFileDialog.getSaveFileName(self, "导出终端输出", name,
+                                               "文本文件 (*.txt);;所有文件 (*)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.console.text_all() + "\n")
+            self._flash(self.btn_save, "已导出", "另存为…")
+        except OSError as e:
+            self.status.setText("导出失败：%s" % e)
+
+    def _search(self) -> None:
+        needle = self.search.text().strip()
+        if not needle:
+            return
+        backwards = bool(QApplication.keyboardModifiers()
+                         & Qt.KeyboardModifier.ShiftModifier)
+        flags = QTextDocument.FindFlag.FindBackward if backwards else \
+            QTextDocument.FindFlag(0)
+        if self.editor.find(needle, flags):
+            return
+        # 到头了：绕回另一端再找一次
+        cursor = self.editor.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End if backwards
+                            else QTextCursor.MoveOperation.Start)
+        self.editor.setTextCursor(cursor)
+        self.editor.find(needle, flags)
+
+    def apply_theme(self, pal: dict) -> None:
+        self.pal = pal
+        self.setStyleSheet(_terminal_style(pal))
+        self.highlighter.set_palette(pal)
+        self._refresh_status()
 
 
 class InspectorWindow(QWidget):
@@ -540,7 +865,15 @@ class InspectorWindow(QWidget):
         self.profile.setCachePath(os.path.join(store, "cache"))
         self.page = QWebEnginePage(self.profile, self.view)
         self.view.setPage(self.page)
-        root.addWidget(self.view, 1)
+
+        # 两页共用同一条工具条：DevTools 与终端输出随时切换。
+        # 终端页在主线程 300ms 拉一次增量，创建成本可以忽略，所以不懒加载。
+        self.terminal = TerminalView(self.pal)
+        self.body = QStackedWidget(self)
+        self.body.addWidget(self.view)
+        self.body.addWidget(self.terminal)
+        root.addWidget(self.body, 1)
+        self.mode_group.idClicked.connect(self._switch_mode)
 
         self.setStyleSheet(_inspector_style(self.pal))
 
@@ -582,6 +915,22 @@ class InspectorWindow(QWidget):
             pass
         self.lbl_target = target
 
+        self.btn_dev = QPushButton("开发者工具")
+        self.btn_dev.setObjectName("segBtn")
+        self.btn_dev.setCheckable(True)
+        self.btn_dev.setChecked(True)
+        self.btn_dev.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_dev.setToolTip("Chromium 开发者工具：元素 / 控制台 / 网络 / 源码")
+        self.btn_term = QPushButton("终端")
+        self.btn_term.setObjectName("segBtn")
+        self.btn_term.setCheckable(True)
+        self.btn_term.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_term.setToolTip("宿主进程的输出（打包前在终端里能看到的那份）")
+        self.mode_group = QButtonGroup(self)
+        self.mode_group.setExclusive(True)
+        self.mode_group.addButton(self.btn_dev, 0)
+        self.mode_group.addButton(self.btn_term, 1)
+
         self.btn_pin = QPushButton("置顶")
         self.btn_pin.setObjectName("pinBtn")
         self.btn_pin.setCheckable(True)
@@ -591,6 +940,9 @@ class InspectorWindow(QWidget):
 
         lay.addWidget(title)
         lay.addWidget(target, 1)
+        lay.addWidget(self.btn_dev)
+        lay.addWidget(self.btn_term)
+        lay.addSpacing(8)
         lay.addWidget(self.btn_pin)
         return bar
 
@@ -600,6 +952,17 @@ class InspectorWindow(QWidget):
             return ""
         u = page.url()
         return (u.host() + (":%d" % u.port() if u.port() > 0 else "")) if u.host() else ""
+
+    def _switch_mode(self, index: int) -> None:
+        """在「开发者工具」与「终端」之间切换。
+
+        DevTools 不销毁也不重载：断点、选中的元素都保留；只是从布局里藏起来。
+        """
+        self.body.setCurrentIndex(index)
+        if index == 1:
+            self.terminal.tick()
+            if self.terminal.btn_follow.isChecked():
+                self.terminal.jump_to_end(scroll_only=True)
 
     def _toggle_pin(self, on: bool) -> None:
         """切换置顶。
@@ -618,6 +981,9 @@ class InspectorWindow(QWidget):
         self._theme = theme
         self.pal = palette(theme)
         self.setStyleSheet(_inspector_style(self.pal))
+        terminal = getattr(self, "terminal", None)
+        if terminal is not None:
+            terminal.apply_theme(self.pal)
 
     def _attach_legacy(self) -> None:
         """Qt 6.3 之前只有 `setDevToolsPage()` 这一条路。"""

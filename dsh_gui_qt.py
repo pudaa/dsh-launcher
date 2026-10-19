@@ -68,6 +68,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEngineProfile
 
+import dsh_console
 import dsh_devtools
 import dsh_panel
 import dsh_theme
@@ -2161,6 +2162,11 @@ def activate_existing() -> None:
 
 
 def main() -> int:
+    # 装在最前面：打包成 windowed exe 后没有控制台，Chromium 的 `js: ...`、
+    # 崩溃栈这类 C++ 层输出会写向无效的 fd 2。这一行把它们接进环形缓冲，
+    # 开发者面板的「终端」页才有东西可看。有控制台时仍会照常回显。
+    dsh_console.install()
+
     QApplication.setApplicationName("DSH-Web")
     QApplication.setOrganizationName("DSH")
     app = QApplication(sys.argv)
