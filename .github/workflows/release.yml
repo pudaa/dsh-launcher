@@ -164,6 +164,11 @@ jobs:
           import os
           import sys
 
+          # CI runner（Windows）的 stdout 是 cp1252，直接 print 中文会抛
+          # UnicodeEncodeError —— 异常会把"检查通过"变成"退出码 1"。
+          # 项目里 resource_report() 那次踩过同一个坑，这里必须先改编码。
+          sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
           DIST = "build/dsh_gui_qt.dist"
           KEEP = {"zh-CN", "zh-TW", "en-US", "en-GB"}
           bad = []
