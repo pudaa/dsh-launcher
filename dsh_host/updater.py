@@ -70,6 +70,19 @@ class UpdateInfo:
                 best = v
         return best
 
+    def preview_below_current(self) -> list[tuple[str, str]]:
+        """预览通道里版本低于已装版本的 (通道短名, 版本)。
+
+        预览计划取"所有预览通道里最高的一版"，不会为了切到 alpha 而降级。
+        但用户看到"尝鲜通道 0.2.1-alpha.5"却被告知已是最新时，容易以为
+        漏检了 alpha——界面用这个列表补一句解释。
+        """
+        out = []
+        for name, v in (("候选", self.next), ("尝鲜", self.alpha)):
+            if v and parse_version(v) is not None and compare(v, self.current) < 0:
+                out.append((name, v))
+        return out
+
     def summary(self) -> str:
         if self.action == "upgrade":
             label = "稳定通道新版" if self.channel == "latest" else "预览通道新版"
@@ -199,6 +212,16 @@ def _highest(candidates: list[tuple[str, str]]) -> tuple[str, str] | None:
     return best
 
 
+def action_for(current: str, target: str) -> str:
+    """目标相对当前版本是升级 / 降级 / 不动。
+
+    "回滚 / 回归稳定版"走的是手工指定 target 的路径，不能一律写成
+    upgrade：降级要触发对话框里的"旧版本可能打不开新会话"警告。
+    """
+    c = compare(target, current)
+    return "upgrade" if c > 0 else ("downgrade" if c < 0 else "none")
+
+
 def decide(install: contract.DshInstall, tags: dict, prerelease_opt_in: bool) -> UpdateInfo:
     """根据通道策略决定目标版本。
 
@@ -218,8 +241,7 @@ def decide(install: contract.DshInstall, tags: dict, prerelease_opt_in: bool) ->
     if prerelease_opt_in and preview and compare(preview[0], stable) > 0:
         target, channel = preview
 
-    c = compare(target, install.version)
-    action = "upgrade" if c > 0 else ("downgrade" if c < 0 else "none")
+    action = action_for(install.version, target)
     return UpdateInfo(current=install.version, stable=stable,
                       next=tags.get("next"), alpha=tags.get("alpha"),
                       target=target, channel=channel, action=action, tags=tags)

@@ -271,6 +271,37 @@ bat 等待 PID 消失 → `move` 备份旧版 → `move` 放入新版 → 重启
 第 1 条最阴——`move` 失败时不报错、不返回非零之外的信息，表现是"更新流程全跑完了但版本没变"。
 回归断言：`tools/gui_selftest.py` 的 `host_update_checks()` 会检查生成的 bat 里路径全是反斜杠。
 
+### 查询的三路降级（2026-10-19 加）
+
+**症状**：连续点「检查桌面壳更新」，弹出"无法获取发行信息（可能是网络问题，或尚未发布任何版本）"，
+但仓库明明有 v2.3.0。
+
+**根因**：GitHub API 未登录限额 60 次/小时/IP。实测 `GET /repos/.../releases/latest`
+返回 `403 API rate limit exceeded`、`X-RateLimit-Remaining: 0`。旧代码把 403 的
+错误 JSON 当普通响应解析，找不到 `tag_name`，只能报一句泛化错误。
+
+**三路降级**（`fetch_latest_release`）：
+
+1. GitHub API —— 有 release body / 资产大小，但吃 60 次/小时配额；
+2. `releases/latest` 的 302 跳转 —— 从 `Location` 里的 `/tag/vX.Y.Z` 取版本；
+3. `releases.atom` —— 不占配额，还能取到说明与发布时间。
+
+后两路都走 `github.com` 普通页面。资产地址按
+`/releases/download/<tag>/DSH-Web.exe` 拼；下载阶段仍然校验 MZ 与 5MB 下限，
+所以即使 GitHub 给的是错误页也进不了替换流程。Atom 与 302 的 tag 必须一致，
+否则只带版本号、不把旧说明挂到新版本上。
+
+回归断言：`tools/gui_selftest.py::host_update_checks()` 用固定 Atom 样本
+验证解析、资产 URL、API 失败降级、Atom 不可用时仅 302 降级，全程不联网。
+
+> 注：这只解决"查询"。GitHub Release 下载走 `github.com` →
+> `release-assets.githubusercontent.com`，与 API 配额无关；实测 120MB 资产
+> 可正常 HEAD 到 Content-Length。
+
+更新说明的格式：API 的 `body` 是 markdown，Atom fallback 的 `content` 是 HTML。
+界面统一交给 `dsh_theme.NotesView`（QTextBrowser）渲染，实现细节与 Qt 坑
+见 `docs/ui-guidelines.md` §12。
+
 ### 安全边界
 
 只从**官方 GitHub Release** 拉取，且：

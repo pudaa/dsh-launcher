@@ -266,6 +266,68 @@ def host_update_checks() -> list[str]:
         failures.append("版本比较")
         print("        异常用例:", bad)
 
+    # 1b. GitHub API 限额时的兜底（2026-10-19 老大连续检查撞上 403 rate limit）。
+    #     API 未登录只有 60 次/小时/IP；releases/latest 的 302 与 releases.atom
+    #     都不占配额。这里用假数据钉住解析与降级顺序，不联网。
+    atom = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <id>tag:github.com,2008:Repository/1/v9.9.9</id>
+    <link rel="alternate" type="text/html"
+          href="https://github.com/pudaa/dsh-launcher/releases/tag/v9.9.9"/>
+    <title>v9.9.9 — 测试版本</title>
+    <updated>2026-10-19T03:17:56Z</updated>
+    <content type="html">&lt;h2&gt;标题&lt;/h2&gt;&lt;p&gt;正文&lt;/p&gt;</content>
+  </entry>
+</feed>"""
+    rel = su._parse_atom_release(atom)
+    ok = (rel is not None and rel.version == "9.9.9" and rel.tag == "v9.9.9"
+          and rel.has_asset and rel.asset.name == su.HOST_ASSET_NAME
+          and rel.asset.url.endswith("/releases/download/v9.9.9/DSH-Web.exe")
+          and "标题" in rel.notes and "正文" in rel.notes
+          and rel.notes_format == "html"
+          and rel.published_at == "2026-10-19")
+    print(f"  [{'OK  ' if ok else 'FAIL'}] Atom feed 可解析出 tag / 说明 / 资产地址")
+    if not ok:
+        failures.append("Atom 解析")
+        print("        rel=", rel)
+
+    orig_json, orig_read = su._http_json, su._http_read
+    try:
+        # API 全部失败；302 与 Atom 都可用 → 必须返回 Atom 的说明
+        su._http_json = lambda *a, **k: None
+
+        def fake_read(url, timeout=20):
+            if url.endswith("/releases/latest"):
+                return ("https://github.com/pudaa/dsh-launcher/releases/tag/v9.9.9", b"")
+            if url.endswith("/releases.atom"):
+                return ("https://github.com/pudaa/dsh-launcher/releases.atom",
+                        atom.encode("utf-8"))
+            return None
+
+        su._http_read = fake_read
+        rel = su.fetch_latest_release(timeout=1)
+        ok = (rel is not None and rel.version == "9.9.9"
+              and rel.has_asset and "正文" in rel.notes)
+        print(f"  [{'OK  ' if ok else 'FAIL'}] API 限额时自动降级到页面/Atom")
+        if not ok:
+            failures.append("API 降级")
+
+        # 连 Atom 都拿不到时，302 的 tag 仍足以发现新版本
+        def fake_read_no_atom(url, timeout=20):
+            if url.endswith("/releases/latest"):
+                return ("https://github.com/pudaa/dsh-launcher/releases/tag/v9.9.9", b"")
+            return None
+
+        su._http_read = fake_read_no_atom
+        rel = su.fetch_latest_release(timeout=1)
+        ok = rel is not None and rel.version == "9.9.9" and rel.has_asset
+        print(f"  [{'OK  ' if ok else 'FAIL'}] Atom 不可用时仍能从 302 取到版本")
+        if not ok:
+            failures.append("302 降级")
+    finally:
+        su._http_json, su._http_read = orig_json, orig_read
+
     # 2. 源码运行时不支持自更新（避免替换掉开发的 py 文件）
     supported, reason = su.self_update_supported()
     ok = (supported is False) and bool(reason)
@@ -879,6 +941,21 @@ def theme_checks() -> list[str]:
     check("菜单右下没有半透明暗边（阴影未裁切）", dark == 0,
           "半透明暗像素 %d" % dark)
     live.close()
+
+    # 更新说明：markdown / html 都要渲染，不能把标记原样打出来。
+    notes = dsh_theme.NotesView(pal=dsh_theme.palette("light"))
+    notes.show_notes("## 标题\n\n正文 **加粗**\n\n    print(1)\n", "markdown")
+    plain = notes.document().toPlainText()
+    check("更新说明 markdown 已渲染（无 ## / 代码围栏）",
+          "标题" in plain and "##" not in plain and "```" not in plain)
+    check("更新说明代码字体已换成 Cascadia Mono",
+          "Courier New" not in notes.document().toHtml())
+    notes.show_notes("<p>正文</p><script>alert(1)</script>"
+                     "<img src='https://example.com/x.png'>", "html")
+    check("更新说明 HTML 去掉了 script / img",
+          "alert" not in notes.document().toPlainText()
+          and "<img" not in notes.document().toHtml().lower())
+    check("更新说明视图只读", notes.isReadOnly())
 
     # 防止以后有人把菜单换回裸 QMenu：裸 QMenu 的 show() 不经过 aboutToShow。
     src = open(os.path.join(ROOT, "dsh_gui_qt.py"), encoding="utf-8").read()

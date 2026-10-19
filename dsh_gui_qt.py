@@ -796,8 +796,7 @@ class UpdateDialog(QDialog):
         detail.setObjectName("dlgHint")
         lay.addWidget(detail)
 
-        self.log = QPlainTextEdit()
-        self.log.setReadOnly(True)
+        self.log = dsh_theme.NotesView()
         lay.addWidget(self.log, 1)
 
         row = QHBoxLayout()
@@ -828,8 +827,9 @@ class UpdateDialog(QDialog):
                     "如需获取，请在托盘菜单里勾选「加入预览计划」。" % newer)
 
         if self.info.action == "downgrade":
+            label = "稳定版" if self.info.channel == "latest" else "旧版本"
             self.headline.setText(
-                f"将把 DSH 从 {self.info.current} 切回稳定版 {self.info.target}。\n\n"
+                f"将把 DSH 从 {self.info.current} 切回{label} {self.info.target}。\n\n"
                 "注意：旧版本可能打不开新版本产生的会话记录。"
                 "这些记录不会被删除，只是旧版本读不了——这是上游的格式版本机制，"
                 "我们无法规避。" + hint)
@@ -844,7 +844,7 @@ class UpdateDialog(QDialog):
 
     def _load_notes(self):
         self.notes_btn.setEnabled(False)
-        self.log.appendPlainText("正在获取更新说明（GitHub，可能较慢）…")
+        self.log.setPlainText("正在获取更新说明（GitHub，可能较慢）…")
         self._notes = NotesWorker(self.info.target)
         self._notes.ready.connect(self._on_notes)
         self._notes.start()
@@ -852,9 +852,9 @@ class UpdateDialog(QDialog):
     def _on_notes(self, text: str):
         self.notes_btn.setEnabled(True)
         if not text:
-            self.log.appendPlainText("未能获取更新说明（网络原因或该版本无发布说明）。")
+            self.log.setPlainText("未能获取更新说明（网络原因或该版本无发布说明）。")
             return
-        self.log.appendPlainText("\n===== 更新说明 =====\n" + text.strip() + "\n")
+        self.log.show_notes(text, "markdown")
 
     def _start(self):
         self.go_btn.setEnabled(False)
@@ -925,8 +925,7 @@ class HostUpdateDialog(QDialog):
         detail.setObjectName("dlgHint")
         lay.addWidget(detail)
 
-        self.log = QPlainTextEdit()
-        self.log.setReadOnly(True)
+        self.log = dsh_theme.NotesView()
         lay.addWidget(self.log, 1)
 
         row = QHBoxLayout()
@@ -946,14 +945,14 @@ class HostUpdateDialog(QDialog):
         dsh_theme.style_dialog(self)
 
         if rel.notes:
-            self.log.setPlainText(rel.notes.strip())
+            self.log.show_notes(rel.notes, rel.notes_format)
 
     def _load_notes(self):
         self.notes_btn.setEnabled(False)
         if self.rel.notes:
-            self.log.setPlainText(self.rel.notes.strip())
+            self.log.show_notes(self.rel.notes, self.rel.notes_format)
         else:
-            self.log.setPlainText("该版本没有附带更新说明。")
+            self.log.show_notes("", "text")
         self._append_meta()
 
     def _append_meta(self):
@@ -1728,6 +1727,13 @@ class MainWindow(QMainWindow):
                 hint = ("\n\n预览通道上已有更新的 %s。\n"
                         "要获取它，请在托盘菜单里勾选「加入预览计划」。" % newer
                         ) if newer else ""
+                lower = info.preview_below_current()
+                if lower:
+                    # 典型场景：已装 0.2.1-rc.2，尝鲜通道 0.2.1-alpha.5。
+                    # 预览计划取最高预览版，不降级；不解释一句用户会以为漏检。
+                    hint += ("\n\n说明　　%s 低于已安装版本（alpha < beta < rc）。\n"
+                             "　　　　预览计划取预览通道最高版，不会自动降级。"
+                             % "、".join("%s %s" % (n, v) for n, v in lower))
                 self._info("当前已是最新版本。\n\n"
                            "已安装　　　DSH %s\n"
                            "检查通道　　%s\n"
@@ -1803,7 +1809,9 @@ class MainWindow(QMainWindow):
                 alpha=self.update_info.alpha if self.update_info else None,
                 target=target,
                 channel=channel,
-                action="upgrade" if target != self.handle.install.version else "none",
+                # 手工回滚的目标可能比已装版本低：必须标成 downgrade，
+                # 否则对话框会把"降级"说成"更新"、也不给旧版兼容性警告。
+                action=updater.action_for(self.handle.install.version, target),
             )
         dlg = UpdateDialog(self, info, self.handle)
         if dlg.exec() == QDialog.DialogCode.Accepted and dlg.new_handle:

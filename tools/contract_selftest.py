@@ -106,6 +106,23 @@ def channel_logic_checks():
     check("已装最新 RC 时不再误报预览通道有更新",
           updater.decide(SimpleNamespace(version="0.1.7-rc.2"), T, False).newer_preview() is None)
 
+    # E：已装 RC 高于 alpha 时，"已是最新"必须能解释为什么 alpha 不升。
+    #    2026-10-19 老大实测：已装 0.2.1-rc.2，看到尝鲜通道 0.2.1-alpha.5
+    #    却"检查不到更新"，以为漏检。预览计划取最高预览版，不自动降级。
+    E = {"latest": "0.2.0-rc.2", "next": "0.2.1-rc.2", "alpha": "0.2.1-alpha.5"}
+    Einfo = updater.decide(SimpleNamespace(version="0.2.1-rc.2"), E, True)
+    check("已装 RC 时能指出 alpha 低于当前（界面解释用）",
+          Einfo.action == "none"
+          and Einfo.preview_below_current() == [("尝鲜", "0.2.1-alpha.5")],
+          f"action={Einfo.action} lower={Einfo.preview_below_current()}")
+    check("action_for 区分升级 / 降级 / 不动",
+          (updater.action_for("0.2.1-rc.2", "0.2.1-alpha.4") == "downgrade"
+           and updater.action_for("0.2.1-alpha.4", "0.2.1-rc.2") == "upgrade"
+           and updater.action_for("0.2.1-rc.2", "0.2.1-rc.2") == "none"))
+    check("已装 alpha 本身时不被列为「低于当前」",
+          updater.decide(SimpleNamespace(version="0.2.1-alpha.5"), E, True)
+          .preview_below_current() == [])
+
 
 def install_cache_checks():
     """安装缓存与"版本复验"快路径的纯逻辑回归（不需要装 DSH）。

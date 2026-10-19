@@ -33,13 +33,16 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import ssl
 import subprocess
 import sys
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
 from . import config
@@ -72,6 +75,8 @@ class HostRelease:
     published_at: str
     asset: ReleaseAsset | None = None
     prerelease: bool = False
+    #: 更新说明的格式：API 是 markdown，Atom 的 content 是 HTML。
+    notes_format: str = "markdown"
 
     @property
     def has_asset(self) -> bool:
@@ -174,6 +179,104 @@ def _http_json(url: str, timeout: float = 20) -> dict | None:
     return None
 
 
+def _http_read(url: str, timeout: float = 20) -> tuple[str, bytes] | None:
+    """GET 普通网页，返回 (最终 URL, 响应体)；失败返回 None。
+
+    这是 **API 之外** 的通道：GitHub 对未登录 API 限制 60 次/小时/IP，
+    而 releases 页面与 releases.atom 不消耗这个配额。2026-10-19 老大
+    连续点"检查桌面壳更新"时正好撞上 403 rate limit，报"无法获取发行信息"。
+
+    与 `_http_json` 一样先正常证书、失败再放宽。
+    """
+    for ctx in (ssl.create_default_context(), ssl._create_unverified_context()):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+                return r.geturl(), r.read()
+        except (urllib.error.URLError, OSError, ValueError):
+            continue
+    return None
+
+
+def _tag_from_release_url(url: str) -> str | None:
+    """从 `.../releases/tag/v2.3.0` 里取 tag。"""
+    m = re.search(r"/releases/tag/([^/?#]+)", url or "")
+    return urllib.parse.unquote(m.group(1)) if m else None
+
+
+def _release_from_tag(tag: str, notes: str = "", published_at: str = "",
+                      prerelease: bool = False,
+                      notes_format: str = "markdown") -> HostRelease:
+    """用 tag 构造一个 release 描述（不依赖 API 的资产元数据）。
+
+    资产地址按 GitHub 的固定规则拼：`/releases/download/<tag>/<asset>`。
+    体积留 0——对话框会省略"约 X MB"，下载阶段本来就会校验 MZ 与最小体积。
+    """
+    version = tag.lstrip("v")
+    return HostRelease(
+        version=version,
+        tag=tag,
+        notes=(notes or "").strip(),
+        html_url=f"https://github.com/{HOST_REPO}/releases/tag/{tag}",
+        published_at=(published_at or "").strip(),
+        asset=ReleaseAsset(
+            name=HOST_ASSET_NAME,
+            url=f"https://github.com/{HOST_REPO}/releases/download/{tag}/{HOST_ASSET_NAME}",
+            size=0,
+        ),
+        prerelease=bool(prerelease),
+        notes_format=notes_format,
+    )
+
+
+def _parse_atom_release(text: str) -> HostRelease | None:
+    """解析 releases.atom 的第一条 entry。
+
+    feed 里同时有标题、发布时间和正文，正好补上 API 拿不到的说明。
+    """
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return None
+    ns = {"a": "http://www.w3.org/2005/Atom"}
+    entry = root.find("a:entry", ns)
+    if entry is None:
+        return None
+    link = entry.find("a:link", ns)
+    tag = _tag_from_release_url(link.get("href", "") if link is not None else "")
+    if not tag:
+        return None
+    title = (entry.findtext("a:title", "", ns) or "").strip()
+    updated = (entry.findtext("a:updated", "", ns) or "").strip()
+    content = entry.findtext("a:content", "", ns) or ""
+    # Atom 的 content 本身就是 HTML，保留给 NotesView 渲染；不要压成纯文本。
+    notes = content.strip() or title
+    return _release_from_tag(tag, notes=notes, published_at=updated[:10],
+                             notes_format="html")
+
+
+def _fallback_release(timeout: float = 20) -> HostRelease | None:
+    """API 不可用时的兜底：`releases/latest` 的 302 跳转 + Atom feed。
+
+    两个入口都是 github.com 的普通页面，不占 API 配额。**先看 302**：
+    "最新版本是哪个"以它为准；Atom 只用来补说明和发布时间。
+    如果 Atom 还没刷到同一个 tag（CDN 缓存），就只带版本号返回，
+    不要把旧版本的说明挂到新版本上。
+    """
+    redirect = _http_read(f"https://github.com/{HOST_REPO}/releases/latest", timeout)
+    latest_tag = _tag_from_release_url(redirect[0]) if redirect else None
+
+    atom = _http_read(f"https://github.com/{HOST_REPO}/releases.atom", timeout)
+    atom_rel = (_parse_atom_release(atom[1].decode("utf-8", "ignore"))
+                if atom else None)
+
+    if latest_tag:
+        if atom_rel is not None and atom_rel.tag == latest_tag:
+            return atom_rel
+        return _release_from_tag(latest_tag)
+    return atom_rel
+
+
 def _parse_release(data: dict) -> HostRelease | None:
     if not isinstance(data, dict):
         return None
@@ -202,6 +305,7 @@ def _parse_release(data: dict) -> HostRelease | None:
         published_at=(data.get("published_at") or "")[:10],
         asset=asset,
         prerelease=bool(data.get("prerelease")),
+        notes_format="markdown",
     )
 
 
@@ -211,6 +315,11 @@ def fetch_latest_release(timeout: float = 20,
 
     单次 `releases/latest` 会跳过预发布版；要拿到预发布就得列全部再挑。
     这里的"预发布"与 DSH 的 alpha 通道无关——是桌面壳自己的。
+
+    三路降级（2026-10-19 加后两路）：
+      1. GitHub API（有说明与资产大小，但未登录只有 60 次/小时/IP）
+      2. Atom feed（不占配额，有说明）
+      3. `releases/latest` 302 跳转解析 tag（不占配额，只有版本号）
     """
     if not include_prerelease:
         data = _http_json(f"https://api.github.com/repos/{HOST_REPO}/releases/latest", timeout)
@@ -219,13 +328,13 @@ def fetch_latest_release(timeout: float = 20,
             return rel
         # latest 接口在没有正式 release 时返回 404，退回去列全部
     data = _http_json(f"https://api.github.com/repos/{HOST_REPO}/releases?per_page=10", timeout)
-    if not isinstance(data, list):
-        return None
-    for item in data:
-        rel = _parse_release(item)
-        if rel:
-            return rel
-    return None
+    if isinstance(data, list):
+        for item in data:
+            rel = _parse_release(item)
+            if rel:
+                return rel
+    # API 可能 403（未登录限额）或整体不可达；页面/Atom 不占配额。
+    return _fallback_release(timeout)
 
 
 def check_host_update(timeout: float = 20) -> tuple[HostRelease | None, str]:
@@ -240,7 +349,8 @@ def check_host_update(timeout: float = 20) -> tuple[HostRelease | None, str]:
         return None, f"检查失败：{e}"
 
     if rel is None:
-        return None, "无法获取发行信息（可能是网络问题，或尚未发布任何版本）。"
+        return None, ("无法获取发行信息（GitHub API 限额、网络问题，或尚未发布任何版本）。\n"
+                      f"可直接到 https://github.com/{HOST_REPO}/releases 查看。")
 
     if not is_newer(rel.version, HOST_VERSION):
         return None, f"已是最新版本（v{HOST_VERSION}）。"

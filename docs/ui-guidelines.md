@@ -156,6 +156,7 @@ Qt 的 `:focus` 没有这个区分。我们的选择是**一律不画环**，用
 | 控制面板 | `dsh_panel.py` | 自绘圆角 + 固定 880×600；三块色带画在裁剪路径内；**贴角的关闭键要自带同半径圆角**，子控件不会被父级裁剪 |
 | 托盘菜单 | `dsh_theme.Menu` + `apply_menu` | 圆角前提是半透明底；**每次显示都必须清掉 QWindows11Style 装的 QGraphicsDropShadowEffect**，否则它按矩形裁切，在右下露出黑边（见 §11.2） |
 | 提示窗 | `dsh_theme.MessageDialog` | 替代 `QMessageBox`；图标取 Lucide |
+| 更新说明 | `dsh_theme.NotesView` | QTextBrowser 渲染 markdown / HTML；标题、列表、代码块、链接、表格都按 DSH 令牌；不要退回 QPlainTextEdit |
 | 更新/引导对话框 | `dsh_theme.style_dialog` + `dlgTitle/dlgBody/dlgHint` | 统一字号与按钮形态 |
 | 启动加载页 | `dsh_theme.style_loading_page` | 深色界面不闪白 |
 | 开发者工具窗口 | `dsh_devtools.InspectorWindow` | 顶部 32px 工具条 + 置顶 |
@@ -168,6 +169,7 @@ Qt 的 `:focus` 没有这个区分。我们的选择是**一律不画环**，用
 - **不在深色主题里用 `#ffffff` 纯白文字**（用 `#f9fafb`）。
 - **不给按钮加系统焦点框**。
 - **不用 `QMessageBox` / 裸 `QMenu`** 直接上界面；菜单统一走 `dsh_theme.Menu`。
+- **不用 QPlainTextEdit 显示更新说明**（会把 `##` / `<p>` 原样打出来）；统一走 `dsh_theme.NotesView`。
 
 ## 11. 半透明只用来做圆角，不是"淡淡透一层"
 
@@ -233,3 +235,27 @@ offset 到右下的阴影被窗口边缘硬裁，正好露出 3px。
 右/下**直边中段** 3px（避开圆角抗锯齿）不应有半透明暗像素；真机截图确认
 右/下与桌面背景一致，无渐变、无硬边。
 
+
+
+## 12. 更新说明的富文本渲染（2026-10-19）
+
+`NotesView(QTextBrowser)` 统一渲染 DSH 更新说明与桌面壳 release notes：
+
+- API 的 `body` 是 markdown → `QTextDocument.setMarkdown`；
+- Atom fallback 的 `content` 是 HTML → `setHtml`；
+- 纯文本（错误/占位）→ `setPlainText`。
+
+四个 Qt 坑（都已加回归断言）：
+
+1. **QTextDocument 的 HTML CSS 认标准 `#RRGGBB`，不认 QSS 的 `#AARRGGBB`**。
+   令牌里的 alpha 色要先 `_solid()` 合成到底色，否则 `#1a000000` 会被当成近黑色。
+2. `setMarkdown` 生成的 HTML 带内联 style，优先级高于 `defaultStyleSheet`：
+   块级 style 要剥掉；代码字体 `Courier New` 要替换成 Cascadia Mono。
+3. `headingLevel` 会再按 1.5x/1.17x 放大；且从旧 `QTextCharFormat` 复制会保留字号
+   resolve，`setFont()` 不生效。必须先 `setHeadingLevel(0)`，再用**全新**
+   `QTextCharFormat` + `setFont`，并用 `setCharFormat`（`mergeCharFormat` 不可靠）。
+4. `pre` 的 CSS background 不画；用 `QTextBlockFormat.setBackground()`。
+   Qt 会把代码块每行拆成独立 block，上下 margin 置 0 才连续。
+
+验证：`tools/gui_selftest.py::theme_checks()` 检查 markdown 无 `##`/代码围栏、
+代码字体替换、HTML 去掉 script/img、只读；真机截图按明/暗两套检查。
