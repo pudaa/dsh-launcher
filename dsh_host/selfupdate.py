@@ -27,10 +27,12 @@ Windows 不允许覆盖正在运行的 exe（文件被锁）。标准解法是�
   4. 替换前把当前 exe 备份为 `DSH-Web.exe.old`，失败可人工恢复
 
 **没有做代码签名校验。** 若将来要对外大规模分发，应考虑加上
-（需要证书），或至少校验 SHA-256（可在 Release 资产里附带校验文件）。
+（需要证书）。作为补偿，GitHub API 在资产里给了 `digest`（sha256）时
+我们会逐字节比对——字段只在较新的 release 上才有，所以是"有就校验"。
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -39,6 +41,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -66,6 +69,9 @@ class ReleaseAsset:
     name: str
     url: str
     size: int
+    #: GitHub 给的完整性摘要，形如 "sha256:abc..."。老 release 的 API
+    #: 不带这个字段，所以只能"有就校验"。
+    digest: str = ""
 
 
 @dataclass
@@ -334,6 +340,7 @@ def _parse_release(data: dict) -> HostRelease | None:
                 name=a["name"],
                 url=a.get("browser_download_url") or "",
                 size=int(a.get("size") or 0),
+                digest=(a.get("digest") or "").strip(),
             )
             break
 
@@ -444,60 +451,320 @@ def check_host_update(timeout: float = 20) -> tuple[HostRelease | None, str]:
 
 
 # ------------------------------------------------------------------ 下载
+#
+# 为什么要分段并行 + 续传（2026-10-20 加）
+# --------------------------------------
+# 老大的反馈：从 GitHub 下一个 100 MB 的 exe，要等极长时间。
+#
+# 实测（就是 v2.3.9 的资产，107 MB，走本机代理）：
+#
+#     GitHub 对**单条连接**只给约 40 KB/s（连续 140 秒稳定在 0.04 MB/s）
+#     → 整包要 40 分钟以上
+#     而资产域名支持 Range：`Range: bytes=0-0` 回 206 +
+#     `Content-Range: bytes 0-0/107207168`
+#
+# 40 KB/s 这种数字不是"网速慢"能解释的——同样的链路单独拉别的站并不慢，
+# 更像是按连接限速。这类瓶颈**多开连接就能绕过**：把文件切成几段并行拉，
+# 用连接数换带宽。
+#
+# 附带的两个好处：
+#
+#   1. 某一段断了只补那一段（带 Range 续传），不必整包重下。这在
+#      40 KB/s 的链路上是决定性的——一次断流就省掉半小时。
+#   2. 每段独立校验长度，比"下完了看总字节数"更早发现被截断。
+#
+# 单连接路径**必须保留**：服务端不支持 Range（老 release、中间代理剥离
+# 了头）、体积太小不值得开线程、或者任何一环没按预期返回 206 时，
+# 一律安静地退回它。宁可慢，不能下不到。
+
+#: 小于这个体积不值得并行：建连（含 302 跳转 + TLS 握手）本身要花钱。
+PARALLEL_MIN_BYTES = 4 * 1024 * 1024
+
+#: 每段目标体积。段数 = 总体积 / 这个值，上限 PARALLEL_MAX_WORKERS。
+#: 12 MB 是实测折中：这条链路上连接越多越快（6 条 0.21 MB/s、8 条 0.42 MB/s，
+#: 单条 0.04 MB/s），所以宁可多切几段；再小则建连（302 + TLS 握手）占比就上来了。
+PARALLEL_SEGMENT_BYTES = 12 * 1024 * 1024
+
+#: 同时最多几条连接。再多对 GitHub 不礼貌，且末端带宽未必还要得动。
+PARALLEL_MAX_WORKERS = 8
+
+#: 单段失败后的最多重试次数（每次带 Range 续传，不重下已收到的部分）。
+PART_RETRIES = 3
+
+
+class _NoRange(Exception):
+    """服务端没按段返回（Range 不可用）。内部信号，不会外泄给使用者。"""
+
+
+def _ssl_contexts() -> tuple:
+    """TLS 上下文：先按系统信任链校验，失败再退回不校验。
+
+    后者是老代码就有的兜底——有些公司网络/代理会换掉证书链。放在这里
+    是为了让单连接与分段两条路径共用同一套"先严后宽"的顺序。
+    """
+    return (ssl.create_default_context(), ssl._create_unverified_context())
+
+
+def _request(url: str, extra: dict | None = None) -> urllib.request.Request:
+    headers = {"User-Agent": UA}
+    if extra:
+        headers.update(extra)
+    return urllib.request.Request(url, headers=headers)
+
+
+class _Progress:
+    """跨线程汇总已下载字节，并按 512 KB / 120 ms 节流回调。
+
+    节流的理由（2026-10-20 体检）：以前每 64 KB 回调一次，120 MB 的包
+    ≈1900 次跨线程信号，每次都要写一遍日志文件 + 往 QTextCursor 里插一行。
+    改成"每 512 KB 或每 120 ms 一次"，观感不变（进度按百分比走），
+    开销降到 1/8 以下。
+
+    并行时回调会被多条线程同时触发，所以**在锁里**调用回调：串行化这点
+    开销（每次几微秒）远小于让每个调用方自己防重入的麻烦。
+    """
+
+    def __init__(self, on_progress, total: int):
+        self._cb = on_progress
+        self._total = int(total or 0)
+        self._done = 0
+        self._lock = threading.Lock()
+        self._last_emit = 0
+        self._last_at = time.monotonic()
+
+    def add(self, n: int) -> None:
+        with self._lock:
+            self._done += n
+            if not self._cb:
+                return
+            now = time.monotonic()
+            if (self._done - self._last_emit >= 512 * 1024
+                    or now - self._last_at >= 0.12):
+                self._last_emit, self._last_at = self._done, now
+                self._cb(self._done, self._total)
+
+    def finish(self) -> None:
+        with self._lock:
+            if self._cb:
+                self._cb(self._done, self._total or self._done)
+
+
+def _worker_count(total: int) -> int:
+    """按体积决定开几条连接。
+
+    `DSH_DL_WORKERS` 可以覆盖（1 = 强制单连接）。留这个口子是因为
+    "多少连接合适"跟具体网络有关，出问题时不想动代码就能试。
+    """
+    env = (os.environ.get("DSH_DL_WORKERS") or "").strip()
+    if env.isdigit():
+        return max(1, min(int(env), 16))
+    if total < PARALLEL_MIN_BYTES:
+        return 1
+    segments = -(-total // PARALLEL_SEGMENT_BYTES)      # 向上取整
+    return max(2, min(PARALLEL_MAX_WORKERS, segments))
+
+
+def _split(total: int, workers: int) -> list[tuple[int, int]]:
+    """把 [0, total) 均分成 workers 段，返回闭区间 (start, end)。"""
+    part = -(-total // workers)
+    spans = []
+    for i in range(workers):
+        start = i * part
+        end = min(total, start + part) - 1
+        if start <= end:
+            spans.append((start, end))
+    return spans
+
+
+def _download_single(url: str, dest: str, on_progress, timeout: float,
+                     total: int = 0) -> int:
+    """单连接整包下载，返回落盘字节数。失败抛 SelfUpdateError。"""
+    ok = False
+    got = 0
+    for ctx in _ssl_contexts():
+        got = 0
+        try:
+            with urllib.request.urlopen(_request(url), timeout=timeout,
+                                        context=ctx) as r, open(dest, "wb") as f:
+                expected = int(r.headers.get("Content-Length") or 0) or total
+                progress = _Progress(on_progress, expected)
+                while True:
+                    chunk = r.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    got += len(chunk)
+                    progress.add(len(chunk))
+                progress.finish()
+            ok = True
+            break
+        except (urllib.error.URLError, OSError) as e:
+            if got:
+                # 已经下了一部分还失败 → 换证书上下文重来也没意义
+                raise SelfUpdateError(f"下载中断：{e}") from e
+            continue
+    if not ok:
+        raise SelfUpdateError("下载失败，请检查网络连接。")
+    return got
+
+
+def _fetch_part(url: str, dest: str, start: int, end: int,
+                progress: _Progress, stop: threading.Event,
+                timeout: float) -> int:
+    """把 [start, end] 写到 dest 的对应偏移处，返回字节数。
+
+    每条线程开**自己的**文件句柄、只写自己那一段：共享句柄会牵扯文件位置
+    指针，而不同句柄写同一文件的不相交区间在 Windows 上是安全的
+    （普通文件没有强制锁）。
+
+    断流不算失败——按已收到的字节数带 Range 续传，最多 PART_RETRIES 次。
+    """
+    want = end - start + 1
+    got = 0
+    attempt = 0
+    last_err = ""
+    while got < want:
+        if stop.is_set():
+            raise SelfUpdateError("已取消")
+        attempt += 1
+        for ctx in _ssl_contexts():
+            try:
+                req = _request(url, {"Range": "bytes=%d-%d" % (start + got, end)})
+                with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+                    if r.status != 206:
+                        # 服务端忽略了 Range、回了整包 → 分段方案不成立
+                        raise _NoRange("status=%s" % r.status)
+                    with open(dest, "r+b") as f:
+                        f.seek(start + got)
+                        while got < want:
+                            chunk = r.read(65536)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            got += len(chunk)
+                            progress.add(len(chunk))
+                break
+            except _NoRange:
+                raise
+            except (urllib.error.URLError, OSError) as e:
+                last_err = "%s: %s" % (type(e).__name__, e)
+                if got:
+                    # 已经写进去一部分 → 续传比换上下文更划算
+                    break
+                continue
+        if got >= want:
+            return got
+        if attempt > PART_RETRIES:
+            raise SelfUpdateError("下载中断（这段已重试 %d 次）：%s"
+                                  % (PART_RETRIES, last_err or "连接提前结束"))
+        time.sleep(min(1.5 * attempt, 5.0))
+    return got
+
+
+def _download_parallel(url: str, dest: str, total: int, workers: int,
+                       on_progress, timeout: float) -> int:
+    """分段并行下载到 dest（同一条文件，各写各的区间）。
+
+    先把文件撑到最终大小，因此**不需要事后拼接**——省掉一次 100 MB 级的
+    读写。任何一段失败就设 stop 让其他段提前收手，然后整包作废。
+    """
+    spans = _split(total, workers)
+    with open(dest, "wb") as f:
+        f.truncate(total)
+
+    progress = _Progress(on_progress, total)
+    stop = threading.Event()
+    errors: list[str] = []
+    got_parts = [0] * len(spans)
+    lock = threading.Lock()
+
+    def one(idx: int, start: int, end: int) -> None:
+        try:
+            got_parts[idx] = _fetch_part(url, dest, start, end,
+                                         progress, stop, timeout)
+        except _NoRange:
+            with lock:
+                errors.append("\x00norange")
+            stop.set()
+        except Exception as e:                                 # noqa: BLE001
+            with lock:
+                errors.append(str(e) or type(e).__name__)
+            stop.set()
+
+    threads = [threading.Thread(target=one, args=(i, s, e), daemon=True,
+                                name="dsh-dl-%d" % i)
+               for i, (s, e) in enumerate(spans)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    if errors and errors[0] == "\x00norange":
+        raise _NoRange("服务端不支持分段下载")
+    if errors:
+        raise SelfUpdateError(errors[0])
+
+    done = sum(got_parts)
+    if done != total:                     # 逻辑兜底：每段都该恰好拉满
+        raise SelfUpdateError("下载不完整：收到 %d 字节，应为 %d 字节，已放弃。"
+                              % (done, total))
+    progress.finish()
+    return done
+
+
+def _verify_digest(path: str, digest: str) -> None:
+    """比对 GitHub API 给的 `sha256:...` 摘要；字段缺失（老 release）时跳过。
+
+    只校验 sha256，别的算法（将来可能有 sha512）直接放过——不认识就当没给，
+    不要因为"看不懂"把更新挡下来。
+    """
+    algo, _, want = (digest or "").partition(":")
+    algo, want = algo.strip().lower(), want.strip().lower()
+    if algo != "sha256" or len(want) != 64:
+        return
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(block)
+    if h.hexdigest() != want:
+        raise SelfUpdateError("下载到的文件与官方校验值不符，已放弃。")
+
 
 def download(rel: HostRelease, on_progress=None, timeout: float = 60) -> str:
     """把新 exe 下载到临时文件，返回路径。
 
     下载过程中的每一步都校验，宁可失败也不要写进去一个坏文件——
     坏文件会直接导致下次启动失败，用户连"更新失败"的提示都看不到。
+
+    分段策略见本节开头；任何一环不配合都退回单连接（慢，但下得到）。
     """
     if not rel.has_asset or not rel.asset:
         raise SelfUpdateError("该发行版没有附带可下载的程序文件。")
     if not rel.asset.url:
         raise SelfUpdateError("下载地址为空，无法下载。")
 
+    url = rel.asset.url
+    # 体积来自 API（`size`）。API 那条路拿不到时为 0：此时无法切段，
+    # 单连接下完再以实际字节数为准。
+    total = int(rel.asset.size or 0)
+    workers = _worker_count(total)
+
     fd, tmp = tempfile.mkstemp(prefix="DSH-Web-new-", suffix=".exe")
     os.close(fd)
-    downloaded = 0
     try:
-        ok = False
-        for ctx in (ssl.create_default_context(), ssl._create_unverified_context()):
+        if workers > 1:
             try:
-                req = urllib.request.Request(rel.asset.url, headers={"User-Agent": UA})
-                with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r, \
-                        open(tmp, "wb") as f:
-                    expected = int(r.headers.get("Content-Length") or 0)
-                    # 进度回调节流（2026-10-20 体检）：以前每 64 KB 回调一次，
-                    # 120 MB 的包 ≈1900 次跨线程信号，每次都要写一遍日志文件 +
-                    # 往 QTextCursor 里插一行。改成"每 512 KB 或每 120 ms 一次"，
-                    # 观感不变（进度条本来就按百分比走），开销降到 1/8 以下。
-                    last_emit = 0
-                    last_at = time.monotonic()
-                    while True:
-                        chunk = r.read(65536)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        now = time.monotonic()
-                        if on_progress and (downloaded - last_emit >= 512 * 1024
-                                            or now - last_at >= 0.12):
-                            last_emit, last_at = downloaded, now
-                            on_progress(downloaded, expected)
-                    if on_progress:
-                        on_progress(downloaded, expected)   # 收尾时补一次 100%
-                ok = True
-                break
-            except (urllib.error.URLError, OSError) as e:
-                if downloaded:
-                    # 已经下了一部分还失败 → 重试也没意义，直接抛
-                    raise SelfUpdateError(f"下载中断：{e}") from e
-                continue
-        if not ok:
-            raise SelfUpdateError("下载失败，请检查网络连接。")
+                _download_parallel(url, tmp, total, workers, on_progress, timeout)
+            except _NoRange:
+                _download_single(url, tmp, on_progress, timeout, total)
+        else:
+            _download_single(url, tmp, on_progress, timeout, total)
 
         # --- 校验：体积 ---
         size = os.path.getsize(tmp)
+        if total and size != total:
+            raise SelfUpdateError(
+                f"下载不完整：收到 {size} 字节，应为 {total} 字节，已放弃。")
         if size < MIN_EXE_BYTES:
             raise SelfUpdateError(
                 f"下载到的文件只有 {size} 字节，明显不是完整的程序，已放弃。")
@@ -506,6 +773,9 @@ def download(rel: HostRelease, on_progress=None, timeout: float = 60) -> str:
         with open(tmp, "rb") as f:
             if f.read(2) != b"MZ":
                 raise SelfUpdateError("下载到的内容不是有效的 Windows 程序，已放弃。")
+
+        # --- 校验：官方摘要（API 里有就比对，没有就跳过）---
+        _verify_digest(tmp, rel.asset.digest)
 
         return tmp
     except Exception:

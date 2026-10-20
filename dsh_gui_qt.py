@@ -562,6 +562,22 @@ class HostCheckWorker(QThread):
             self.done.emit()
 
 
+def _human_left(seconds: float) -> str:
+    """把"还要多久"写成人话。
+
+    显示剩余时间不是装饰：实测从 GitHub 单线程下一个 100 MB 的包只有
+    40 KB/s，不给时间预期的话，用户只会以为卡死了。
+    """
+    seconds = max(0.0, seconds)
+    if seconds < 90:
+        return "%d 秒" % max(1, int(round(seconds)))
+    minutes = seconds / 60.0
+    if minutes < 60:
+        return "%d 分钟" % int(round(minutes))
+    hours = int(minutes // 60)
+    return "%d 小时 %d 分" % (hours, int(round(minutes - hours * 60)))
+
+
 class HostUpdateWorker(QThread):
     """下载桌面壳新版本，并**在本进程内**完成替换。
 
@@ -586,13 +602,28 @@ class HostUpdateWorker(QThread):
 
     def run(self):
         try:
+            # 进度里带速度与剩余时间：单连接时那个速度会低到让人以为死机，
+            # 给出"还要多久"比只报百分比有用得多。
+            window = [time.monotonic(), 0, 0.0]     # 起点时刻 / 起点字节 / 速度
+
             def on_progress(got: int, total: int):
-                if total > 0:
-                    self.line.emit("已下载 %.1f / %.1f MB  (%d%%)"
-                                   % (got / 1048576, total / 1048576,
-                                      got * 100 // total if total else 0))
-                else:
-                    self.line.emit("已下载 %.1f MB" % (got / 1048576))
+                now = time.monotonic()
+                dt = now - window[0]
+                if dt >= 0.9:                       # ≥0.9 秒才重算，免得数字抖
+                    window[2] = (got - window[1]) / dt
+                    window[0], window[1] = now, got
+                speed = window[2]
+                rate = ("  %.1f MB/s" % (speed / 1048576)) if speed > 0 else ""
+                if total <= 0:
+                    self.line.emit("已下载 %.1f MB%s" % (got / 1048576, rate))
+                    return
+                line = ("已下载 %.1f / %.1f MB  (%d%%)%s"
+                        % (got / 1048576, total / 1048576,
+                           got * 100 // total, rate))
+                if speed > 4096 and got < total:
+                    # 低于 4 KB/s 时算出来的剩余时间没有意义，不如不显示
+                    line += "  剩余约 %s" % _human_left((total - got) / speed)
+                self.line.emit(line)
 
             info = selfupdate.install_inplace(self.rel, on_progress=on_progress)
             self.done.emit(True,

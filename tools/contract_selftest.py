@@ -331,11 +331,162 @@ def main() -> int:
               path=fp.path, files=0, bytes=0, truncated=True)))
 
     print(LINE)
+    print("[L3] 自更新下载（分段并行 / 退回单连接 / 断流续传 / 校验）")
+    selfupdate_download_checks()
+
+    print(LINE)
     if failures:
         print("失败项：", "、".join(failures))
         return 1
     print("契约层自测全部通过")
     return 0
+
+
+def selfupdate_download_checks():
+    """自更新下载：分段并行、无 Range 退回、断流续传、体积与摘要校验。
+
+    为什么专门造一个本地服务端：这条路径出错的表现是「更新装上了，但装进去
+    的程序是坏的」——最坏的一种失败，而且用户看不到任何报错。真网络上
+    碰运气覆盖不到「服务端不支持 Range」这种分支，所以把服务端行为造出来。
+
+    背景见 dsh_host/selfupdate.py 的「为什么要分段并行」：GitHub 对单条连接
+    实测只给 40 KB/s，100 MB 的包要 40 分钟；分 6 条连接实测 5.4 倍。
+    """
+    import hashlib
+    import re as _re
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from dsh_host import selfupdate
+
+    _saved_workers = os.environ.pop("DSH_DL_WORKERS", None)
+    check("体积小于阈值时不开线程（建连本身要花钱）",
+          selfupdate._worker_count(3 * 1024 * 1024) == 1)
+    check("大体积才会开到多连接",
+          selfupdate._worker_count(107 * 1024 * 1024) > 1,
+          str(selfupdate._worker_count(107 * 1024 * 1024)))
+    check("体积未知时不猜（交给单连接）", selfupdate._worker_count(0) == 1)
+    spans = selfupdate._split(100, 3)
+    check("分段首尾相接且恰好覆盖整个文件",
+          [(s, e) for s, e in spans] == [(0, 33), (34, 67), (68, 99)], str(spans))
+    check("段数多于字节数时不产生空段也不丢内容",
+          all(e >= s for s, e in selfupdate._split(10, 8))
+          and sum(e - s + 1 for s, e in selfupdate._split(10, 8)) == 10,
+          str(selfupdate._split(10, 8)))
+    if _saved_workers is not None:
+        os.environ["DSH_DL_WORKERS"] = _saved_workers
+
+    payload = b"MZ" + bytes(range(256)) * (6 * 1024 * 4)      # ≈6 MB
+    total = len(payload)
+    digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"        # 一条连接一个请求，行为可预测
+        ranges = True
+        truncate_once = False
+        seen: list = []
+        truncated: set = set()
+
+        def log_message(self, *args):        # 别往测试输出里掺访问日志
+            pass
+
+        def do_GET(self):
+            rng = self.headers.get("Range") or ""
+            Handler.seen.append(rng)
+            if rng and Handler.ranges:
+                m = _re.match(r"bytes=(\d+)-(\d+)", rng)
+                start = int(m.group(1))
+                end = min(int(m.group(2)), total - 1)
+                body = payload[start:end + 1]
+                self.send_response(206)
+                self.send_header("Content-Range",
+                                 "bytes %d-%d/%d" % (start, end, total))
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Accept-Ranges", "bytes")
+                self.end_headers()
+                key = (start, end)
+                # 只截断**整轮测试的第一个**请求：续传请求的区间是新的，
+                # 如果也截断，就会一直"续传又断"，测不出补齐能力。
+                if Handler.truncate_once and not Handler.truncated:
+                    Handler.truncated.add(key)
+                    self.wfile.write(body[:max(1, len(body) // 3)])
+                    self.wfile.flush()
+                    self.close_connection = True         # 模拟断流
+                    return
+                self.wfile.write(body)
+                return
+            self.send_response(200)                          # 忽略 Range，回整包
+            self.send_header("Content-Length", str(total))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = "http://127.0.0.1:%d/DSH-Web.exe" % srv.server_address[1]
+
+    def make_rel(size=total, dig=digest):
+        return selfupdate.HostRelease(
+            version="9.9.9", tag="v9.9.9", notes="", html_url="",
+            published_at="",
+            asset=selfupdate.ReleaseAsset(name="DSH-Web.exe", url=url,
+                                          size=size, digest=dig))
+
+    def fetch(rel):
+        path = selfupdate.download(rel)
+        try:
+            with open(path, "rb") as fh:
+                return fh.read()
+        finally:
+            os.remove(path)
+
+    def reset(ranges=True, truncate=False):
+        Handler.ranges, Handler.truncate_once = ranges, truncate
+        Handler.seen, Handler.truncated = [], set()
+
+    os.environ["DSH_DL_WORKERS"] = "4"        # 6 MB 也强制分段，跑得快
+    try:
+        reset()
+        check("分段下载拿到完整文件", fetch(make_rel()) == payload)
+        check("每个请求都带了 Range（确实分了段）",
+              len(Handler.seen) == 4 and all(Handler.seen), str(Handler.seen))
+
+        # 服务端忽略 Range（老 release / 代理剥头）→ 必须安静退回单连接
+        reset(ranges=False)
+        check("服务端不支持 Range 时仍能下完", fetch(make_rel()) == payload)
+        check("退回单连接只发一次不带 Range 的请求",
+              Handler.seen.count("") == 1,
+              "共 %d 次请求" % len(Handler.seen))
+
+        # 断流：第一段只写三分之一就断，应带 Range 续传补齐
+        reset(truncate=True)
+        check("断流后能续传补齐", fetch(make_rel()) == payload)
+        check("断流后确实重发了同一段",
+              len(Handler.seen) > 4, "共 %d 次请求" % len(Handler.seen))
+
+        reset()
+        bad = "sha256:" + "0" * 64
+        try:
+            fetch(make_rel(dig=bad))
+            check("摘要不符时必须失败", False, "下载被当成成功了")
+        except selfupdate.SelfUpdateError as e:
+            check("摘要不符时必须失败", "校验值" in str(e), str(e))
+
+        # 服务端公布体积比实际大 → 体积校验拦下（不能让截断的 exe 过关）
+        os.environ["DSH_DL_WORKERS"] = "1"
+        reset()
+        try:
+            fetch(make_rel(size=total + 1000))
+            check("体积不符时必须失败", False, "下载被当成成功了")
+        except selfupdate.SelfUpdateError as e:
+            check("体积不符时必须失败", "不完整" in str(e), str(e))
+    finally:
+        if _saved_workers is None:
+            os.environ.pop("DSH_DL_WORKERS", None)
+        else:
+            os.environ["DSH_DL_WORKERS"] = _saved_workers
+        srv.shutdown()
+        srv.server_close()
 
 
 def main_lite() -> int:
@@ -590,6 +741,10 @@ def main_lite() -> int:
               names == ["@deepseek-ai/a", "@deepseek-ai/c"], str(names))
         check("范围型依赖不误报", "@deepseek-ai/b" not in names)
 
+
+    print(LINE)
+    print("[L3] 自更新下载（分段并行 / 退回单连接 / 断流续传 / 校验）")
+    selfupdate_download_checks()
 
     print(LINE)
     if failures:

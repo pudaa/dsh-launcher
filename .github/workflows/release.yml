@@ -251,11 +251,32 @@ jobs:
           path: build/DSH-Web.exe
           retention-days: 30
 
+      - name: 准备更新说明
+        # 说明正文写在 `docs/releases/<tag>.md`，和代码一起提交、一起评审。
+        #
+        # 为什么不再只靠 generate_release_notes（2026-10-20 改）：它只会生成
+        # 一条 "Full Changelog" 链接——用户点开 Release 页面看不到"这版改了什么"。
+        # v2.3.8 / v2.3.9 就是这么发出去的，事后才发现说明是空的。
+        #
+        # 缺文件不失败（不挡发版），但会打一条 warning，让它显眼。
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          NOTE="docs/releases/${GITHUB_REF_NAME}.md"
+          if [ -f "$NOTE" ]; then
+            cp "$NOTE" release-body.md
+            echo "更新说明来自 $NOTE（$(wc -c < release-body.md) 字节）"
+          else
+            echo "::warning::缺少 $NOTE —— 本次 Release 只有自动生成的变更列表"
+            : > release-body.md
+          fi
+
       - name: 创建 Release 并附带 exe
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: build/DSH-Web.exe
+          body_path: release-body.md
           generate_release_notes: true
           draft: false
           prerelease: false
