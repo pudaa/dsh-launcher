@@ -714,13 +714,6 @@ def _read_new(path: str, pos: int) -> tuple[str, int]:
         return "", pos
 
 
-def _build_url(handle: ServiceHandle) -> str:
-    if handle.url:
-        return handle.url
-    base = f"http://{handle.host}:{handle.port}/"
-    return f"{base}?token={handle.token}" if handle.token else base
-
-
 def launch(install: DshInstall, port: int, log_path: str, cwd: str | None = None) -> ServiceHandle:
     """启动 dsh web。stdout/stderr 落到我们自己的日志文件——不读 DSH 的私有日志。"""
     profile = install.profile
@@ -762,15 +755,19 @@ def wait_ready(handle: ServiceHandle, timeout: float | None = None,
     port=0 时端口由系统分配，因此必须先从输出里拿到 URL 才知道该探哪个端口；
     固定端口时 TCP 探测与 URL 解析并行，谁先成功都算就绪。
 
-    注意就绪后的 URL 兜底：DSH 写 `dsh web: <url>` 与开始监听几乎同一瞬间，
-    而 TCP 一连通我们就该返回。若此时还没读到 URL 行，会出现"就绪但 URL 为空"
-    ——首屏会直接变成 401 页。所以 TCP 判定就绪后必须再给一小段宽限期补读 URL。
+    **"能连上"不等于"能用"**（2026-10-20 线上事故）：DSH 的端口是先监听、
+    才打印 `dsh web: http://…?token=…` 的，中间可能隔着好几秒的插件初始化
+    （账号 403 重试那种最慢）。以前 TCP 一通就返回，宽限期只有 3 秒，等不到
+    就"兜底"成一个**没有令牌的 URL** —— 界面打开就是 401 页，用户看到的是
+    "连不上后端"。所以现在：宽限期过了继续等，**拿不到带令牌的地址就不算就绪**，
+    直到总超时后报一条能看懂的错误（而不是静默给个坏地址）。
     """
     profile = handle.install.profile
     timeout = timeout or float(profile.get("ready_timeout", 120))
     interval = float(profile.get("poll_interval", 0.5))
     grace = float(profile.get("url_grace", 3.0))
     deadline = time.time() + timeout
+    tcp_since = None
 
     while time.time() < deadline:
         chunk, pos = _read_new(handle.log_path, handle._read_pos)
@@ -778,8 +775,17 @@ def wait_ready(handle: ServiceHandle, timeout: float | None = None,
             handle._read_pos = pos
             _absorb(handle, chunk)
 
-        if handle.port and tcp_open(handle.host, handle.port):
-            _finalize_url(handle, grace)
+        listening = bool(handle.port and tcp_open(handle.host, handle.port))
+        if listening and not handle.url:
+            if tcp_since is None:
+                tcp_since = time.time()
+            # 已经在监听了，先给一小段宽限期；等不到就从日志尾部整段捞一次
+            # （URL 行可能早于我们记录的读取位置，光读增量永远看不到）。
+            if time.time() - tcp_since >= grace:
+                _recover_url_from_log(handle)
+                tcp_since = None if handle.url else time.time()
+
+        if listening and handle.url:
             return True
 
         if handle.proc is not None and handle.proc.poll() is not None:
@@ -794,6 +800,14 @@ def wait_ready(handle: ServiceHandle, timeout: float | None = None,
                 pass
         time.sleep(interval)
 
+    if handle.port and tcp_open(handle.host, handle.port):
+        raise DshError(
+            "服务端口已经在监听，但始终没从输出里拿到带令牌的地址，"
+            "所以界面会停在 401。\n"
+            f"端口：{handle.port}\n"
+            "通常是插件初始化太慢或输出被截断；点「重新加载页面」不会好，"
+            "请退出应用后重试。\n"
+            f"日志尾部：\n{_tail(handle.log_path, 1200)}")
     raise DshError(
         f"{int(timeout)} 秒内未检测到服务就绪。\n"
         f"期望端口：{'系统分配' if handle.requested_port == 0 else handle.requested_port}\n"
@@ -802,23 +816,38 @@ def wait_ready(handle: ServiceHandle, timeout: float | None = None,
     )
 
 
-def _finalize_url(handle: ServiceHandle, grace: float) -> None:
-    """就绪后补读 URL；宽限期内拿不到就按现有信息兜底，绝不返回空 URL。"""
-    if handle.url:
-        return
-    until = time.time() + grace
-    while time.time() < until and not handle.url:
-        chunk, pos = _read_new(handle.log_path, handle._read_pos)
-        if chunk:
-            handle._read_pos = pos
-            _absorb(handle, chunk)
-        if not handle.url:
-            time.sleep(0.1)
-    # 兜底：至少给一个能打开的地址，DSH 自己的鉴权会接手
-    if not handle.url:
-        handle.url = _build_url(handle)
-    if not handle.url:
-        handle.url = f"http://{handle.host}:{handle.port}/"
+def _recover_url_from_log(handle: ServiceHandle, nbytes: int = 65536) -> bool:
+    """从日志**尾部整段**再捞一次地址（按端口匹配，取最后一行）。
+
+    和 `_absorb` 的区别：`_absorb` 只看增量，而 URL 行可能在 `_read_pos`
+    之前就写完了（多实例/快速启动时实测会发生）。这里扫描最后 64 KB，
+    取**最后一条**端口匹配的记录——同一份日志里往往堆着历次启动的地址。
+    """
+    try:
+        size = os.path.getsize(handle.log_path)
+        with open(handle.log_path, "r", encoding="utf-8", errors="ignore") as f:
+            if size > nbytes:
+                f.seek(size - nbytes)
+            text = f.read()
+    except OSError:
+        return False
+    best = None
+    for pat in handle.install.profile.get("url_regexes", []):
+        try:
+            hits = re.findall(pat, text)
+        except re.error:
+            continue
+        for hit in hits:
+            m = re.search(r":(\d+)", hit)
+            if not m:
+                continue
+            if handle.port and int(m.group(1)) != int(handle.port):
+                continue        # 端口对不上：是上一次启动留下的地址
+            best = hit
+    if not best:
+        return False
+    _absorb(handle, best)
+    return bool(handle.url)
 
 
 def _tail(path: str, nbytes: int) -> str:
@@ -835,20 +864,43 @@ def _tail(path: str, nbytes: int) -> str:
 def recover_url(install: DshInstall, port: int, log_path: str) -> str:
     """附加到已在运行的服务时恢复 URL。
 
-    三级降级：① 本次日志的 URL 行 → ② 日志里的令牌 → ③ 裸 URL（交给 DSH 自己的鉴权）。
-    全部失败也返回裸 URL，绝不因为"拿不到令牌"而拒绝启动。
+    三级降级：① 日志里**端口匹配的最后一条** URL（历次启动都会留一行）
+    → ② 日志里的令牌 → ③ 裸 URL。
+
+    **必须按端口过滤并取最后一条**（2026-10-20 线上事故）：以前是
+    `_extract()` 取"最后一个 200 KB 里的第一个匹配"，而同一份日志里堆着
+    历次启动的地址——端口一样、令牌不同，于是 attach 会拿**上一次的旧令牌**
+    去打开首屏：界面直接 401，用户看到的是"连不上后端"。
     """
     profile = install.profile
     host = profile.get("service_host", "127.0.0.1")
     text = _tail(log_path, 200_000)
-    url = _extract(text, profile.get("url_regexes", [])) or \
-        _extract(text, profile.get("log_url_regexes", []))
-    if url:
-        return url
-    tok = _extract(text, profile.get("log_token_regexes", []))
-    token = tok.split("=", 1)[-1] if tok else ""
+    best = ""
+    for pat in profile.get("url_regexes", []) + profile.get("log_url_regexes", []):
+        try:
+            hits = re.findall(pat, text)
+        except re.error:
+            continue
+        for hit in hits:
+            m = re.search(r":(\d+)", hit)
+            if not m:
+                continue
+            if port and int(m.group(1)) != int(port):
+                continue        # 别的端口：不是这个实例
+            best = hit          # 取最后一条（日志是追加写的，越靠后越新）
+    if best:
+        return best
+    # 没有该端口的地址行时，只有"日志里恰好只有一个令牌"才敢用它——
+    # 同一份日志里有多个令牌就说明那些是别的实例的，硬塞进去只会得到 401。
+    toks = set()
+    for pat in profile.get("log_token_regexes", []):
+        try:
+            for hit in re.findall(pat, text):
+                toks.add(hit.split("=", 1)[-1])
+        except re.error:
+            continue
     base = f"http://{host}:{port}/"
-    return f"{base}?token={token}" if token else base
+    return f"{base}?token={next(iter(toks))}" if len(toks) == 1 else base
 
 
 # ------------------------------------------------------------------ 停止

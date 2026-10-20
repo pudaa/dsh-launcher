@@ -235,6 +235,15 @@ def main() -> int:
     logf = os.path.join(TMP, "svc.log")
     handle = contract.launch(inst, 0, logf, cwd=TMP)
     print("    pid :", handle.pid)
+    # 这一段会覆盖**用户正在用的** service.json（同一路径）。以前跑完就把它
+    # 清成 None，于是正在运行的服务丢了状态：launcher 下次启动时要重新猜端口
+    # 和令牌，甚至可以起来了却连不上（2026-10-20 现场就被这么坑过）。
+    # 所以先备份，结束时原样恢复。
+    state_file = config.service_state_path()
+    prev_state = None
+    if os.path.isfile(state_file):
+        with open(state_file, "rb") as fh:
+            prev_state = fh.read()
     try:
         t0 = time.time()
         contract.wait_ready(handle, timeout=150)
@@ -264,7 +273,15 @@ def main() -> int:
         print("    终止进程数 :", n)
         check("进程已停止", n >= 1)
         check("端口已释放", not contract.tcp_open("127.0.0.1", handle.port))
-        contract.save_state(None)
+        if prev_state is not None:
+            try:
+                with open(state_file, "wb") as fh:
+                    fh.write(prev_state)
+                print("    已恢复原有的 service.json（不干扰正在运行的实例）")
+            except OSError as e:
+                print("    恢复 service.json 失败：", e)
+        else:
+            contract.save_state(None)
 
     print(LINE)
     print("[7] 环境自检与探测（首次运行引导依赖）")
@@ -384,7 +401,32 @@ def main_lite() -> int:
     check("能从官方输出行解析出 URL", bool(url and "token=" in url), str(url))
 
     print(LINE)
-    print("[L2] 数据指纹判断逻辑")
+    print("[L2] 从日志恢复地址（attach 时最容易拿错令牌的地方）")
+    # 2026-10-20 线上事故：同一份 dsh-web.log 里堆着历次启动的地址行，
+    # 端口相同、令牌不同。老实现取"第一个匹配"，于是 attach 用**上一次的旧令牌**
+    # 打开首屏 → 401。这里造一份真实的日志形状，钉住"取最后一条 + 按端口过滤"。
+    import tempfile
+    import types
+    fake_install = types.SimpleNamespace(profile={
+        "service_host": "127.0.0.1",
+        "url_regexes": prof.get("url_regexes") or [],
+        "log_url_regexes": prof.get("log_url_regexes") or [],
+        "log_token_regexes": prof.get("log_token_regexes") or [],
+    })
+    with tempfile.TemporaryDirectory() as tmp:
+        logf = os.path.join(tmp, "dsh-web.log")
+        with open(logf, "w", encoding="utf-8") as fh:
+            fh.write("dsh web: http://127.0.0.1:3080/?token=OLDOLDOLD\n")
+            fh.write("dsh web: http://127.0.0.1:4001/?token=OTHERPORT\n")
+            fh.write("dsh web: http://127.0.0.1:3080/?token=NEWNEWNEW\n")
+        got = contract.recover_url(fake_install, 3080, logf)
+        check("同端口取最后一条（不用上次的旧令牌）",
+              "token=NEWNEWNEW" in got, got)
+        got2 = contract.recover_url(fake_install, 9999, logf)
+        check("端口对不上时不硬塞旧令牌",
+              "OLDOLDOLD" not in got2 and "NEWNEWNEW" not in got2, got2)
+
+    print(LINE)
     fp = contract.HomeFingerprint(path=r"C:\fake", files=10, bytes=1000)
     check("自比不误报减少", not fp.lost_against(fp))
     check("能识别减少", fp.lost_against(
