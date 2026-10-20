@@ -38,6 +38,7 @@ from PySide6.QtCore import QRegularExpression, Qt, QTimer, QUrl
 from PySide6.QtGui import (QColor, QFont, QTextCharFormat, QTextCursor,
                            QTextDocument, QSyntaxHighlighter)
 from PySide6.QtWebEngineCore import (QWebEnginePage, QWebEngineProfile,
+                                     QWebEngineSettings,
                                      QWebEngineUrlRequestInterceptor)
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup,
@@ -102,6 +103,37 @@ def nav_disposition(url, base) -> str:
         return "external"
     # javascript: / data: / blob: / about: —— 都是页面内部行为
     return "internal"
+
+
+#: 要放行的页面权限：只有剪贴板写入。
+#: `ClipboardReadWrite` 是 `navigator.clipboard.writeText()` 要的那个；
+#: `ClipboardSanitizedWrite` 是它的"只写、不可读"变体，**PySide6 6.11 还没暴露**
+#: （实测 `QWebEnginePage.Feature` 里只有前者），所以按名字挑、有就一起给，
+#: 免得换个 Qt 版本复制又坏掉。
+CLIPBOARD_FEATURES = frozenset(
+    f for f in (getattr(QWebEnginePage.Feature, name, None)
+                for name in ("ClipboardReadWrite", "ClipboardSanitizedWrite"))
+    if f is not None)
+
+
+def clipboard_origin_allowed(origin, base) -> bool:
+    """剪贴板权限只给我方页面：**严格同源**（scheme + host + port）。
+
+    为什么不能只看"是本机"：DSH 用随机端口起本地服务，端口每次启动都可能不同，
+    所以这里逐项比；比字符串更可靠（末尾斜杠、大小写、默认端口都不会误判）。
+    基址未知时（服务还没起来）只放行 loopback——那时页面上不可能有别人的内容。
+    """
+    o = origin if isinstance(origin, QUrl) else QUrl(str(origin or ""))
+    if not o.isValid() or not o.host():
+        return False
+    b = base if isinstance(base, QUrl) else QUrl(str(base or ""))
+    if not b.isValid() or b.isEmpty() or not b.host():
+        return o.host().lower() in ("127.0.0.1", "localhost", "::1")
+    if o.scheme().lower() != b.scheme().lower():
+        return False
+    if o.host().lower() != b.host().lower():
+        return False
+    return o.port(-1) == b.port(-1)
 
 
 def _as_json(value):
@@ -256,11 +288,14 @@ class RequestRecorder(QWebEngineUrlRequestInterceptor):
 
 
 class ShellPage(QWebEnginePage):
-    """主视图使用的页面：接管外链出口 + 采集控制台消息。
+    """主视图使用的页面：接管外链出口 + 采集控制台消息 + 放行剪贴板权限。
 
     只拦 **LinkClicked**。表单提交、重定向、刷新、前进后退一律放行——
     早期若不加判据全拦，会把登录跳转之类一起打掉（那类"功能莫名其妙坏掉"
     极难排查）。
+
+    权限只放行**我方页面**的剪贴板写入（见 `_on_feature_permission`），
+    其它一律拒绝——Qt 默认就拒绝，但那样复制按钮会静默失效。
     """
 
     def __init__(self, profile, parent, base_url=None, recorder=None,
@@ -277,6 +312,12 @@ class ShellPage(QWebEnginePage):
         self._view = view if view is not None else (
             parent if hasattr(parent, "setUrl") else None)
         self.newWindowRequested.connect(self._on_new_window)
+        self.featurePermissionRequested.connect(self._on_feature_permission)
+        # legacy 路径（`document.execCommand('copy')`）也放开写权限。
+        # DSH 前端的复制助手**不会**回退到它（失败就直接 return false），
+        # 但别的调用方可能用；实测默认返回 False、开启后能真正写进系统剪贴板。
+        self.settings().setAttribute(
+            QWebEngineSettings.WebAttribute.JavascriptCanAccessClipboard, True)
 
     # ---- 导航策略 ----
 
@@ -402,6 +443,36 @@ class ShellPage(QWebEnginePage):
                          view=None, capture_console=self.capture_console)
         page._is_popup = True
         return page
+
+    # ---- 页面权限 ----
+
+    def _on_feature_permission(self, origin, feature) -> None:
+        """页面申请权限：只给剪贴板，其余明确拒绝。
+
+        为什么必须自己处理（2026-10-20 用户报"点复制没反应"）
+        --------------------------------------------------
+        `navigator.clipboard.writeText()` 在 QtWebEngine 里**受权限管**，而 Qt 的
+        默认行为是拒绝、且不弹任何提示：Promise 直接以
+        `NotAllowedError: ... Write permission denied.` 结束。
+        DSH 前端的复制助手（bundle 里的 `async function zo(e)`）拿到异常后
+        **直接 return false，不回退 execCommand**，于是"点了复制、没有报错、
+        剪贴板也没变"——正是用户看到的现象。
+
+        实测（真窗口，点页面上的复制按钮）：
+          - 不授权：clicks=1，权限请求 ClipboardReadWrite @ http://127.0.0.1:9/，
+            结果 `err:NotAllowedError:Write permission denied`，系统剪贴板不变；
+          - 授权后同一次点击：`__r='ok'`，剪贴板立刻变成新内容。
+        """
+        try:
+            allow = (feature in CLIPBOARD_FEATURES
+                     and clipboard_origin_allowed(origin, self._base()))
+            self.setFeaturePermission(
+                origin, feature,
+                QWebEnginePage.PermissionPolicy.PermissionGrantedByUser
+                if allow
+                else QWebEnginePage.PermissionPolicy.PermissionDeniedByUser)
+        except Exception:                                      # noqa: BLE001
+            pass
 
     # ---- 控制台 ----
 
@@ -1654,6 +1725,54 @@ def selftest_checks() -> list:
 
     check("基址未知时不擅自外跳",
           nav_disposition("http://127.0.0.1:3080/x", "") == "internal")
+
+    # --- 剪贴板权限只给我方页面（2026-10-20「点复制没反应」的闸门）---
+    # 不授权时 writeText 会以 NotAllowedError 结束，而 DSH 的复制助手
+    # 拿到异常直接 return false（不回退 execCommand），表现就是"点了没反应"。
+    clip_cases = [
+        ("同源放行", "http://127.0.0.1:3080/", "http://127.0.0.1:3080/?token=t", True),
+        ("换端口不放行", "http://127.0.0.1:3081/", "http://127.0.0.1:3080/", False),
+        ("换协议不放行", "https://127.0.0.1:3080/", "http://127.0.0.1:3080/", False),
+        ("异源不放行", "https://platform.deepseek.com/", "http://127.0.0.1:3080/", False),
+        ("localhost 与 127.0.0.1 不同源", "http://localhost:3080/",
+         "http://127.0.0.1:3080/", False),
+        ("基址未知时只给 loopback", "http://127.0.0.1:3080/", "", True),
+        ("基址未知时不信任异源", "https://evil.example/", "", False),
+    ]
+    bad = []
+    for name, origin, b, expect in clip_cases:
+        got = clipboard_origin_allowed(origin, b)
+        if got != expect:
+            bad.append("%s→%s(应 %s)" % (name, got, expect))
+    check("剪贴板权限只给同源页面", not bad, "、".join(bad))
+    check("剪贴板权限覆盖 writeText 对应的 Feature",
+          QWebEnginePage.Feature.ClipboardReadWrite in CLIPBOARD_FEATURES)
+
+    # 真调一遍权限处理器（用桩替掉 QWebEnginePage 的部分，不建 WebEngine）
+    captured = []
+
+    class _StubPage:
+        def _base(self):
+            return base
+
+        def setFeaturePermission(self, origin, feature, policy):  # noqa: N802
+            captured.append((origin.toString(), feature, policy))
+
+    stub = _StubPage()
+    grant = QWebEnginePage.PermissionPolicy.PermissionGrantedByUser
+    deny = QWebEnginePage.PermissionPolicy.PermissionDeniedByUser
+    ShellPage._on_feature_permission(
+        stub, QUrl("http://127.0.0.1:3080/"),
+        QWebEnginePage.Feature.ClipboardReadWrite)
+    ShellPage._on_feature_permission(
+        stub, QUrl("https://evil.example/"),
+        QWebEnginePage.Feature.ClipboardReadWrite)
+    ShellPage._on_feature_permission(
+        stub, QUrl("http://127.0.0.1:3080/"),
+        QWebEnginePage.Feature.Geolocation)
+    check("权限处理器：同源剪贴板放行，异源与其它权限拒绝",
+          [c[2] for c in captured] == [grant, deny, deny],
+          "、".join(str(c[2]).rsplit(".", 1)[-1] for c in captured))
 
     # 令牌打码：日志里不能出现明文 token
     r = redact(base)

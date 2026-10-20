@@ -38,6 +38,7 @@ DWM 圆角是窗口管理器合成的，`PrintWindow` 抓不到、屏幕抓图�
 from __future__ import annotations
 
 import os
+import time
 from string import Template
 
 from PySide6.QtCore import (QAbstractAnimation, QEvent, Property, QEasingCurve,
@@ -720,6 +721,34 @@ class ChannelWorker(QThread):
             f"已安装 {cur or '未知'}；三条通道最高 {highest or '未知'}"))
 
 
+class UsageWorker(QThread):
+    """在后台数数据目录有多大。
+
+    为什么必须后台（2026-10-20 用户反馈"每次切进常规 tab 都明显卡顿"）
+    -----------------------------------------------------------------
+    `storage.breakdown()` 要遍历整个数据根。私有部署下那是 **6.6 万个文件 /
+    727 MB**：旧实现（分组各走一遍）实测 **10.2 秒**，改成一次遍历后 **5.1 秒**
+    （Windows Defender 逐文件扫描占大头）。以前它在 `GeneralPage.on_show()` 里
+    **同步**跑，于是每次切到「常规」页，界面就冻住十几秒——连页签高亮都要等它
+    算完才画出来。
+
+    所以挪到线程里：页面立刻显示（"统计中…"），算完再回填。
+    顺带加了 30 秒缓存（见 `GeneralPage._refresh_usage`），来回切页不重复付账。
+    """
+    done = Signal(object)
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self._fn = fn
+
+    def run(self):
+        try:
+            self.done.emit(self._fn())
+        except Exception as e:                                   # noqa: BLE001
+            # 统计失败不该把整页搞崩：只让"占用"这一行显示失败原因。
+            self.done.emit({"error": "%s: %s" % (type(e).__name__, e)})
+
+
 # ------------------------------------------------------------------ 主机接口
 
 class PanelHost:
@@ -731,7 +760,8 @@ class PanelHost:
 
     def __init__(self, install=None, handle=None, host_release=None,
                  theme=None, open_path=None, open_web=None, log_dir=None,
-                 flag=None, set_flag=None, action=None, data_dir=None):
+                 flag=None, set_flag=None, action=None, data_dir=None,
+                 usage=None):
         self._install = install
         self._handle = handle
         self._release = host_release
@@ -742,6 +772,9 @@ class PanelHost:
         #: 桌面壳数据根（"常规 → 数据目录"用）。默认直接问 config，
         #: 这样面板能脱离主窗口单独跑自测。
         self.data_dir = data_dir or config.data_root
+        #: 数据根占用统计。**很贵**（秒级全树遍历），调用方必须放到后台线程里跑。
+        #: 做成可注入的，是为了让自测不必真的去数自己那块盘。
+        self.usage = usage or storage.breakdown
         self._flag = flag or (lambda name: False)
         self._set_flag = set_flag or (lambda name, value: None)
         self.action = action or (lambda name: None)
@@ -1101,6 +1134,10 @@ class GeneralPage(BasePage):
          "让窗口标题栏跟随 DSH 界面的主色。需要 Windows 11。"),
     )
 
+    #: 占用统计的复用期限（秒）。切回本页时先用缓存，过期才重算——
+    #: 统计要遍历整棵树（见 UsageWorker），来回切页不该每次都付这个代价。
+    USAGE_TTL = 30.0
+
     def build(self) -> None:
         self.layout_.addWidget(_label("常规", "h1"))
         self.layout_.addWidget(_label(
@@ -1179,8 +1216,8 @@ class GeneralPage(BasePage):
         # --- 数据目录 ---
         c3 = Card("数据目录", self.pal)
         self.card_data = c3
-        self.kv_root = KeyValueRow("位置", "—", self.pal)
-        self.kv_usage = KeyValueRow("占用", "—", self.pal)
+        self.kv_root = KeyValueRow("位置", self.host.data_dir(), self.pal)
+        self.kv_usage = KeyValueRow("占用", "统计中…", self.pal)
         c3.add(self.kv_root)
         c3.add(self.kv_usage)
         self.group_rows: list[KeyValueRow] = []
@@ -1211,6 +1248,9 @@ class GeneralPage(BasePage):
         self.layout_.addWidget(c3)
 
         self.layout_.addStretch(1)
+        self._usage = None            # 最近一次统计结果
+        self._usage_at = 0.0          # 拿到结果时的 time.monotonic()
+        self._usage_worker = None
         self.refresh()
 
     def refresh(self) -> None:
@@ -1219,9 +1259,41 @@ class GeneralPage(BasePage):
         on = self.host.flag("dev_mode")
         for b in (self.btn_dev, self.btn_log):
             b.setEnabled(on)
+        self._refresh_usage()
 
-        info = storage.breakdown()
-        self.kv_root.set(info["root"])
+    def _refresh_usage(self) -> None:
+        """占用统计：缓存新鲜就直接渲染，否则丢给后台线程。
+
+        **绝不在界面线程里同步调 `storage.breakdown()`**——那是秒级的全树遍历，
+        以前就是它让"切进常规 tab"卡十几秒（见 UsageWorker）。
+        """
+        if (self._usage is not None
+                and time.monotonic() - self._usage_at < self.USAGE_TTL):
+            self._render_usage(self._usage)
+            return
+        w = self._usage_worker
+        if w is not None and w.isRunning():
+            return            # 已经在算了，算完自己会回填
+        if self._usage is None:
+            self.kv_usage.set("统计中…")
+        self._usage_worker = UsageWorker(self.host.usage, self)
+        self._usage_worker.done.connect(self._on_usage)
+        self._usage_worker.start()
+
+    def _on_usage(self, info) -> None:
+        if not isinstance(info, dict) or "error" in info:
+            msg = info.get("error") if isinstance(info, dict) else str(info)
+            self.kv_usage.set("统计失败")
+            self.kv_usage.setToolTip(str(msg))
+            self._usage_at = 0.0        # 下次进来重试
+            return
+        self._usage = info
+        self._usage_at = time.monotonic()
+        self.kv_usage.setToolTip("")
+        self._render_usage(info)
+
+    def _render_usage(self, info: dict) -> None:
+        self.kv_root.set(info.get("root") or self.host.data_dir())
         self.kv_usage.set("%s · %d 个文件"
                           % (storage.str_of_bytes(info["bytes"]), info["files"]))
         # 明细行重建（组数很少，重建比增删维护简单）
@@ -1230,7 +1302,7 @@ class GeneralPage(BasePage):
             r.deleteLater()
         self.group_rows = []
         card = getattr(self, "card_data", None)
-        for g in info["groups"]:
+        for g in info.get("groups", ()):
             r = KeyValueRow("　" + g["label"],
                             "%s · %d 个文件"
                             % (storage.str_of_bytes(g["bytes"]), g["files"]),
@@ -1242,9 +1314,16 @@ class GeneralPage(BasePage):
 
     def on_show(self) -> None:
         if not self._built:
-            super().on_show()
+            super().on_show()          # build() 里已经调过 refresh()
         else:
             self.refresh()
+
+    def shutdown(self, timeout_ms: int = 8000) -> bool:
+        """等后台统计线程收尾（QThread 活着退出会让 Qt abort）。"""
+        w = self._usage_worker
+        if w is not None and w.isRunning() and not w.wait(timeout_ms):
+            return False
+        return True
 
     def apply_palette(self, pal: dict) -> None:
         super().apply_palette(pal)
@@ -1966,7 +2045,23 @@ def selftest_checks() -> list:
             bad_icons.append("%s=%.3f" % (name, r))
     check("全部图标渲染比例正常", not bad_icons, "、".join(bad_icons[:4]))
 
-    host = PanelHost(install=None, handle=None, theme=lambda: "dark")
+    # 假的数据根统计：真去数本机那块盘要好几秒（几百兆 / 几万文件），
+    # 自测不该为了验渲染去付这个代价。sleep 是用来**假装**那次全树遍历的，
+    # 好让下面能断言"切页不等它"。
+    fake_usage = {
+        "root": r"D:\fake\DSH-Web", "files": 12, "bytes": 3 * 1024 * 1024,
+        "groups": [{"key": "profile", "label": "浏览器数据",
+                    "hint": "登录态与缓存", "files": 10,
+                    "bytes": 2 * 1024 * 1024}],
+        "other": 1024 * 1024, "is_default": False,
+    }
+
+    def fake_usage_scan():
+        time.sleep(1.2)
+        return fake_usage
+
+    host = PanelHost(install=None, handle=None, theme=lambda: "dark",
+                     usage=fake_usage_scan)
     panel = ControlPanel(host)
     panel.resize(PANEL_W, PANEL_H)
     panel.show()
@@ -1994,9 +2089,13 @@ def selftest_checks() -> list:
     check("部署页提供「重新安装 DSH」入口",
           "reinstall_dsh" in _deploy_src and "重新安装" in _deploy_src)
 
+    goto_cost = None
     try:
         for i in range(len(ControlPanel.PAGES)):
+            _t0 = time.monotonic()
             panel.goto(i)
+            if i == 3:
+                goto_cost = time.monotonic() - _t0
         check("五个页面都能切换并完成构建",
               len(panel.pages) == len(ControlPanel.PAGES),
               "已构建 %d 个" % len(panel.pages))
@@ -2008,6 +2107,39 @@ def selftest_checks() -> list:
     check("状态检测页覆盖全部预期项",
           sp is not None and set(sp.rows.keys()) == {k for k, _n in CHECK_ROWS},
           "、".join(sp.rows.keys()) if sp is not None else "状态页未构建")
+
+    # --- 常规页的占用统计必须走后台线程（2026-10-20 卡顿回归）---
+    # 用户反馈"每次切进常规 tab 都明显卡顿"：根因是 `storage.breakdown()`
+    # 在 GUI 线程里同步遍历整个数据根（实测 10.2 秒 / 6.6 万文件 / 727 MB）。
+    # 上面 fake_usage_scan 会睡 1.2 秒，所以这三条断言能分别钉住：
+    #   ① 切页不等它（耗时远小于 1.2 秒）
+    #   ② 它确实在别的线程里跑
+    #   ③ 结果回来后会回填到界面上，且 30 秒内复用缓存
+    gp = panel.pages.get(3)
+    check("切进常规页不等占用统计（不再卡顿）",
+          goto_cost is not None and goto_cost < 0.5,
+          "%.3f 秒" % goto_cost if goto_cost is not None else "页面未构建")
+    check("占用统计跑在后台线程（不占界面线程）",
+          gp is not None and gp._usage_worker is not None
+          and gp._usage_worker.isRunning())
+    for _ in range(200):
+        if gp is None or (gp._usage_worker is not None
+                          and not gp._usage_worker.isRunning()):
+            break
+        loop_events(app, 20)
+    loop_events(app, 60)
+    got_text = gp.kv_usage.v.text() if gp is not None else "常规页未构建"
+    check("统计结果回填到「占用」行",
+          "12 个文件" in got_text and "3.0 MB" in got_text, got_text)
+    check("数据根来自统计结果",
+          gp is not None and gp.kv_root.v.text() == fake_usage["root"],
+          gp.kv_root.v.text() if gp is not None else "")
+    worker_before = gp._usage_worker if gp is not None else None
+    if gp is not None:
+        gp.on_show()
+    check("30 秒内重复进入常规页复用缓存（不重算）",
+          gp is not None and gp._usage_worker is worker_before
+          and "12 个文件" in gp.kv_usage.v.text())
 
     # --- 圆角：像素级 ---
     # grab() 渲染的是控件自己的绘制（含透明通道），所以圆角外应当是**透明**的。
