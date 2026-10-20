@@ -1160,6 +1160,12 @@ class MainWindow(QMainWindow):
         self._icon_dark_bg = None
         self._set_theme_icon(dwm.system_uses_dark())
         self._build_loading_page()
+
+        # WebEngine 的创建是一笔固定成本（约 2 秒，含 QtWebEngineProcess 子进程），
+        # 原先排在"服务就绪之后"串行执行——正好压在用户最焦虑的那一刻。
+        # 挪到这里与服务启动并行：代价是加载页刚出现时顿一下，但那时用户还没
+        # 盯住它，比结尾白 2 秒好得多。（2026-10-20，对照官方桌面端后的优化）
+        QTimer.singleShot(80, self._ensure_webview)
         self._build_tray()
 
         self.starter = None
@@ -1671,10 +1677,38 @@ class MainWindow(QMainWindow):
         于是在页面真正渲染完成的那一刻就上色，通常 1 秒内完成。
         """
         if ok:
-            self.stack.setCurrentIndex(1)
+            self._reveal_when_rendered()
         if ok and config.get("adaptive_titlebar") and dwm.available():
             self._schedule_titlebar_probe(0)
             self._start_theme_watch()
+
+    #: 前端首屏渲染探针。返回 "1"/"0" 两个**字符串**：
+    #  实测 PySide6 6.11 对 array/object 的返回值一律给空串（见 memory 里的坑），
+    #  布尔虽然没踩到，但统一走字符串最省心。
+    JS_RENDERED = ("(function(){try{var b=document.body;"
+                   "return (b&&b.children.length>0&&(b.textContent||'').length>40)"
+                   "?'1':'0';}catch(e){return '0';}})()")
+
+    def _reveal_when_rendered(self, tries: int = 0) -> None:
+        """等前端真的画出内容，再把加载页换成 Web 视图。
+
+        `loadFinished` 只代表 **HTML 到了**。DSH 是 SPA，此刻 `#root` 还是空的，
+        立刻切过去就是一片白——这正是"页面加载完了却要愣一下"的来源。
+        这里用一个很便宜的 DOM 探针轮询（只读 children/textContent，不读布局），
+        最多等约 1.8 秒；超时也切——宁可看到白，也不能永远卡在加载页。
+        """
+
+        def decided(value) -> None:
+            if str(value).strip() == "1" or tries >= 12:      # 12 × 150ms ≈ 1.8s
+                self.stack.setCurrentIndex(1)
+            else:
+                QTimer.singleShot(
+                    150, lambda: self._reveal_when_rendered(tries + 1))
+
+        try:
+            self.page.runJavaScript(self.JS_RENDERED, decided)
+        except Exception:                                      # noqa: BLE001
+            self.stack.setCurrentIndex(1)
 
     # ---------------------------------------------------- 主题跟踪（低频）
     #
