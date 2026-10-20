@@ -346,22 +346,25 @@ class ShellPage(QWebEnginePage):
         # 空白页——DOM 只剩 <html><head></head><body></body></html>，没有地址栏、
         # 没有返回入口，用户只能重启。
         if scheme in ("about", "javascript", "data", "blob"):
-            # 官方桌面端对 window.open 一律 deny，我们照做。
+            # 交给 Qt 开窗（2026-10-20，第三次才做对）。
             #
-            # 为什么**不能**自己开一个窗口接它（2026-10-20 实测踩坑）：
-            # Qt 的 `newWindowRequested` 只有调 `request.openIn(...)` 才会把
-            # 新窗口交回 Chromium，`window.open()` 也才会返回有效对象。
-            # 我们之前是自己 new 了一个 QMainWindow——Chromium 根本不知道它，
-            # 于是 DSH 的 `window.open()` 拿到 null，后续
-            # `popup.location.replace(authorizeUrl)` 永远不会执行，
-            # 结果就是一个**永远空白的窗口**，登录也卡住。
+            # 这里的坑值得写清楚，因为连错了两次：
+            # ① `view.setUrl(about:blank)` —— 主窗口被换成空白页；
+            # ② 自己 new 一个 QMainWindow —— Chromium 不知道它，
+            #    `window.open()` 返回 null，DSH 后续的
+            #    `popup.location.replace(authorizeUrl)` 永不执行，
+            #    于是留下一个永远空白的窗口，登录也卡死；
+            # ③ 正解：`request.openIn(...)` 让 Qt 接管，
+            #    并重写 `createWindow` 返回一个页面（Qt 的默认实现返回
+            #    nullptr，那样窗口根本不会创建）。这样 Chromium 会拿到
+            #    有效的 window 对象，DSH 的登录流程才能走下去。
             #
-            # 拒绝之后 DSH 会走它自己设计的降级路径：ui-settings-account 的
-            # begin() 注释原话就是 "blocked popups need the copy-link route"
-            # ——对话框给出可复制的授权链接。
+            # 新页面随后被导航到外部授权页时，由它自己的
+            # `acceptNavigationRequest` 转交系统浏览器并阻止渲染——
+            # 效果等同官方桌面端的 openExternal + deny。
             try:
-                self.recorder.add_console(
-                    "warn", "已拒绝 window.open(%s)，改用复制链接" % url.toString(), 0, "popup")
+                request.openIn(
+                    QWebEnginePage.WebWindowType.WebBrowserTab)
             except Exception:                                  # noqa: BLE001
                 pass
             return
@@ -371,6 +374,26 @@ class ShellPage(QWebEnginePage):
             view = self._view
             if view is not None:
                 view.setUrl(url)
+
+    def createWindow(self, window_type):                        # noqa: N802
+        """为 `window.open` 提供新页面。
+
+        **Qt 的默认实现返回 nullptr**，那样窗口根本不会创建，页面里的
+        `window.open()` 只能拿到 null。DSH 的登录流程恰恰依赖那个对象：
+        `ui-settings-account/client.js` 的 `begin()` 先占位，
+        `update()` 里 `popup.location.replace(authorizeUrl)` 才把它导航到授权页。
+        返回 null 等于把登录卡死（2026-10-20 实测复现）。
+
+        新页面共用同一份 ShellPage 逻辑：一旦被导航到外部站点，
+        `acceptNavigationRequest` 会转交系统浏览器并返回 False——
+        用户看到授权页在自己的默认浏览器里打开，与官方桌面端行为一致。
+        """
+        page = ShellPage(self.profile(), self, base_url=self._base,
+                         recorder=self.recorder,
+                         open_external=self._open_external,
+                         view=None, capture_console=self.capture_console)
+        page._is_popup = True
+        return page
 
     # ---- 控制台 ----
 

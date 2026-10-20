@@ -495,14 +495,14 @@ def host_update_checks() -> list[str]:
     #     同时仍要保留刷新入口作为页面跑偏时的自救。
     import dsh_devtools as _dt
     _src = inspect.getsource(_dt.ShellPage._on_new_window)
-    ok = ('"about"' in _src and "已拒绝" in _src
-          and not hasattr(_dt, "PopupWindow")
+    ok = ('"about"' in _src and "openIn" in _src
+          and hasattr(_dt.ShellPage, "createWindow")
           and "def _reload_page" in inspect.getsource(g.MainWindow))
-    print(f"  [{'OK  ' if ok else 'FAIL'}] window.open 被拒绝且提供刷新入口")
+    print(f"  [{'OK  ' if ok else 'FAIL'}] window.open 交给 Qt，且新页面拦截外部授权页")
     if not ok:
         failures.append("登录弹窗/刷新入口")
-        print(f"        about分支={'"about"' in _src}  拒绝文案={'已拒绝' in _src}"
-              f"  无PopupWindow={not hasattr(_dt, 'PopupWindow')}")
+        print(f"        openIn={'openIn' in _src}"
+              f"  createWindow={hasattr(_dt.ShellPage, 'createWindow')}")
 
     # 2. 源码运行时不支持自更新（避免替换掉开发的 py 文件）
     supported, reason = su.self_update_supported()
