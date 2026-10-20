@@ -284,6 +284,11 @@ class NativeCapture:
         顺序很关键：先把 1/2 指回原句柄（或关掉），管道的**写端**随之消失，
         读线程的 `read` 立刻返回 0 → 自己结束。反过来在别的线程里
         `close(read_fd)` 会让阻塞中的 read 行为未定义。
+
+        **恢复完要把自己那几个 fd 也关掉**（2026-10-20 体检）：`_orig_out` /
+        `_orig_err` 是 `os.dup()` 出来的副本，`_read_fd` 是管道读端，日志文件
+        还有一个 FILE 对象。以前一个都不关，于是"开发者模式"每关一次再开一次
+        就漏 3~4 个句柄（进程是长跑的，句柄泄漏迟早会显形）。
         """
         if not self.started:
             return
@@ -297,6 +302,27 @@ class NativeCapture:
                     os.close(fd)
             except OSError:
                 pass
+        # 读线程此时应该已经读到 EOF 并退出（写端没了）。等一小会儿再关读端，
+        # 免得在别的线程阻塞在 read 上时把 fd 抽走。
+        thread = getattr(self, "_thread", None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+        for attr in ("_orig_out", "_orig_err", "_read_fd"):
+            fd = getattr(self, attr, -1)
+            if fd is not None and fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            setattr(self, attr, -1)
+        self._thread = None
+        fh = getattr(self, "_file", None)
+        if fh is not None:
+            try:
+                fh.close()
+            except OSError:
+                pass
+            self._file = None
 
 
 def _drain_on_exit() -> None:

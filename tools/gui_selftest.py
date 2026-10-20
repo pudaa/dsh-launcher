@@ -999,12 +999,22 @@ def titlebar_checks() -> list[str]:
     #     老大反馈过"加载完网页后有明显延迟"，罪魁就是 QTimer.singleShot(4000)。
     #     注意匹配要带 QTimer. 前缀——docstring 里为说明历史也写了
     #     "singleShot(4000, ...)"，不带前缀会误伤自己。
+    #
+    #     2026-10-20 体检：`_on_ready` 会被 StartupWorker 与 `_swap_service.done`
+    #     反复调用（换来源、迁移数据后重启服务），所以这条连接必须是
+    #     UniqueConnection——否则一次加载会触发 N 条取色链 + N 条渲染探针链。
     src = open(os.path.join(ROOT, "dsh_gui_qt.py"), encoding="utf-8").read()
     ok = ("QTimer.singleShot(4000" not in src
-          and "loadFinished.connect(self._on_view_loaded)" in src)
+          and "loadFinished.connect(self._on_view_loaded" in src)
     print(f"  [{'OK  ' if ok else 'FAIL'}] 取色由 loadFinished 触发（无固定死等）")
     if not ok:
         failures.append("取色触发方式")
+
+    # 7h2. loadFinished 连接必须是 UniqueConnection（重复连接会放大取色链）
+    ok = "Qt.ConnectionType.UniqueConnection" in src
+    print(f"  [{'OK  ' if ok else 'FAIL'}] loadFinished 用 UniqueConnection 连接")
+    if not ok:
+        failures.append("loadFinished 重复连接")
 
     # 7i. 降级链与图标方法齐备（借用方法时容易漏掉依赖）
     need2 = ["_on_view_loaded", "_schedule_titlebar_probe", "_set_theme_icon"]
@@ -1247,6 +1257,72 @@ def terminal_checks() -> list[str]:
     return failures
 
 
+def health_checks() -> list:
+    """2026-10-20 体检发现的问题的回归断言（源码级，静态分支也跑）。
+
+    这些都是"改了某处却没人拦"的类型：退出路径、资源释放、重复连接、
+    主线程里的全树遍历。断言写得宽一点（认行为不认排版），但必须能在
+    有人把修法改回去时变红。
+    """
+    failures: list[str] = []
+
+    def check(name: str, ok: bool, extra: str = "") -> None:
+        print("  [%s] %s%s" % ("OK  " if ok else "FAIL", name,
+                               ("  " + extra) if extra else ""))
+        if not ok:
+            failures.append(name)
+
+    def read(rel: str) -> str:
+        with open(os.path.join(ROOT, rel), encoding="utf-8") as fh:
+            return fh.read()
+
+    gui = read("dsh_gui_qt.py")
+    panel = read("dsh_panel.py")
+    dev = read("dsh_devtools.py")
+    console = read("dsh_console.py")
+    storage = read(os.path.join("dsh_host", "storage.py"))
+    theme = read("dsh_theme.py")
+
+    # ① 关掉最后一个窗口不能退出进程（否则绕过 _quit，服务变孤儿）
+    check("关窗口不退出进程（退出只走 _quit）",
+          "setQuitOnLastWindowClosed(False)" in gui)
+
+    # ② 退出要等后台线程；启动失败要把已经拉起来的进程收掉
+    check("退出前等主窗口的后台线程", "_join_workers()" in gui)
+    check("启动失败时回收已 spawn 的服务进程",
+          "def _abort" in gui and "self._abort(handle)" in gui)
+    check("启动流程有重入守卫", "self.starter is not None and self.starter.isRunning()" in gui)
+    check("_stop_service 在无 handle 时按 state 端口反查",
+          "contract.load_state() or {}" in gui)
+
+    # ③ 释放 WebEngine 时把两个调试窗口也收掉，并真正执行延迟删除
+    check("_drop_webview 会关闭调试窗口",
+          "_devwin.deleteLater()" in gui and "_inspector.close()" in gui)
+    check("_drop_webview 显式执行 DeferredDelete",
+          "sendPostedEvents(None, QEvent.Type.DeferredDelete)" in gui)
+
+    # ④ 提示窗不释放会随点击次数线性增长
+    check("提示窗用完即释放",
+          "dlg.deleteLater()" in theme or "deleteLater()" in theme)
+
+    # ⑤ 面板：切页不再重复付全量检测的代价
+    check("状态检测页有自动检测缓存", "CHECKS_TTL" in panel)
+
+    # ⑥ 开发者模式反复开关不漏句柄
+    check("控制台采集停止时关掉自己那几个 fd",
+          "self._orig_out" in console and "os.close(fd)" in console)
+
+    # ⑦ 主线程里不许再出现无预算的全树遍历
+    check("tree_usage 走 scandir 快路径", "_scan(path, budget_s=0" in storage)
+    check("清缓存覆盖 devtools-profile", "devtools-profile" in storage)
+
+    # ⑧ 单发定时器必须绑定接收者（控件提前销毁时不打空）
+    check("提示性单发定时器绑定了控件",
+          "QTimer.singleShot(1400, button" in dev
+          and "QTimer.singleShot(1200, btn" in panel)
+    return failures
+
+
 def main() -> int:
     #: CI 里没有装 DSH，起不了真实服务。设此变量只跑不依赖 DSH 的部分
     #: （引导窗口渲染、对话框文案、自更新纯逻辑），
@@ -1298,6 +1374,10 @@ def main() -> int:
     state["terminal_failures"] = terminal_checks()
     print()
 
+    print("== 体检结论的回归断言（退出 / 释放 / 重复连接 / 主线程遍历）==")
+    state["health_failures"] = health_checks()
+    print()
+
     if static_only:
         # 菜单结构检查不需要服务在跑——它只读菜单项文本与启用状态。
         # 但 MainWindow 的构造函数会立刻启动服务，所以这里用不启动
@@ -1307,12 +1387,20 @@ def main() -> int:
                or state.get("host_update_failures") or state.get("titlebar_failures")
                or state.get("panel_failures") or state.get("devtools_failures")
                or state.get("theme_failures") or state.get("console_failures")
-               or state.get("stack_failures") or state.get("terminal_failures"))
+               or state.get("stack_failures") or state.get("terminal_failures")
+               or state.get("health_failures"))
         if bad:
             print("\n用例失败：", "、".join(bad))
             return 1
         print("\nGUI 静态检查通过（未覆盖真实启动链路）")
         return 0
+
+    # 冒烟测试用**独立的 WebEngine profile 目录**：不去碰用户正在用的那份。
+    # 两个进程同抢一个缓存目录时 Chromium 会一路报 "Unable to move the cache"
+    # 并且首屏永不就绪——看起来像产品缺陷，实际是测试环境污染（2026-10-20 踩过）。
+    import tempfile
+    _prof_tmp = tempfile.mkdtemp(prefix="dsh-smoke-profile-")
+    os.environ["DSH_PROFILE_DIR"] = _prof_tmp
 
     win = g.MainWindow()
     win.show()
@@ -1461,6 +1549,22 @@ def main() -> int:
 
     win.starter.ready.connect(on_ready)
     win.starter.failed.connect(on_failed)
+
+    # 就绪信号可能**在连接之前就已经发完**（服务已存在时走 attach，0.5 秒就 ready；
+    # 以前每次要现起服务、6 秒以上，这个竞态一直没暴露）。信号错过就永远收不到，
+    # 于是这里再加一道轮询：只看 MainWindow 有没有拿到 handle。
+    def _poll_ready():
+        if state.get("ready_checks_done"):
+            poll.stop()
+            return
+        if win.handle is not None:
+            poll.stop()
+            print("  （就绪早于信号连接，按 handle 补跑一遍检查）")
+            on_ready(win.handle)
+
+    poll = QTimer()
+    poll.timeout.connect(_poll_ready)
+    poll.start(200)
     QTimer.singleShot(90000, app.quit)
     app.exec()
 
@@ -1472,7 +1576,7 @@ def main() -> int:
            or state.get("panel_failures") or state.get("webview_failures")
            or state.get("devtools_failures") or state.get("theme_failures")
            or state.get("console_failures") or state.get("stack_failures")
-           or state.get("terminal_failures"))
+           or state.get("terminal_failures") or state.get("health_failures"))
     # on_ready 里一旦抛异常，后面的检查会被静默跳过、测试却仍然"通过"。
     # 用一个完成标记把这种情况变成失败。
     if "handle" in state and not state.get("ready_checks_done"):

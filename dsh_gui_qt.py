@@ -57,7 +57,8 @@ if _UI_LANG:
         os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
             _flags + " --lang=" + _UI_LANG).strip()
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QUrl
+from PySide6.QtCore import (QCoreApplication, QEvent, Qt, QThread, Signal,
+                            QTimer, QUrl)
 from PySide6.QtGui import (QIcon, QAction, QDesktopServices, QImage,
                            QKeySequence, QShortcut)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
@@ -391,6 +392,7 @@ class StartupWorker(QThread):
         self.logf = logf
 
     def run(self):
+        handle = None
         try:
             # 先做环境自检：缺 Node / 缺 DSH 时不是"启动失败"，而是"还没准备好"，
             # 这两件事对用户的意义完全不同，走不同的界面
@@ -423,9 +425,30 @@ class StartupWorker(QThread):
             contract.save_state(handle)
             self.ready.emit(handle)
         except DshError as e:
+            self._abort(handle)
             self.failed.emit(str(e))
         except Exception as e:                                   # noqa: BLE001
+            self._abort(handle)
             self.failed.emit(f"{type(e).__name__}: {e}")
+
+    @staticmethod
+    def _abort(handle) -> None:
+        """启动链路失败时，把**已经拉起来的**进程收掉。
+
+        没有这一步的话，"就绪超时"/"端口回退后起不来"会留下一个没人管的
+        node.exe：占着端口、吃 300+ MB，而界面已经显示失败。用户看到的是
+        "服务明明在跑，可就是连不上"——比直接失败更难查（2026-10-20 体检）。
+        """
+        if handle is None:
+            return
+        try:
+            contract.stop(handle, port=handle.port)
+        except Exception:                                        # noqa: BLE001
+            pass
+        try:
+            contract.save_state(None)
+        except Exception:                                        # noqa: BLE001
+            pass
 
 
 class VersionReverifyWorker(QThread):
@@ -1228,6 +1251,14 @@ class MainWindow(QMainWindow):
         self._launch_startup()
 
     def _launch_startup(self):
+        # 重入守卫：切换来源、面板「自动准备运行环境」都会走到这里。没有守卫时
+        # 两个 StartupWorker 会并发 launch/wait_ready —— 多一个没人管的服务，
+        # 或者 attach 到同一个服务后 `_on_ready` 再跑一遍。`_swap_service` 和
+        # `_check_update` 都有同类守卫，只有启动这条没有（2026-10-20 体检补上）。
+        if self.starter is not None and self.starter.isRunning():
+            return
+        if self.starter is not None:
+            self.starter.deleteLater()
         self.starter = StartupWorker(requested_service_port(),
                                      bool(config.get("port_auto_fallback")),
                                      config.service_log())
@@ -1268,7 +1299,13 @@ class MainWindow(QMainWindow):
         if self.view is not None:
             return
         self.profile = QWebEngineProfile("dsh-profile", self)
-        self.profile.setPersistentStoragePath(config.profile_dir())
+        # `DSH_PROFILE_DIR` 只给自测/排查用：让一次冒烟测试不去碰用户正在用的
+        # profile 目录。踩过的坑（2026-10-20）：前一个探针进程还留着一个
+        # QtWebEngineProcess 握着 profile 的缓存锁，冒烟测试这边就一路报
+        # "Unable to move the cache: 拒绝访问 (0x5)"，然后启动链路超时——
+        # 看起来像产品缺陷，其实是两个进程抢同一个缓存目录。
+        self.profile.setPersistentStoragePath(
+            os.environ.get("DSH_PROFILE_DIR") or config.profile_dir())
         # 拦截器**不在关闭时挂载**：挂上之后每个请求都会回调进 Python
         # （图片、字体、轮询都算），"关闭状态只读一个布尔值"也是有成本的。
         # 关闭时干脆不挂，开关打开时再挂（见 _apply_dev_mode）。
@@ -1695,7 +1732,11 @@ class MainWindow(QMainWindow):
         host_log("服务就绪：%s | 端口 %s | 来源 %s"
                  % (handle.install.describe(), handle.port, handle.install.source))
         self._ensure_webview()
-        self.view.loadFinished.connect(self._on_view_loaded)
+        # UniqueConnection：`_on_ready` 会被 StartupWorker 与 `_swap_service.done`
+        # 反复调用（换来源、迁移数据后重启服务）。不加这个，一次加载会触发 N 条
+        # 渲染探针链 + N 条取色链（取色带整窗位图回读，最贵的一项）。
+        self.view.loadFinished.connect(self._on_view_loaded,
+                                       Qt.ConnectionType.UniqueConnection)
         self.view.load(QUrl(handle.url))
         QTimer.singleShot(15000, lambda: self.stack.setCurrentIndex(1))
         self._refresh_menu()
@@ -1871,7 +1912,9 @@ class MainWindow(QMainWindow):
         self._show_main()
         dlg = OnboardingDialog(self, rep)
         dlg.exec()
-        if dlg.succeeded:
+        ok = dlg.succeeded           # 先取出来：下面要延迟销毁这个对话框
+        dlg.deleteLater()
+        if ok:
             host_log("环境准备完成，重新启动服务")
             self.act_setup.setEnabled(False)
             self._set_tip("环境已就绪，正在启动…")
@@ -1896,10 +1939,20 @@ class MainWindow(QMainWindow):
         不再是菜单项（见 _quit 的说明），改为退出流程内部调用。
         保留成独立方法是为了让"停服务"和"退窗口"两件事在代码里仍然分开——
         将来若要恢复成两个入口，直接挂回菜单即可。
+
+        `self.handle` 为空时（启动还没就绪、或启动失败）退到 `service.json`
+        里记的端口：那种情况下进程是**已经起来了**的，不按端口反查就只能干看着
+        它常驻。`stop()` 对映像名做了校验，误杀别的程序的概率很低（2026-10-20 体检）。
         """
-        n = contract.stop(self.handle,
-                          port=(self.handle.port if self.handle else
-                                int(config.get("port") or 0)))
+        if self.handle is not None:
+            port = self.handle.port or 0
+        else:
+            state = contract.load_state() or {}
+            try:
+                port = int(state.get("port") or config.get("port") or 0)
+            except (TypeError, ValueError):
+                port = 0
+        n = contract.stop(self.handle, port=port)
         if n:
             contract.save_state(None)
         return n
@@ -2026,8 +2079,11 @@ class MainWindow(QMainWindow):
             return
         inst = self.handle.install
         dlg = ReinstallDialog(self, inst.version, self.handle)
-        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.new_handle:
-            self.handle = dlg.new_handle
+        accepted = dlg.exec() == QDialog.DialogCode.Accepted
+        new_handle = dlg.new_handle if accepted else None
+        dlg.deleteLater()            # 带整篇更新日志的对话框，不释放会一直挂着
+        if new_handle:
+            self.handle = new_handle
             self._ensure_webview()
             self.stack.setCurrentIndex(1)
             self.view.load(QUrl(self.handle.url))
@@ -2057,8 +2113,11 @@ class MainWindow(QMainWindow):
                 action=updater.action_for(self.handle.install.version, target),
             )
         dlg = UpdateDialog(self, info, self.handle)
-        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.new_handle:
-            self.handle = dlg.new_handle
+        accepted = dlg.exec() == QDialog.DialogCode.Accepted
+        new_handle = dlg.new_handle if accepted else None
+        dlg.deleteLater()            # 带整篇更新日志的对话框，不释放会一直挂着
+        if new_handle:
+            self.handle = new_handle
             self._ensure_webview()
             self.stack.setCurrentIndex(1)
             self.view.load(QUrl(self.handle.url))
@@ -2118,6 +2177,7 @@ class MainWindow(QMainWindow):
     def _show_host_update_dialog(self, rel):
         dlg = HostUpdateDialog(self, rel)
         result = dlg.exec()
+        dlg.deleteLater()            # 带整篇更新日志的对话框，不释放会一直挂着
         if result == HostUpdateDialog.RESTART_NOW:
             self._relaunch_after_update()
 
@@ -2346,8 +2406,20 @@ class MainWindow(QMainWindow):
 
         删/搬数据目录前**必须**先做这一步：Windows 上 WebEngine 进程会锁住
         profile 目录里的缓存文件，不释放就删不掉、也复制不完整。
+
+        两个调试窗口也一起关掉（2026-10-20 体检）：`DevWindow` 与
+        `InspectorWindow` 都缓存着 `self.page`，视图没了它们就成了"握着已删对象"
+        的窗口——`_open_dev_window` 又只在 `_devwin is None` 时创建，于是
+        迁一次数据之后轻量日志窗口就永久坏了（点布局/环境页直接 RuntimeError）。
         """
         try:
+            if getattr(self, "_devwin", None) is not None:
+                self._devwin.close()
+                self._devwin.deleteLater()
+                self._devwin = None
+            if getattr(self, "_inspector", None) is not None:
+                self._inspector.close()      # WA_DeleteOnClose，会自己销毁
+                self._inspector = None
             if self.view is not None:
                 self.stack.removeWidget(self.view)
                 self.view.deleteLater()
@@ -2358,7 +2430,11 @@ class MainWindow(QMainWindow):
                 self.profile = None
         except Exception:                                      # noqa: BLE001
             pass
+        # `deleteLater()` 是异步的：`processEvents()` 在本地循环里**不处理**
+        # DeferredDelete，所以光靠它并不保证 profile 已经释放、目录句柄已经关掉。
+        # 显式把排队中的删除事件跑掉，后面的 rmtree/copytree 才不会撞上"文件被占用"。
         QApplication.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
     def _swap_service(self, note: str = "") -> None:
         """按当前配置重启后台服务（来源 / 数据目录变了之后）。"""
@@ -2573,6 +2649,11 @@ class MainWindow(QMainWindow):
                     host_log("警告：面板的后台检测线程未在超时内结束")
             except Exception as e:                               # noqa: BLE001
                 host_log("退出时收尾面板失败：%s: %s" % (type(e).__name__, e))
+        # 主窗口自己的后台任务同理，而且更危险：启动线程半路被丢下还会继续把
+        # 服务拉起来，于是退出后留下一个孤儿 node.exe（2026-10-20 体检补上）。
+        left = self._join_workers()
+        if left:
+            host_log("警告：后台任务未在超时内结束：%s" % "、".join(left))
         try:
             n = self._stop_service()
             host_log("已停止后台服务（%d 个进程）" % n)
@@ -2580,6 +2661,23 @@ class MainWindow(QMainWindow):
             host_log("退出时停止服务失败：%s: %s" % (type(e).__name__, e))
         self.tray.hide()
         QApplication.quit()
+
+    #: 退出时要等它收尾的后台任务（属性名）。面板自己的线程由 panel.shutdown() 管。
+    _WORKERS = ("starter", "_reverify", "_checker", "_host_checker", "_swap_worker")
+
+    def _join_workers(self, timeout_ms: int = 4000) -> list:
+        """等主窗口的后台线程收尾，返回超时没等到的属性名。
+
+        `wait()` 只等、不打断 `run()` 里的同步代码——这正是我们要的：
+        等服务探测/启动走到一个安全点，再把它停掉。总预算按线程数叠加，
+        实际退出路径上通常一个都不需要等。
+        """
+        left = []
+        for name in self._WORKERS:
+            w = getattr(self, name, None)
+            if w is not None and w.isRunning() and not w.wait(timeout_ms):
+                left.append(name)
+        return left
 
     def closeEvent(self, event):
         event.ignore()
@@ -2608,6 +2706,19 @@ def main() -> int:
     QApplication.setApplicationName("DSH-Web")
     QApplication.setOrganizationName("DSH")
     app = QApplication(sys.argv)
+
+    # **最后一个窗口关闭不等于退出**（2026-10-20 体检发现，实测复现）。
+    #
+    # 这是个"关掉面板，整个程序就没了，但后台服务还在跑"的坑：
+    #   · 主窗口的 closeEvent 是 ignore()+hide()（最小化到托盘），此时没有可见窗口；
+    #   · 控制面板/开发者窗口都是**无父顶层窗口**，关掉它们就触发了 Qt 默认的
+    #     "最后一个窗口关闭 → 退出应用"；
+    #   · 但那个退出路径**不经过 `_quit()`**，于是后台服务不会被停掉：
+    #     进程表里留着 node.exe 占着端口，`service.json` 也没清，用户下次启动
+    #     会 attach 到这个孤儿服务上——表现是"关了个窗口，怎么后台一直在跑"。
+    #
+    # 所以：退出只走 `_quit()`（托盘菜单），窗口的开关一概不退出进程。
+    app.setQuitOnLastWindowClosed(False)
 
     # 打包产物资源自检：设了环境变量就只检查、写报告、退出，不进 GUI。
     # CI 构建完 exe 后立刻跑这个，用来兜住"包里没带 assets"这类问题。
@@ -2678,13 +2789,20 @@ def main() -> int:
     # 其他版本的 onefile 解包目录也一并清掉。
     # 每个版本用自己的解包目录（这样新旧才能同跑，见 release.yml 的说明），
     # 不清就会一版一版攒下来。正在运行的旧实例锁着自己那个，删不掉是正常的。
-    try:
-        gone = selfupdate.cleanup_stale_runtimes()
-        if gone:
-            host_log("已清理 %d 个旧版解包目录" % len(gone))
-    except Exception as e:                                       # noqa: BLE001
-        host_log("清理旧版解包目录失败（不影响使用）：%s: %s"
-                 % (type(e).__name__, e))
+    #
+    # **推迟到窗口出来之后再做**（2026-10-20 体检）：一次更新之后这里可能要删
+    # 几份旧解包目录（每份几百 MB），rmtree 是同步的——排在创建主窗口之前，
+    # 用户看到的就是"点了图标等好几秒才出现窗口"。它对启动不是必需的。
+    def _cleanup_old_runtimes():
+        try:
+            gone = selfupdate.cleanup_stale_runtimes()
+            if gone:
+                host_log("已清理 %d 个旧版解包目录" % len(gone))
+        except Exception as e:                                   # noqa: BLE001
+            host_log("清理旧版解包目录失败（不影响使用）：%s: %s"
+                     % (type(e).__name__, e))
+
+    QTimer.singleShot(2500, _cleanup_old_runtimes)
 
     server = QLocalServer()
     server.listen(SINGLETON_ID)

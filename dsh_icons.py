@@ -16,6 +16,8 @@ Lucide 用 `stroke="currentColor"`，而 **QtSvg 没有 CSS 上下文、不解�
 """
 from __future__ import annotations
 
+from functools import lru_cache
+
 from PySide6.QtCore import QByteArray
 from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPixmap
 from PySide6.QtSvg import QSvgRenderer
@@ -72,6 +74,21 @@ def recolor(svg: str, color: str) -> bytes:
 
 def render(name: str, size: int, color: str, dpr: float = 1.0) -> QImage:
     """按名字渲染成 ARGB32 图像（透明底）。dpr 用于 HiDPI。"""
+    return _render_cached(name, int(size), str(color), float(dpr)).copy()
+
+
+@lru_cache(maxsize=96)
+def _render_cached(name: str, size: int, color: str, dpr: float) -> QImage:
+    """渲染结果缓存。
+
+    为什么需要（2026-10-20 体检）：`qicon()` 一次要渲染 1x/1.5x/2x 三张位图，
+    而面板切页、切主题、每个提示窗都会重新要图标——等于反复解析同一份 SVG。
+    缓存键里带颜色与 dpr，所以切主题不会拿到旧配色的图。
+    上限 96：界面用到的组合（约 20 个图标 × 2 套配色）远小于它，不会顶掉热项。
+
+    `render()` 返回 `.copy()`：QImage 是隐式共享的，但调用方可能要往上面画
+    （或交给 QPixmap 后不再关心），拷一份两块钱，省得互相踩。
+    """
     px = max(1, int(round(size * dpr)))
     img = QImage(px, px, QImage.Format.Format_ARGB32)
     img.fill(QColor(0, 0, 0, 0))

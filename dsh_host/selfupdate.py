@@ -39,6 +39,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -466,14 +467,25 @@ def download(rel: HostRelease, on_progress=None, timeout: float = 60) -> str:
                 with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r, \
                         open(tmp, "wb") as f:
                     expected = int(r.headers.get("Content-Length") or 0)
+                    # 进度回调节流（2026-10-20 体检）：以前每 64 KB 回调一次，
+                    # 120 MB 的包 ≈1900 次跨线程信号，每次都要写一遍日志文件 +
+                    # 往 QTextCursor 里插一行。改成"每 512 KB 或每 120 ms 一次"，
+                    # 观感不变（进度条本来就按百分比走），开销降到 1/8 以下。
+                    last_emit = 0
+                    last_at = time.monotonic()
                     while True:
                         chunk = r.read(65536)
                         if not chunk:
                             break
                         f.write(chunk)
                         downloaded += len(chunk)
-                        if on_progress:
+                        now = time.monotonic()
+                        if on_progress and (downloaded - last_emit >= 512 * 1024
+                                            or now - last_at >= 0.12):
+                            last_emit, last_at = downloaded, now
                             on_progress(downloaded, expected)
+                    if on_progress:
+                        on_progress(downloaded, expected)   # 收尾时补一次 100%
                 ok = True
                 break
             except (urllib.error.URLError, OSError) as e:

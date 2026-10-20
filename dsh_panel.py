@@ -1274,6 +1274,8 @@ class GeneralPage(BasePage):
         w = self._usage_worker
         if w is not None and w.isRunning():
             return            # 已经在算了，算完自己会回填
+        if w is not None:
+            w.deleteLater()   # 不释放的话，每次 TTL 到期都多一个 QThread 常驻
         if self._usage is None:
             self.kv_usage.set("统计中…")
         self._usage_worker = UsageWorker(self.host.usage, self)
@@ -1294,8 +1296,19 @@ class GeneralPage(BasePage):
 
     def _render_usage(self, info: dict) -> None:
         self.kv_root.set(info.get("root") or self.host.data_dir())
-        self.kv_usage.set("%s · %d 个文件"
-                          % (storage.str_of_bytes(info["bytes"]), info["files"]))
+        partial = bool(info.get("partial"))
+        # 数字一律粗粒度：文件数上万就按"万"报（见 storage.str_of_count）。
+        # 用户的原话是"不需要那么精细"，而 66447 这种精度对"占多大"没有帮助。
+        text = "%s · %s 个文件" % (storage.str_of_bytes(info["bytes"]),
+                                  storage.str_of_count(info["files"]))
+        if partial:
+            text = "≥ " + text
+            self.kv_usage.setToolTip(
+                "文件太多，统计到预算上限就停了（结果偏小）。数字够判断大小了，"
+                "需要精确值可以在资源管理器里看目录属性。")
+        else:
+            self.kv_usage.setToolTip("")
+        self.kv_usage.set(text)
         # 明细行重建（组数很少，重建比增删维护简单）
         for r in self.group_rows:
             r.setParent(None)
@@ -1304,8 +1317,9 @@ class GeneralPage(BasePage):
         card = getattr(self, "card_data", None)
         for g in info.get("groups", ()):
             r = KeyValueRow("　" + g["label"],
-                            "%s · %d 个文件"
-                            % (storage.str_of_bytes(g["bytes"]), g["files"]),
+                            "%s · %s 个文件"
+                            % (storage.str_of_bytes(g["bytes"]),
+                               storage.str_of_count(g["files"])),
                             self.pal)
             r.setToolTip(g["hint"])
             if card is not None and hasattr(card, "add"):
@@ -1461,7 +1475,7 @@ class DeployPage(BasePage):
         # 就地反馈，不弹对话框——复制这类动作不该打断用户
         old = btn.text()
         btn.setText("已复制")
-        QTimer.singleShot(1200, lambda: btn.setText(old))
+        QTimer.singleShot(1200, btn, lambda: btn.setText(old))
 
 
 class RunModePage(BasePage):
@@ -1585,6 +1599,9 @@ class RunModePage(BasePage):
 class StatusPage(BasePage):
     """状态检测：只报告，不修复。"""
 
+    #: 自动检测的复用期限（秒）。手动点「重新检测」不受它影响，永远真跑。
+    CHECKS_TTL = 30.0
+
     def build(self) -> None:
         head_w = QWidget()
         head = QHBoxLayout(head_w)
@@ -1621,19 +1638,33 @@ class StatusPage(BasePage):
 
         self._worker = None
         self._chan_worker = None
+        self._checked_at = 0.0        # 上次自动检测完成的时刻（monotonic）
 
     def on_show(self) -> None:
         if not self._built:
             super().on_show()
-        self.run_checks()
+        self.run_checks(auto=True)
 
-    def run_checks(self) -> None:
+    def run_checks(self, auto: bool = False) -> None:
+        """跑一遍本地检测。`auto=True` 是"切到本页顺带看一眼"，走缓存。
+
+        为什么要有缓存（2026-10-20 体检）：一次检测会 spawn 一次
+        `node --version`（实测 65ms）并对 DSH_HOME 做全树指纹
+        （上限 6 万条 / 20 秒）。而它挂在 `on_show()` 上——用户来回切页签
+        就反复重跑，纯属白费。手动点「重新检测」永远是**真跑**。
+        """
+        if auto and self._checked_at and \
+                time.monotonic() - self._checked_at < self.CHECKS_TTL:
+            return
         if self._worker is not None and self._worker.isRunning():
             return
         for k in LOCAL_KEYS:
             self.rows[k].dot.set_state(STATE_UNKNOWN)
             self.rows[k].value_lbl.setText("检测中…")
         self.btn_recheck.setEnabled(False)
+        old = self._worker
+        if old is not None:
+            old.deleteLater()    # 不释放的话，每次重检都多一个永不回收的 QThread
         self._worker = ChecksWorker(self.host, self)
         self._worker.done.connect(self._on_checks)
         self._worker.start()
@@ -1644,6 +1675,7 @@ class StatusPage(BasePage):
             if row is None:
                 continue     # 例如 "error" 这种额外结果，界面暂不展示
             row.apply(res)
+        self._checked_at = time.monotonic()
         self.btn_recheck.setEnabled(True)
 
     def run_channel(self) -> None:
@@ -1654,6 +1686,9 @@ class StatusPage(BasePage):
         row.dot.set_state(STATE_UNKNOWN)
         row.value_lbl.setText("查询中…")
         self.btn_channel.setEnabled(False)
+        old = self._chan_worker
+        if old is not None:
+            old.deleteLater()
         self._chan_worker = ChannelWorker(self.host.install(), self)
         self._chan_worker.done.connect(self._on_channel)
         self._chan_worker.start()
@@ -2044,6 +2079,31 @@ def selftest_checks() -> list:
         if not (0.02 < r < 0.60):
             bad_icons.append("%s=%.3f" % (name, r))
     check("全部图标渲染比例正常", not bad_icons, "、".join(bad_icons[:4]))
+
+    # --- 数据目录统计：粗粒度文案 + 预算保护（2026-10-20 第二轮反馈）---
+    # 用户："文件数量太大的话统计耗时又占用内存，不需要那么精细"。
+    # 所以：文案上万按"万"报，并且统计有硬预算（超了标"≥"而不是硬算到底）。
+    counts = [(0, "0"), (999, "999"), (9999, "9999"), (10000, "1.0 万"),
+              (66447, "6.6 万"), (1200000, "120 万")]
+    bad_counts = ["%d→%s(应 %s)" % (n, storage.str_of_count(n), want)
+                  for n, want in counts if storage.str_of_count(n) != want]
+    check("文件数文案是粗粒度的", not bad_counts, "、".join(bad_counts))
+
+    import tempfile as _tempfile
+    with _tempfile.TemporaryDirectory() as _tmp:
+        for _i in range(5):
+            with open(os.path.join(_tmp, "f%d" % _i), "wb") as _fh:
+                _fh.write(b"abc")
+        _f1, _b1, _p1, _partial1 = storage._scan(_tmp)
+        _f2, _b2, _p2, _partial2 = storage._scan(_tmp, budget_s=-1)
+        _f3, _b3, _p3, _partial3 = storage._scan(_tmp, max_entries=2)
+    check("统计正常时数字准确且不打不完整标记",
+          (_f1, _b1, _partial1) == (5, 15, False),
+          "%s 个文件 / %s 字节 / partial=%s" % (_f1, _b1, _partial1))
+    check("超时间预算时立刻停并标记不完整",
+          _partial2 and _f2 <= 5, "partial=%s files=%s" % (_partial2, _f2))
+    check("超条目上限时标记不完整", _partial3 and _f3 <= 2,
+          "partial=%s files=%s" % (_partial3, _f3))
 
     # 假的数据根统计：真去数本机那块盘要好几秒（几百兆 / 几万文件），
     # 自测不该为了验渲染去付这个代价。sleep 是用来**假装**那次全树遍历的，

@@ -149,21 +149,23 @@ def fetch_dist_tags(install: contract.DshInstall, timeout: float = 90) -> dict:
 
 
 def _parse_json_object(text: str) -> dict | None:
-    """npm 输出可能夹杂警告行，从第一个 { 起截取。"""
+    """npm 输出可能夹杂警告行，从第一个 `{` 起取一个完整的 JSON 对象。
+
+    为什么不用"从末尾往前截、反复 json.loads"（2026-10-20 体检）：
+    那是对整段文本反复解析，尾部有 N 字节噪声就白跑 N 次，实测 17 KB 噪声
+    要 57 ms（O(n²)）。`raw_decode` 一次就能告诉我们在哪里停，且多余内容
+    直接忽略——正是"从噪声里挑 JSON"想要的行为。
+    """
     if not text:
         return None
     start = text.find("{")
     if start < 0:
         return None
-    for end in range(len(text), start, -1):
-        try:
-            data = json.loads(text[start:end])
-            if isinstance(data, dict):
-                return data
-            return None
-        except ValueError:
-            continue
-    return None
+    try:
+        data, _end = json.JSONDecoder().raw_decode(text[start:])
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def get_registry(install: contract.DshInstall) -> str:

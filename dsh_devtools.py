@@ -923,7 +923,9 @@ class TerminalView(QWidget):
 
     def _flash(self, button: QPushButton, text: str, restore: str) -> None:
         button.setText(text)
-        QTimer.singleShot(1400, lambda: button.setText(restore))
+        # 绑定到按钮自己（context 重载）：1.4 秒内窗口被关掉时定时器随之作废，
+        # 不会去碰一个已经删掉的控件（否则槽里抛 RuntimeError，还被 Qt 吞掉）。
+        QTimer.singleShot(1400, button, lambda: button.setText(restore))
 
     def _copy_all(self) -> None:
         from PySide6.QtWidgets import QApplication

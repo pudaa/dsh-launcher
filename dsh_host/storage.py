@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import time
 
 from . import config
 
@@ -40,19 +41,40 @@ def str_of_bytes(n: float) -> str:
     return "%.1f GB" % n
 
 
+def str_of_count(n: int) -> str:
+    """给界面用的文件数文案（粗粒度）。
+
+    用户明确说过"不需要那么精细"，而且 66447 这种精确数字对"占多大"的判断
+    毫无帮助——反而暗示"数得越准越可信"。所以上万以后按"万"报：
+        9999 → "9999"      66447 → "6.6 万"      1200000 → "120 万"
+    """
+    n = int(n)
+    if n < 10000:
+        return str(n)
+    if n < 100000:
+        return "%.1f 万" % (n / 10000.0)
+    return "%.0f 万" % (n / 10000.0)
+
+
+#: 单次统计的时间预算（秒）。超了就停，宁可给一个"偏小"的近似值。
+SCAN_BUDGET_S = 3.0
+
+#: 单次统计的条目上限（文件 + 目录）。防止极端目录（几十万小文件）把
+#: 后台线程拖成几十秒——那时用户早就切走了，结果没人看。
+SCAN_MAX_ENTRIES = 400_000
+
+
 def tree_usage(path: str) -> tuple[int, int]:
-    """返回 (文件数, 总字节)。路径不存在时返回 (0, 0)。"""
-    files = 0
-    total = 0
+    """返回 (文件数, 总字节)。路径不存在时返回 (0, 0)。
+
+    用 `_scan()` 的同一套 scandir 逻辑，**无时间预算**（这里的调用方是
+    迁移前/后的完整性核对，宁可慢也要数准）。旧实现是 `os.walk` +
+    `os.path.getsize`：每个文件额外 stat 一次，在 Windows 上等于再打开一次
+    文件，实测比这里慢 8 倍（66443 文件的真实数据根：5.8s → 0.7s）。
+    """
     if not os.path.isdir(path):
         return 0, 0
-    for root, _dirs, names in os.walk(path):
-        for name in names:
-            files += 1
-            try:
-                total += os.path.getsize(os.path.join(root, name))
-            except OSError:
-                pass
+    files, total, _per, _partial = _scan(path, budget_s=0, max_entries=0)
     return files, total
 
 
@@ -67,52 +89,85 @@ GROUPS = (
 )
 
 
-def _scan(root: str) -> tuple[int, int, dict]:
-    """**一次**遍历数据根，同时算出总量与每个分组的占用。
+def _scan(root: str, budget_s: float = SCAN_BUDGET_S,
+          max_entries: int = SCAN_MAX_ENTRIES) -> tuple[int, int, dict, bool]:
+    """一次遍历算出总量与各分组占用；超预算就带着"不完整"标记返回。
 
-    为什么要一次遍历（2026-10-20）
-    -----------------------------
-    以前 `breakdown()` 对数据根和 4 个分组各跑一遍 `tree_usage()`，等于把整棵树
-    走两遍。私有部署下这棵树是 **6.6 万个文件 / 727 MB**，实测 10.2 秒
-    （Windows Defender 逐文件扫描是主要成本）。一次遍历后 **5.1 秒**（2.0x），
-    剩下的交给后台线程（`dsh_panel.UsageWorker`）——它以前就在界面线程里同步跑，
-    于是"每次切到「常规」页都卡十几秒"。
+    为什么这么写（2026-10-20 用户的第二版反馈："文件数量大的话耗时长又占内存，
+    不需要那么精细"）
+    ---------------------------------------------------------------------------
+    1. **用 `os.scandir` 而不是 `os.walk` + `os.path.getsize`**：后者每读一个
+       文件都要再 `stat()` 一次，在 Windows 上等于再打开一次文件——Defender
+       逐个扫，这就是 5 秒里的大头。`scandir` 的目录枚举结果里已经带 size，
+       `entry.stat()` 直接命中缓存，**同一次枚举就能拿到**。
+    2. **时间/条目预算**：真遇到几十万小文件的目录，宁可给个近似值也不让
+       后台线程跑几十秒。超预算时 `partial=True`，界面会标"≥"并说明原因。
+    3. 只统计根下第一层目录对应的分组；直接躺在根上的文件只计入总量。
 
-    返回 (文件数, 总字节, {分组key: [文件数, 字节]})。只统计根下第一层目录
-    对应的分组；直接躺在根上的文件只计入总量（由调用方算进 "other"）。
+    `budget_s=0` / `max_entries=0` 表示**不设该上限**（`tree_usage()` 走这条，
+    它要的是准确值，不是快）。
+
+    返回 (文件数, 总字节, {分组key: [文件数, 字节]}, 是否不完整)。
     """
     per = {key: [0, 0] for key, _label, _hint in GROUPS}
     files = 0
     total = 0
+    seen = 0
     if not os.path.isdir(root):
-        return 0, 0, per
-    base = os.path.abspath(root)
-    for cur, _dirs, names in os.walk(base):
-        rel = os.path.relpath(cur, base)
-        bucket = None if rel == os.curdir else per.get(rel.split(os.sep, 1)[0])
-        for name in names:
-            files += 1
-            try:
-                size = os.path.getsize(os.path.join(cur, name))
-            except OSError:
-                size = 0
-            total += size
-            if bucket is not None:
-                bucket[0] += 1
-                bucket[1] += size
-    return files, total, per
+        return 0, 0, per, False
+    deadline = time.monotonic() + budget_s if budget_s else None
+
+    # 显式栈代替递归：目录层级不受 Python 递归上限影响。
+    # 每项是 (目录绝对路径, 该目录所属的分组 key 或 None)。
+    stack = [(os.path.abspath(root), None)]
+    while stack:
+        cur, group = stack.pop()
+        try:
+            it = os.scandir(cur)
+        except OSError:
+            continue                      # 权限不足 / 半路被删，跳过这一层
+        with it:
+            for entry in it:
+                seen += 1
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        child = group
+                        # 只有根下的第一层目录才认分组名；更深的继承父级
+                        if child is None and entry.name in per:
+                            child = entry.name
+                        stack.append((entry.path, child))
+                        continue
+                    # 目录枚举里已经带 stat 信息，这一次调用不额外打开文件
+                    size = entry.stat(follow_symlinks=False).st_size
+                except OSError:
+                    continue                  # 读不到就跳过，别让整次统计失败
+                files += 1
+                total += size
+                if group is not None:
+                    per[group][0] += 1
+                    per[group][1] += size
+                if max_entries and seen >= max_entries:
+                    return files, total, per, True
+                # 每 512 项看一次表（每项都调 monotonic 也要钱）；第 1 项时
+                # 也查一次，这样"预算已经用完"（budget_s<=0）能立刻生效，
+                # 小目录不会因为凑不满一个批次就绕过预算。
+                if deadline is not None and (seen <= 1 or (seen & 511) == 0) \
+                        and time.monotonic() > deadline:
+                    return files, total, per, True
+    return files, total, per, False
 
 
 def breakdown() -> dict:
     """当前数据根的占用明细。
 
-    返回 {"root", "files", "bytes", "groups": [{key,label,hint,files,bytes}], "other"}。
+    返回 {"root", "files", "bytes", "groups": [{key,label,hint,files,bytes}],
+          "other", "is_default", "partial"}。
 
     ⚠️ 这个调用**很贵**（秒级，见 `_scan` 的说明）。界面线程里不要直接调它，
     用 `dsh_panel.UsageWorker` 挪到后台。
     """
     root = config.data_root()
-    files, total, per = _scan(root)
+    files, total, per, partial = _scan(root)
     groups = []
     counted = 0
     for key, label, hint in GROUPS:
@@ -127,6 +182,7 @@ def breakdown() -> dict:
         "bytes": total,
         "groups": groups,
         "other": max(0, total - counted),
+        "partial": partial,
         "is_default": os.path.normcase(os.path.abspath(root))
         == os.path.normcase(os.path.abspath(config.default_root())),
     }
@@ -202,7 +258,10 @@ def clear_cache() -> tuple[int, int]:
     删了要重新登录——所以这一步在界面上要写清楚。
     """
     freed_files = freed_bytes = 0
-    for name in ("profile", "logs", "cache"):
+    # devtools-profile 也要清（2026-10-20 体检）：那是 Chromium 给开发者工具
+    # 单独开的 profile，缓存在 `data_root()/devtools-profile`，以前不在清理范围内，
+    # 越用越大，而用户在"清理缓存"里看不到它。
+    for name in ("profile", "devtools-profile", "logs", "cache"):
         p = os.path.join(config.data_root(), name)
         f, b = tree_usage(p)
         if os.path.isdir(p):

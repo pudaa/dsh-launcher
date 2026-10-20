@@ -580,22 +580,36 @@ class MessageDialog(QDialog):
         self.setMinimumWidth(max(380, min(560, width)))
 
     # ---- 便捷入口（与 QMessageBox 的用法一一对应） ----
+    #
+    # 每个入口都会 `deleteLater()`（2026-10-20 体检）。原因：这些窗口以主窗口为
+    # parent，C++ 归属在父对象手里——Python 侧执行完把引用丢掉**不会**释放它，
+    # 于是每弹一次提示，主窗口的 children 里就永久多一个 QDialog（含图标位图、
+    # 若干标签与布局）。用户点"知道了"几百次就是一个几百个对话框的主窗口。
+    #
+    # 用延迟删除而不是 `WA_DeleteOnClose`：调用方在 `exec()` 返回后还会读
+    # `dlg.new_handle` 之类的成员，立刻销毁会变成访问已删对象。
+    @classmethod
+    def _run(cls, dlg) -> int:
+        try:
+            return dlg.exec()
+        finally:
+            dlg.deleteLater()
 
     @classmethod
     def info(cls, parent, title: str, text: str, ok_text: str = "知道了") -> int:
-        return cls(parent, title, text, "info", ok_text).exec()
+        return cls._run(cls(parent, title, text, "info", ok_text))
 
     @classmethod
     def warn(cls, parent, title: str, text: str, ok_text: str = "知道了") -> int:
-        return cls(parent, title, text, "warn", ok_text).exec()
+        return cls._run(cls(parent, title, text, "warn", ok_text))
 
     @classmethod
     def error(cls, parent, title: str, text: str, ok_text: str = "知道了") -> int:
-        return cls(parent, title, text, "error", ok_text).exec()
+        return cls._run(cls(parent, title, text, "error", ok_text))
 
     @classmethod
     def about(cls, parent, title: str, text: str, ok_text: str = "关闭") -> int:
-        return cls(parent, title, text, "about", ok_text).exec()
+        return cls._run(cls(parent, title, text, "about", ok_text))
 
     @classmethod
     def ask(cls, parent, title: str, text: str,
@@ -605,5 +619,5 @@ class MessageDialog(QDialog):
         统一用 warn 图标：这些操作都不致命，但确实会改东西，
         用 info 的绿勾会让人以为"只是通知一下"。
         """
-        return cls(parent, title, text, "warn",
-                   ok_text, cancel_text).exec() == QDialog.DialogCode.Accepted
+        return (cls._run(cls(parent, title, text, "warn", ok_text, cancel_text))
+                == QDialog.DialogCode.Accepted)
