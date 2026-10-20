@@ -178,6 +178,14 @@ QWidget#pageContent { background: transparent; }
 QScrollArea#pageScroll { background: transparent; border: none; }
 QScrollArea#pageScroll > QWidget > QWidget { background: transparent; }
 
+/* 兜底：不带 objectName 的 QLabel 也必须跟主题走。
+   少了这一条，暗色下会出现"黑底黑字"——控件回落系统默认色（黑），
+   而背景是深色；浅色下偶发"白底白字"则是控件自带白底没被覆盖。
+   具名规则（#kv_k 等）优先级更高，仍然按需覆盖（2026-10-20 老大反馈）。 */
+QLabel             { color: $text; font-family: $font; font-size: 13px; }
+QTextBrowser, QTextEdit, QPlainTextEdit {
+    color: $text; background: transparent; border: none; }
+
 QLabel#panelTitle  { color: $text; font-family: $font; font-size: 13px; }
 QLabel#statusText  { color: $muted; font-family: $font; font-size: 12px; }
 QLabel#h1          { color: $text; font-family: $font; font-size: 19px; font-weight: 600; }
@@ -237,7 +245,7 @@ def build_style(pal: dict) -> str:
         r_win=R_WINDOW,
         btn_fill=pal["btn_fill"], btn_hover=pal["btn_hover"],
         primary_fill=pal["primary_fill"], primary_hover=pal["primary_hover"],
-        primary_text=pal["primary_text"],
+        primary_text=pal["primary_text"], bg=pal["bg"],
     )
 
 
@@ -1291,6 +1299,7 @@ class DeployPage(BasePage):
         # 只是从"日常入口"降级成"不想自己装时的兜底"，且必须点进这一页才看得到。
         c3 = Card("不想自己装？", self.pal)
         c3.add_text("可以让桌面壳代劳：自动安装 Node.js 与 DeepSeek Harness。"
+                    "装到应用自己的数据目录（和命令行里那份互不影响）。"
                     "需要联网，中途会弹出进度窗口。")
         holder = QWidget()
         lay = QHBoxLayout(holder)

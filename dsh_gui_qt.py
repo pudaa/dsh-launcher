@@ -1035,8 +1035,14 @@ class ReinstallDialog(QDialog):
         lay.setContentsMargins(16, 16, 16, 16)
         lay.setSpacing(12)
 
+        _inst = getattr(handle, "install", None)
+        _where = ""
+        if _inst is not None:
+            _src = "私有安装" if "私有" in str(_inst.source) else "命令行那份（公共）"
+            _where = "\n\n安装位置：%s\n（%s）" % (_inst.prefix, _src)
         headline = QLabel(
-            "将重新安装 DeepSeek Harness v%s（就是当前这个版本）。" % version)
+            "将重新安装 DeepSeek Harness v%s（就是当前这个版本）。%s"
+            % (version, _where))
         headline.setObjectName("dlgBody")
         headline.setWordWrap(True)
         lay.addWidget(headline)

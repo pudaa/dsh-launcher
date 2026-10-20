@@ -131,7 +131,20 @@ def install_node_via_winget(on_line=None) -> tuple[bool, str]:
 
 
 def install_dsh(on_line=None, tag: str = DEFAULT_TAG) -> tuple[bool, str]:
-    """用官方 npm 通道把 DSH 装进我们的私有 prefix（免管理员）。"""
+    """用官方 npm 通道把 DSH 装进我们的私有 prefix（免管理员）。
+
+    2026-10-20：**公共模式下直接拒绝**。这里固定写私有 prefix，如果当前
+    `dsh_source == "system"`，装出来也不会被用——用户会以为装好了，
+    界面却还是找不到 DSH。要装公共那份请用命令行，或在「运行方式」页切回自动。
+    """
+    if str(config.get("dsh_source") or "auto") == "system":
+        return False, (
+            "当前是「公共安装」模式，而自动安装只能装到应用自己的数据目录"
+            "（免管理员、与命令行隔离）。\n\n"
+            "两个选择：\n"
+            "· 用命令行安装公共那份：npm install -g @deepseek-ai/dsh\n"
+            "· 或在「运行方式」页切回「自动」，再用这里的自动安装")
+
     node = contract.find_node()
     if not node:
         return False, "未找到 Node.js，无法安装 DeepSeek Harness。"
