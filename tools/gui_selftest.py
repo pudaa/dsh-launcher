@@ -489,25 +489,20 @@ def host_update_checks() -> list[str]:
               f"  closeEvent={hasattr(getattr(g, 'ReinstallDialog', None), 'closeEvent')}"
               f"  动作接线={'reinstall_dsh' in inspect.getsource(g.MainWindow._panel_action)}")
 
-    # 1g. 登录弹窗与刷新自救（2026-10-20 白屏事故）。
-    #     DSH 登录第一步是 window.open("about:blank")，旧实现把它当"页面内部
-    #     导航"丢给主视图，整个应用变成空白页。三条一起钉：
-    #     占位请求必须走弹窗、主视图不许接、必须有刷新入口。
+    # 1g. 登录窗口：window.open 一律拒绝（对齐官方 deny），不能开 WebEngine 窗口。
+    #     Qt 下自建窗口拿不到有效的 window 对象，DSH 后续导航不会发生，
+    #     结果就是一个永远空白的窗口 + 登录卡住（2026-10-20 实测）。
+    #     同时仍要保留刷新入口作为页面跑偏时的自救。
     import dsh_devtools as _dt
     _src = inspect.getsource(_dt.ShellPage._on_new_window)
-    # act_reload 是实例属性，hasattr(类) 查不到；直接看类源码里有没有接上。
-    _cls_src = inspect.getsource(g.MainWindow)
-    ok = (hasattr(_dt, "PopupWindow")
-          and "_spawn_popup" in _src
-          and '"about"' in _src
-          and "def _reload_page" in _cls_src
-          and "act_reload" in _cls_src)
-    print(f"  [{'OK  ' if ok else 'FAIL'}] 登录弹窗不占主视图，且提供刷新入口")
+    ok = ('"about"' in _src and "已拒绝" in _src
+          and not hasattr(_dt, "PopupWindow")
+          and "def _reload_page" in inspect.getsource(g.MainWindow))
+    print(f"  [{'OK  ' if ok else 'FAIL'}] window.open 被拒绝且提供刷新入口")
     if not ok:
         failures.append("登录弹窗/刷新入口")
-        print(f"        PopupWindow={hasattr(_dt, 'PopupWindow')}"
-              f"  about分支={'"about"' in _src}"
-              f"  reload={hasattr(g.MainWindow, '_reload_page')}")
+        print(f"        about分支={'"about"' in _src}  拒绝文案={'已拒绝' in _src}"
+              f"  无PopupWindow={not hasattr(_dt, 'PopupWindow')}")
 
     # 2. 源码运行时不支持自更新（避免替换掉开发的 py 文件）
     supported, reason = su.self_update_supported()

@@ -35,7 +35,7 @@ from collections import deque
 from dataclasses import dataclass
 
 from PySide6.QtCore import QRegularExpression, Qt, QTimer, QUrl
-from PySide6.QtGui import (QColor, QDesktopServices, QFont, QTextCharFormat, QTextCursor,
+from PySide6.QtGui import (QColor, QFont, QTextCharFormat, QTextCursor,
                            QTextDocument, QSyntaxHighlighter)
 from PySide6.QtWebEngineCore import (QWebEnginePage, QWebEngineProfile,
                                      QWebEngineUrlRequestInterceptor)
@@ -43,7 +43,7 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup,
                                QFileDialog,
                                QFrame, QHBoxLayout, QLabel, QLineEdit,
-                               QMainWindow, QPlainTextEdit, QPushButton,
+                               QPlainTextEdit, QPushButton,
                                QSizePolicy, QStackedWidget, QTabWidget,
                                QTableWidget, QTableWidgetItem, QVBoxLayout,
                                QWidget)
@@ -346,7 +346,24 @@ class ShellPage(QWebEnginePage):
         # 空白页——DOM 只剩 <html><head></head><body></body></html>，没有地址栏、
         # 没有返回入口，用户只能重启。
         if scheme in ("about", "javascript", "data", "blob"):
-            self._spawn_popup(url)
+            # 官方桌面端对 window.open 一律 deny，我们照做。
+            #
+            # 为什么**不能**自己开一个窗口接它（2026-10-20 实测踩坑）：
+            # Qt 的 `newWindowRequested` 只有调 `request.openIn(...)` 才会把
+            # 新窗口交回 Chromium，`window.open()` 也才会返回有效对象。
+            # 我们之前是自己 new 了一个 QMainWindow——Chromium 根本不知道它，
+            # 于是 DSH 的 `window.open()` 拿到 null，后续
+            # `popup.location.replace(authorizeUrl)` 永远不会执行，
+            # 结果就是一个**永远空白的窗口**，登录也卡住。
+            #
+            # 拒绝之后 DSH 会走它自己设计的降级路径：ui-settings-account 的
+            # begin() 注释原话就是 "blocked popups need the copy-link route"
+            # ——对话框给出可复制的授权链接。
+            try:
+                self.recorder.add_console(
+                    "warn", "已拒绝 window.open(%s)，改用复制链接" % url.toString(), 0, "popup")
+            except Exception:                                  # noqa: BLE001
+                pass
             return
         if where == "external":
             self._deliver_external(url)
@@ -354,22 +371,6 @@ class ShellPage(QWebEnginePage):
             view = self._view
             if view is not None:
                 view.setUrl(url)
-
-    def _spawn_popup(self, url) -> None:
-        """为 `window.open()` 真的开一个子窗口（不碰主视图）。"""
-        try:
-            win = PopupWindow(self.profile(), self._base(), url,
-                              open_external=self._open_external,
-                              recorder=self.recorder)
-            _popups.add(win)
-            win.destroyed.connect(lambda *_: _popups.discard(win))
-            win.show()
-        except Exception as e:                                 # noqa: BLE001
-            # 开窗失败也不能影响主视图：登录走不通是功能缺失，白屏是事故。
-            try:
-                self.recorder.add_console("warn", "弹窗打开失败：%s" % e, 0, "popup")
-            except Exception:                                  # noqa: BLE001
-                pass
 
     # ---- 控制台 ----
 
@@ -384,68 +385,6 @@ class ShellPage(QWebEnginePage):
                                       line, source)
         except Exception:                                      # noqa: BLE001
             pass
-
-
-# ------------------------------------------------------------------ 弹窗
-
-#: 存活的弹窗。**必须持有 Python 引用**：Qt 顶层窗口如果只由 C++ 侧持有，
-#: Python 包装对象一旦被 GC，窗口会跟着消失（表现为"点了登录，窗口闪一下没了"）。
-_popups: set = set()
-
-
-class PopupWindow(QMainWindow):
-    """`window.open()` 开出来的子窗口。
-
-    共用同一个 WebEngineProfile（登录态、Cookie 一致），页面仍是 `ShellPage`，
-    所以外链策略与控制台采集的行为跟主窗口完全一致。
-
-    为什么要独立窗口，而不是在主视图里打开（2026-10-20 事故）
-    ------------------------------------------------------
-    DSH 的登录流程第一步是 `window.open("about:blank", "_blank")`
-    （见 `dsh-client-ui-settings-account/lib/client.js:999`）——先占位一个空窗口
-    再把它导航到登录页，避免被弹窗拦截。而 `nav_disposition()` 把 `about:`
-    归为"页面内部行为"，旧实现直接 `view.setUrl(about:blank)`，
-    于是**主窗口变成空白页**，DOM 只剩 `<html><head></head><body></body></html>`，
-    既不报错也没有返回入口，用户只能重启——这比"点了没反应"更糟。
-    """
-
-    def __init__(self, profile, base_url: str, url, open_external=None,
-                 recorder=None, parent=None):
-        super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-        self.setWindowTitle("DSH")
-        self.resize(960, 720)
-        view = QWebEngineView(self)
-        page = ShellPage(profile, self, base_url=lambda: base_url,
-                         recorder=recorder, open_external=open_external,
-                         view=view)
-        view.setPage(page)
-        self.setCentralWidget(view)
-        self.view = view
-        # 弹窗一旦被导航到外部站点，就交给系统浏览器（对齐官方桌面端）。
-        view.urlChanged.connect(self._on_url_changed)
-        if url.isValid() and not url.isEmpty():
-            view.load(url)
-
-    def _on_url_changed(self, url) -> None:
-        """被导航到外部站点 → 系统浏览器打开，然后关掉自己。
-
-        官方 `apps/desktop` 的做法是 `setWindowOpenHandler` 直接
-        `shell.openExternal(url)` + `{action:'deny'}`，**根本不开 WebEngine 窗口**；
-        主窗口被导航到外部时同样 preventDefault + openExternal。
-        我们没有 host 的 IPC 通道去监听"等待浏览器授权"，所以保留 about:blank
-        占位窗口以兼容 DSH 现在的流程，但外部登录页一律不自己渲染：
-        一是和官方行为一致，二是 Chromium 里加载 chat.deepseek.com 受代理影响
-        会变成一片空白（2026-10-20 实测），用户在浏览器里至少能看到地址栏、
-        能自己处理代理或换浏览器。
-        """
-        u = url if isinstance(url, QUrl) else QUrl(str(url or ""))
-        if u.isValid() and not u.isEmpty() and u.scheme().lower() in ("http", "https"):
-            try:
-                QDesktopServices.openUrl(u)
-            except Exception:                                  # noqa: BLE001
-                pass
-            self.close()
 
 
 # ------------------------------------------------------------------ 注入脚本
