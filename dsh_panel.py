@@ -50,7 +50,7 @@ from PySide6.QtWidgets import (QFrame, QGraphicsOpacityEffect, QHBoxLayout,
                                QStackedWidget, QToolButton, QVBoxLayout, QWidget)
 
 import dsh_icons as icons
-from dsh_host import compat, config, contract, dwm, updater
+from dsh_host import compat, config, contract, dwm, netenv, updater
 from dsh_host.version import HOST_REPO, HOST_VERSION
 
 FONT = '"Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", sans-serif'
@@ -1152,6 +1152,14 @@ class DeployPage(BasePage):
         self.layout_.addWidget(_label(
             "这一步由你来做，我们只负责告诉你做没做成。"
             "每步做完回到「状态检测」页点一次重新检测，就能看到结果。"))
+
+        # 代理提示（2026-10-20）：只在真的有风险时出现——设了代理、且
+        # DeepSeek 域名没排除。这时账号功能会"半坏不坏"，用户不可能自己想到。
+        _hint = netenv.proxy_hint()
+        if _hint:
+            _c = Card("网络代理可能影响账号功能", self.pal)
+            _c.add_text(_hint)
+            self.layout_.addWidget(_c)
 
         links = guide_links()
         c1 = Card("第一步 · 安装 Node.js 运行环境", self.pal)

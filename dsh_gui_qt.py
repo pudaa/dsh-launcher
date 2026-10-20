@@ -58,7 +58,8 @@ if _UI_LANG:
             _flags + " --lang=" + _UI_LANG).strip()
 
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QUrl
-from PySide6.QtGui import QIcon, QAction, QDesktopServices, QImage
+from PySide6.QtGui import (QIcon, QAction, QDesktopServices, QImage,
+                           QKeySequence, QShortcut)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QSystemTrayIcon, QDialog,
@@ -1494,6 +1495,11 @@ class MainWindow(QMainWindow):
         act_show = QAction("显示主窗口", self)
         act_show.triggered.connect(self._show_main)
 
+        # 页面白掉 / 卡住时的自救入口。2026-10-20 那次登录白屏证明：
+        # 一旦主视图被导航到空白页，没有刷新入口就只能重启整个应用。
+        self.act_reload = QAction("重新加载页面", self)
+        self.act_reload.triggered.connect(self._reload_page)
+
         # 只在环境确实缺东西时才可用——平时不给一个点了没反应的菜单项
         self.act_setup = QAction("准备运行环境…", self)
         self.act_setup.setEnabled(False)
@@ -1557,6 +1563,16 @@ class MainWindow(QMainWindow):
         # 上面那些 QAction 仍然保留（面板走同一套回调，`_refresh_menu` 也还在
         # 更新它们的文字与可用性），只是不再挂进菜单。
         menu.addAction(act_show)
+        menu.addAction(self.act_reload)
+
+        # 快捷键挂在主窗口上：托盘菜单里的项只有在菜单打开时才响应按键，
+        # 而"页面白了我按 F5"必须随时生效。留着引用，否则 Python 侧被 GC
+        # 会连带删掉 C++ 的 QShortcut。
+        self._reload_shortcuts = []
+        for key in (QKeySequence.Refresh, QKeySequence("Ctrl+R")):
+            sc = QShortcut(key, self)
+            sc.activated.connect(self._reload_page)
+            self._reload_shortcuts.append(sc)
         menu.addAction(self.act_panel)
         menu.addSeparator()
         menu.addAction(self.act_check)
@@ -2261,6 +2277,28 @@ class MainWindow(QMainWindow):
         self._start_theme_watch()
 
     # ----------------------------------------------------------- 窗口行为
+
+    def _reload_page(self):
+        """把主视图重新加载回 DSH 首页。
+
+        刻意**不用** `view.reload()`：页面已经跑偏时（例如被 `window.open`
+        的 about:blank 顶掉），reload 只会把空白页再加载一遍。这里始终回到
+        handle 里那个带 token 的地址。
+
+        2026-10-20：登录流程把主窗口换成空白页，当时应用里没有任何刷新入口，
+        只能重启。这个入口就是为那次事故加的。
+        """
+        if not self.handle:
+            self._info("服务还没就绪，稍等一下再试。")
+            return
+        try:
+            self._ensure_webview()
+            self.view.load(QUrl(self.handle.url))
+            self.stack.setCurrentIndex(1)
+            host_log("手动重新加载页面：%s"
+                     % str(self.handle.url).split("token=")[0])
+        except Exception as e:                                 # noqa: BLE001
+            host_log("重新加载失败：%s: %s" % (type(e).__name__, e))
 
     def _show_main(self):
         self.showNormal()

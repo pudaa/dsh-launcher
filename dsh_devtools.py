@@ -43,9 +43,10 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup,
                                QFileDialog,
                                QFrame, QHBoxLayout, QLabel, QLineEdit,
-                               QPlainTextEdit, QPushButton, QSizePolicy,
-                               QStackedWidget, QTabWidget, QTableWidget,
-                               QTableWidgetItem, QVBoxLayout, QWidget)
+                               QMainWindow, QPlainTextEdit, QPushButton,
+                               QSizePolicy, QStackedWidget, QTabWidget,
+                               QTableWidget, QTableWidgetItem, QVBoxLayout,
+                               QWidget)
 
 import dsh_console
 from dsh_host import config
@@ -325,12 +326,40 @@ class ShellPage(QWebEnginePage):
         except Exception:                                      # noqa: BLE001
             return
         where = nav_disposition(url, self._base())
+        scheme = url.scheme().lower()
+        # `about:blank` 这类是 `window.open()` 的**占位窗口**——先开一个空窗口
+        # 避开弹窗拦截，拿到句柄后再把它导航到目标页（DSH 的登录流程就是这样，
+        # 见 ui-settings-account/client.js:999）。
+        #
+        # 绝不能拿主视图去接（2026-10-20 事故）：`nav_disposition()` 把 about:
+        # 归为"页面内部行为"，于是 `view.setUrl(about:blank)` 把整个应用换成
+        # 空白页——DOM 只剩 <html><head></head><body></body></html>，没有地址栏、
+        # 没有返回入口，用户只能重启。
+        if scheme in ("about", "javascript", "data", "blob"):
+            self._spawn_popup(url)
+            return
         if where == "external":
             self._deliver_external(url)
         elif where == "internal":
             view = self._view
             if view is not None:
                 view.setUrl(url)
+
+    def _spawn_popup(self, url) -> None:
+        """为 `window.open()` 真的开一个子窗口（不碰主视图）。"""
+        try:
+            win = PopupWindow(self.profile(), self._base(), url,
+                              open_external=self._open_external,
+                              recorder=self.recorder)
+            _popups.add(win)
+            win.destroyed.connect(lambda *_: _popups.discard(win))
+            win.show()
+        except Exception as e:                                 # noqa: BLE001
+            # 开窗失败也不能影响主视图：登录走不通是功能缺失，白屏是事故。
+            try:
+                self.recorder.add_console("warn", "弹窗打开失败：%s" % e, 0, "popup")
+            except Exception:                                  # noqa: BLE001
+                pass
 
     # ---- 控制台 ----
 
@@ -345,6 +374,46 @@ class ShellPage(QWebEnginePage):
                                       line, source)
         except Exception:                                      # noqa: BLE001
             pass
+
+
+# ------------------------------------------------------------------ 弹窗
+
+#: 存活的弹窗。**必须持有 Python 引用**：Qt 顶层窗口如果只由 C++ 侧持有，
+#: Python 包装对象一旦被 GC，窗口会跟着消失（表现为"点了登录，窗口闪一下没了"）。
+_popups: set = set()
+
+
+class PopupWindow(QMainWindow):
+    """`window.open()` 开出来的子窗口。
+
+    共用同一个 WebEngineProfile（登录态、Cookie 一致），页面仍是 `ShellPage`，
+    所以外链策略与控制台采集的行为跟主窗口完全一致。
+
+    为什么要独立窗口，而不是在主视图里打开（2026-10-20 事故）
+    ------------------------------------------------------
+    DSH 的登录流程第一步是 `window.open("about:blank", "_blank")`
+    （见 `dsh-client-ui-settings-account/lib/client.js:999`）——先占位一个空窗口
+    再把它导航到登录页，避免被弹窗拦截。而 `nav_disposition()` 把 `about:`
+    归为"页面内部行为"，旧实现直接 `view.setUrl(about:blank)`，
+    于是**主窗口变成空白页**，DOM 只剩 `<html><head></head><body></body></html>`，
+    既不报错也没有返回入口，用户只能重启——这比"点了没反应"更糟。
+    """
+
+    def __init__(self, profile, base_url: str, url, open_external=None,
+                 recorder=None, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.setWindowTitle("DSH")
+        self.resize(960, 720)
+        view = QWebEngineView(self)
+        page = ShellPage(profile, self, base_url=lambda: base_url,
+                         recorder=recorder, open_external=open_external,
+                         view=view)
+        view.setPage(page)
+        self.setCentralWidget(view)
+        self.view = view
+        if url.isValid() and not url.isEmpty():
+            view.load(url)
 
 
 # ------------------------------------------------------------------ 注入脚本

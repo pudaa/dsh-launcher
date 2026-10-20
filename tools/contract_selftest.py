@@ -442,6 +442,31 @@ def main_lite() -> int:
           accept_release(_rel("2.4.0-beta.1"), include_prerelease=True))
 
     print(LINE)
+    print("[Host] 网络代理提示")
+    # 2026-10-20 实测：chat.deepseek.com 直连 429、走代理 403。
+    # DSH 只认环境变量里的代理，不读系统代理，于是"账号资料不可用"极难归因。
+    from dsh_host import netenv
+
+    _keys = ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+             "http_proxy", "https_proxy", "no_proxy")
+    _saved = {k: os.environ.get(k) for k in _keys}
+    try:
+        for k in _keys:
+            os.environ.pop(k, None)
+        check("没设代理时不打扰用户", netenv.proxy_hint() == "")
+        os.environ["HTTPS_PROXY"] = "http://127.0.0.1:7897"
+        check("设了代理且没排除 DeepSeek 时给出提示", bool(netenv.proxy_hint()))
+        os.environ["NO_PROXY"] = "chat.deepseek.com"
+        check("NO_PROXY 覆盖后不再提示", netenv.proxy_hint() == "")
+    finally:
+        for k, v in _saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+    print(LINE)
     print("[Host] 安装完整性（半升级防护）")
     # 背景（2026-10-20）：`npm install -g` 可能只升主包，把精确版本的子依赖
     # 留在旧版。表现为"版本号正常，界面却报接口 404"——光看版本号查不出来。

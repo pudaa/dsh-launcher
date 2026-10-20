@@ -489,6 +489,26 @@ def host_update_checks() -> list[str]:
               f"  closeEvent={hasattr(getattr(g, 'ReinstallDialog', None), 'closeEvent')}"
               f"  动作接线={'reinstall_dsh' in inspect.getsource(g.MainWindow._panel_action)}")
 
+    # 1g. 登录弹窗与刷新自救（2026-10-20 白屏事故）。
+    #     DSH 登录第一步是 window.open("about:blank")，旧实现把它当"页面内部
+    #     导航"丢给主视图，整个应用变成空白页。三条一起钉：
+    #     占位请求必须走弹窗、主视图不许接、必须有刷新入口。
+    import dsh_devtools as _dt
+    _src = inspect.getsource(_dt.ShellPage._on_new_window)
+    # act_reload 是实例属性，hasattr(类) 查不到；直接看类源码里有没有接上。
+    _cls_src = inspect.getsource(g.MainWindow)
+    ok = (hasattr(_dt, "PopupWindow")
+          and "_spawn_popup" in _src
+          and '"about"' in _src
+          and "def _reload_page" in _cls_src
+          and "act_reload" in _cls_src)
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 登录弹窗不占主视图，且提供刷新入口")
+    if not ok:
+        failures.append("登录弹窗/刷新入口")
+        print(f"        PopupWindow={hasattr(_dt, 'PopupWindow')}"
+              f"  about分支={'"about"' in _src}"
+              f"  reload={hasattr(g.MainWindow, '_reload_page')}")
+
     # 2. 源码运行时不支持自更新（避免替换掉开发的 py 文件）
     supported, reason = su.self_update_supported()
     ok = (supported is False) and bool(reason)
