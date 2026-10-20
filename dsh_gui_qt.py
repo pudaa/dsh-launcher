@@ -63,8 +63,8 @@ from PySide6.QtGui import (QIcon, QAction, QDesktopServices, QImage,
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QSystemTrayIcon, QDialog,
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QProgressBar, QStackedWidget,
-    QPlainTextEdit, QPushButton, QFileDialog,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QProgressBar, QStackedLayout,
+    QStackedWidget, QPlainTextEdit, QPushButton, QFileDialog,
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEngineProfile
@@ -1180,6 +1180,7 @@ class MainWindow(QMainWindow):
         self.host_release = None          # 有值表示桌面壳有新版本可用
         self.view = None
         self.profile = None
+        self.loading_page = None
         # 页面观测记录在窗口创建之前就存在：开发者模式可能在运行中被打开，
         # 那时要能回看"打开之前"发生的报错。
         self.recorder = dsh_devtools.Recorder()
@@ -1190,6 +1191,25 @@ class MainWindow(QMainWindow):
         self._last_titlebar_rgb = None    # 上次上色用的界面色，用于变更比对
 
         self.stack = QStackedWidget()
+        # 关键：**StackAll** —— 所有页都参与排版、且都保持 show 状态，
+        # 切页只是把目标页 raise 到最上层，不会 hide 另一页。
+        #
+        # 为什么必须这样（2026-10-20 实测，tools/webview_flicker_diag.py）
+        # -----------------------------------------------------------------
+        # 默认的 StackOne 只给**当前页**排版。于是隐藏的 Web 视图一直停在
+        # Qt 的默认几何 100x30 上，而 Chromium 一开加载就按当时的视口排版。
+        # 实测（真窗口 + 真 GPU，125% 缩放）：
+        #   · 切页前：视图 100x30，网页 innerWidth/innerHeight = 0x0；
+        #   · 切页后 +48ms：视图已是全尺寸，网页视口**仍是 100x30**；
+        #   · 切页后 0~600ms：窗口里**没有任何网页像素**（露的是底色）。
+        # 这正是"每次启动 WebEngine 先以很小的状态出现在左上角"的来源。
+        # 换成 StackAll 后同样的实测变成：切页前视口就是全尺寸，
+        # 切页第一帧（+17ms）即满幅，没有空白期。
+        #
+        # 附带好处：视图不再经历 hide/show 与"一步跳变"，它的合成器
+        # surface 从创建起就跟着容器走，缩放时少一次尺寸突变。
+        self.stack.layout().setStackingMode(
+            QStackedLayout.StackingMode.StackAll)
         self.setCentralWidget(self.stack)
         # 初始图标跟随**系统**主题——此刻还不知道界面是什么色。
         # 取色成功后会被 _set_theme_icon 换成匹配界面底色的那套。
@@ -1238,6 +1258,7 @@ class MainWindow(QMainWindow):
         lay.addStretch(1)
         # 深色界面下不要让启动瞬间先闪一片系统白
         dsh_theme.style_loading_page(page)
+        self.loading_page = page
         self.stack.addWidget(page)
 
     def _set_tip(self, text: str):
@@ -1279,6 +1300,11 @@ class MainWindow(QMainWindow):
         # Chromium**，所以网页里自己的 contextmenu 处理与 DOM 菜单都会正常工作。
         self.view.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         self.stack.addWidget(self.view)
+        # StackAll 下新加的页会被顶到最上层。加载页必须继续盖在 Web 视图
+        # 上面，直到前端真的画出东西（见 _reveal_when_rendered）——否则
+        # 用户会先看到 Web 视图自己的白色/空白底面。
+        if self.loading_page is not None:
+            self.stack.setCurrentWidget(self.loading_page)
 
     # ----------------------------------------------------------- 标题栏自适应
 
@@ -1736,6 +1762,8 @@ class MainWindow(QMainWindow):
 
         def decided(value) -> None:
             if str(value).strip() == "1" or tries >= 12:      # 12 × 150ms ≈ 1.8s
+                # StackAll 下这一步只是把 Web 视图 raise 到最上层，
+                # 不改变任何一页的可见性/尺寸，所以不会触发重新排版。
                 self.stack.setCurrentIndex(1)
             else:
                 QTimer.singleShot(

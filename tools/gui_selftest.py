@@ -1171,6 +1171,30 @@ def theme_checks() -> list[str]:
     return failures
 
 
+def stack_overlay_checks() -> list[str]:
+    """Web 视图必须和加载页**一起**被排版（StackAll），否则启动首帧会缩小。
+
+    2026-10-20 真窗口实测（tools/webview_flicker_diag.py）：
+      · StackOne：隐藏的视图停在 Qt 默认几何 100x30；切页后 +48ms 视图已是
+        全尺寸，但网页视口仍是 100x30；0~600ms 窗口里没有网页像素。
+      · StackAll：切页前视口就是全尺寸，切页第一帧（+17ms）即满幅。
+    这条断言只钉住"用的是哪种叠放"，防止有人把 StackAll 改回去。
+    """
+    failures: list[str] = []
+    src = open(os.path.join(ROOT, "dsh_gui_qt.py"), encoding="utf-8").read()
+
+    def check(name: str, ok: bool, extra: str = "") -> None:
+        print(f"  [{'OK  ' if ok else 'FAIL'}] {name}{('  ' + extra) if extra else ''}")
+        if not ok:
+            failures.append(name)
+
+    check("栈用 StackAll 叠放（所有页一起排版，不只是当前页）",
+          "StackingMode.StackAll" in src)
+    check("加入 Web 视图后把加载页重新 raise 回来",
+          "setCurrentWidget(self.loading_page)" in src)
+    return failures
+
+
 def terminal_checks() -> list[str]:
     """开发者面板「终端」页：能否读到输出、整段复制、暂停/归位、搜索。"""
     failures: list[str] = []
@@ -1266,6 +1290,10 @@ def main() -> int:
     state["console_failures"] = dsh_console.selftest_checks()
     print()
 
+    print("== Web 视图与加载页的叠放方式（启动首帧不缩小）==")
+    state["stack_failures"] = stack_overlay_checks()
+    print()
+
     print("== 开发者面板终端页（复制 / 暂停 / 归位 / 搜索）==")
     state["terminal_failures"] = terminal_checks()
     print()
@@ -1279,7 +1307,7 @@ def main() -> int:
                or state.get("host_update_failures") or state.get("titlebar_failures")
                or state.get("panel_failures") or state.get("devtools_failures")
                or state.get("theme_failures") or state.get("console_failures")
-               or state.get("terminal_failures"))
+               or state.get("stack_failures") or state.get("terminal_failures"))
         if bad:
             print("\n用例失败：", "、".join(bad))
             return 1
@@ -1443,7 +1471,8 @@ def main() -> int:
            or state.get("titlebar_failures") or state.get("menu_failures")
            or state.get("panel_failures") or state.get("webview_failures")
            or state.get("devtools_failures") or state.get("theme_failures")
-           or state.get("console_failures") or state.get("terminal_failures"))
+           or state.get("console_failures") or state.get("stack_failures")
+           or state.get("terminal_failures"))
     # on_ready 里一旦抛异常，后面的检查会被静默跳过、测试却仍然"通过"。
     # 用一个完成标记把这种情况变成失败。
     if "handle" in state and not state.get("ready_checks_done"):
