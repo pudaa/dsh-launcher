@@ -360,6 +360,33 @@ class NotesView(QTextBrowser):
             self.setPlainText(text)
         self.verticalScrollBar().setValue(0)
 
+    def append_line(self, text: str) -> None:
+        """在文档末尾追加一行纯文本（进度行用）。
+
+        为什么需要这个方法（2026-10-20 实测事故）
+        ----------------------------------------
+        这是 `QTextBrowser`，**没有** `QPlainTextEdit` 的 `appendPlainText()`。
+        2.3.1 把更新对话框的日志控件从 `QPlainTextEdit` 换成富文本视图时，
+        `self.log.appendPlainText` 的接线没跟着改：
+
+            AttributeError: 'NotesView' object has no attribute 'appendPlainText'
+
+        而这个调用发生在**按钮已经禁用之后**，异常又被 Qt 吞在槽里（无控制台），
+        用户看到的就是"点了下载并更新→进入更新状态→一个字的进度都没有"。
+        用 `hasattr` 自查过：QTextBrowser 只有 `append()`，且它会按 HTML 解析，
+        进度文本里的 `%`、`<` 之类有被当标记吃掉的风险，所以不用它。
+        """
+        cur = QTextCursor(self.document())
+        cur.movePosition(QTextCursor.MoveOperation.End)
+        if not self.document().isEmpty():
+            cur.insertBlock()
+        fmt = QTextCharFormat()
+        fmt.setFont(self._font)
+        fmt.setForeground(QColor(self._pal["text"]))
+        cur.insertText(text, fmt)
+        bar = self.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
 
 def menu_qss(pal: dict) -> str:
     """托盘菜单：官方下拉菜单的形态（卡片底 + 1px 描边 + 6px 内边距 + 圆角）。"""

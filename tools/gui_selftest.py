@@ -453,6 +453,29 @@ def host_update_checks() -> list[str]:
               f"  实际: {msg1[:40]!r} / {msg2[:40]!r}")
 
 
+    # 1e. 富文本视图**没有** `appendPlainText`（2026-10-20 老大实测事故）。
+    #     2.3.1 把更新对话框的日志控件从 QPlainTextEdit 换成 NotesView 时，
+    #     接线没跟着改：点「下载并更新」当场 AttributeError；而异常发生在
+    #     按钮已经禁用之后，用户看到的是"进入更新状态，但一个字的进度都没有"。
+    #     这里同时钉两头：控件要有自己的追加方法，两个对话框里不许再出现旧方法名。
+    import inspect
+
+    import dsh_theme
+    leaks = [cls.__name__ for cls in (g.UpdateDialog, g.HostUpdateDialog)
+             if "appendPlainText" in inspect.getsource(cls)]
+    probe = dsh_theme.NotesView()
+    probe.show_notes("## 版本说明\n正文一段", "markdown")
+    probe.append_line("已下载 12.3 / 106.9 MB  (11%)")
+    plain = probe.toPlainText()
+    append_ok = ("已下载 12.3" in plain) and ("版本说明" in plain)
+    ok = (hasattr(dsh_theme.NotesView, "append_line")
+          and not leaks and append_ok)
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 更新对话框的进度接线用富文本视图自己的方法")
+    if not ok:
+        failures.append("更新进度接线")
+        print(f"        append_line={hasattr(dsh_theme.NotesView, 'append_line')}"
+              f"  追加可见={append_ok}  残留旧调用={leaks}")
+
     # 2. 源码运行时不支持自更新（避免替换掉开发的 py 文件）
     supported, reason = su.self_update_supported()
     ok = (supported is False) and bool(reason)

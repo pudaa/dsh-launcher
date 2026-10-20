@@ -864,7 +864,7 @@ class UpdateDialog(QDialog):
         self.log.clear()
         self._worker = UpdateWorker(self.info.target, self.handle,
                                     int(config.get("port") or 0), config.service_log())
-        self._worker.line.connect(self.log.appendPlainText)
+        self._worker.line.connect(self.log.append_line)
         self._worker.line.connect(host_log)      # 更新全过程也进桌面壳日志
         self._worker.done.connect(self._on_done)
         self._worker.start()
@@ -874,10 +874,10 @@ class UpdateDialog(QDialog):
         self.close_btn.setEnabled(True)
         host_log("更新%s：%s" % ("成功" if ok else "失败", detail.replace("\n", " | ")[:400]))
         if ok:
-            self.log.appendPlainText("\n更新完成：DSH %s" % detail)
+            self.log.append_line("\n更新完成：DSH %s" % detail)
             QTimer.singleShot(1200, self.accept)
         else:
-            self.log.appendPlainText("\n更新失败，已尝试回滚：\n" + detail)
+            self.log.append_line("\n更新失败，已尝试回滚：\n" + detail)
             self.go_btn.setEnabled(True)
             self.notes_btn.setEnabled(True)
 
@@ -957,7 +957,7 @@ class HostUpdateDialog(QDialog):
         self._append_meta()
 
     def _append_meta(self):
-        self.log.appendPlainText(
+        self.log.append_line(
             "\n开通时间　%s\n项目地址　%s"
             % (self.rel.published_at or "（未知）", self.rel.html_url))
 
@@ -967,21 +967,21 @@ class HostUpdateDialog(QDialog):
         self.close_btn.setEnabled(False)
         self.log.clear()
         self._worker = HostUpdateWorker(self.rel)
-        self._worker.line.connect(self.log.appendPlainText)
+        self._worker.line.connect(self.log.append_line)
         self._worker.line.connect(host_log)
         self._worker.done.connect(self._on_done)
         self._worker.start()
 
     def _on_done(self, ok: bool, msg: str):
         if not ok:
-            self.log.appendPlainText("\n更新失败：\n" + msg)
+            self.log.append_line("\n更新失败：\n" + msg)
             self.go_btn.setEnabled(True)
             self.notes_btn.setEnabled(True)
             self.close_btn.setEnabled(True)
             return
 
         self._prepared = True
-        self.log.appendPlainText("\n" + msg)
+        self.log.append_line("\n" + msg)
         # 替换**已经做完了**（在这个窗口还开着的时候完成的），所以"重启"这一步
         # 只是把新实例拉起来 + 自己退出，是瞬时的。
         # 仍然给一个明确的按钮而不是自动退出：静默消失会让用户以为程序崩了。
