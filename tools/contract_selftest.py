@@ -291,11 +291,13 @@ def main() -> int:
 
     # 私有 prefix 必须位于候选序列并优先命中，否则引导装完自己都找不到。
     # 借用现有安装冒充私有 prefix 来验证这条路径真实可达（而不是只打印一遍候选）。
+    # 注意标签：v2.3.7 把来源名从"私有 prefix"改成了"私有目录"（用户看不懂 prefix），
+    # 断言当时没跟着改，于是长期红着——不是产品问题，是断言过时（2026-10-20 修）。
     orig_ngd = config.node_global_dir
     try:
         config.node_global_dir = lambda: inst.prefix
         srcs = [s for s, _b, _n in contract.candidate_bin_js()]
-        check("私有 prefix 命中时排在首位", bool(srcs) and srcs[0] == "私有 prefix",
+        check("私有 prefix 命中时排在首位", bool(srcs) and srcs[0] == "私有目录",
               "候选顺序：" + ("、".join(srcs) or "无"))
     finally:
         config.node_global_dir = orig_ngd
