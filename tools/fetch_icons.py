@@ -36,7 +36,8 @@ ICONS: dict[str, str] = {
     # 左侧导航
     "layout-dashboard": "概览",
     "package": "本机部署",
-    "plug": "连接",
+    "plug": "连接 / 运行方式",
+    "settings": "常规",
     "activity": "状态检测",
     "info": "关于",
     # 窗口按钮

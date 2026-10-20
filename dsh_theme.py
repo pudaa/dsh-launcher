@@ -596,3 +596,14 @@ class MessageDialog(QDialog):
     @classmethod
     def about(cls, parent, title: str, text: str, ok_text: str = "关闭") -> int:
         return cls(parent, title, text, "about", ok_text).exec()
+
+    @classmethod
+    def ask(cls, parent, title: str, text: str,
+            ok_text: str = "继续", cancel_text: str = "取消") -> bool:
+        """是/否确认。危险操作（清空数据、切换来源）走这里。
+
+        统一用 warn 图标：这些操作都不致命，但确实会改东西，
+        用 info 的绿勾会让人以为"只是通知一下"。
+        """
+        return cls(parent, title, text, "warn",
+                   ok_text, cancel_text).exec() == QDialog.DialogCode.Accepted

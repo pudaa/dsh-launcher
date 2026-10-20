@@ -24,6 +24,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 
@@ -155,6 +156,81 @@ def install_dsh(on_line=None, tag: str = DEFAULT_TAG) -> tuple[bool, str]:
     if rc != 0:
         return False, "DeepSeek Harness 安装失败（npm 退出码 %s）。\n%s" % (rc, text[-1200:])
     return True, "DeepSeek Harness 安装完成"
+
+
+# ------------------------------------------------------------------ 私有副本
+
+def private_bin() -> str:
+    """私有安装的 bin.js 路径（不判断是否存在）。"""
+    return os.path.join(config.node_global_dir(), "node_modules",
+                        "@deepseek-ai", "dsh", "lib", "bin.js")
+
+
+def private_version() -> str:
+    """私有安装的版本号；没有或读不出来返回空串。"""
+    p = os.path.join(config.node_global_dir(), "node_modules",
+                     "@deepseek-ai", "dsh", "package.json")
+    try:
+        with open(p, encoding="utf-8") as f:
+            return str(json.load(f).get("version") or "")
+    except (OSError, ValueError):
+        return ""
+
+
+def private_ready() -> bool:
+    """私有目录里是否有一份可用的 DSH（bin.js 与 package.json 都在）。"""
+    return bool(private_version()) and os.path.isfile(private_bin())
+
+
+def import_private(install, on_line=None) -> tuple[bool, str]:
+    """把系统里那份 DSH 复制成私有副本，**不重新下载**。
+
+    为什么要有这条路：用户机器上已经装好 DSH 了，让他为了"隔离"再等十几分钟
+    重装一遍没有道理。复制 250 MB 通常几十秒，而且版本立刻对齐——这比 npm 重装
+    既快又不会引入新的半升级风险。
+
+    复制完只校验"能不能读出版本号"，不做运行验证——那是切换后
+    `resolve_install` 的事，它失败会明确报出来。
+    """
+    emit = on_line or (lambda s: None)
+    if install is None:
+        return False, "当前没有可用的 DSH 安装。"
+    src = os.path.join(install.prefix, "node_modules", "@deepseek-ai")
+    dst = os.path.join(config.node_global_dir(), "node_modules", "@deepseek-ai")
+    if os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dst)):
+        return True, private_version() or install.version
+    if not os.path.isdir(src):
+        return False, "在 %s 下没找到 DSH 的程序文件。" % install.prefix
+
+    files = sum(len(f) for _r, _d, f in os.walk(src))
+    emit("把现有安装复制到数据目录（%d 个文件）…" % files)
+    try:
+        if os.path.isdir(dst):
+            shutil.rmtree(dst)
+        shutil.copytree(src, dst)
+    except OSError as e:
+        return False, ("复制失败：%s\n\n可以改用「安装到数据目录」，"
+                       "它会重新下载一份（更慢，但不受源目录状态影响）。" % e)
+
+    ver = private_version()
+    if not ver or not os.path.isfile(private_bin()):
+        return False, "复制完成但这份副本不完整（读不到版本号），请改用「安装到数据目录」。"
+    if install.version and ver != install.version:
+        emit("注意：复制过来的版本是 %s，与当前使用的 %s 不同。" % (ver, install.version))
+    emit("私有副本就绪：%s" % ver)
+    return True, ver
+
+
+def remove_private() -> tuple[bool, str]:
+    """删掉私有副本（切回公共安装时用来收回那 250 MB）。"""
+    d = os.path.join(config.node_global_dir(), "node_modules", "@deepseek-ai")
+    if not os.path.isdir(d):
+        return True, "私有目录里没有安装，无需清理。"
+    try:
+        shutil.rmtree(d)
+    except OSError as e:
+        return False, "删除私有副本失败：%s\n请先停止服务再试。" % e
+    return True, "已删除私有副本"
 
 
 # ------------------------------------------------------------------ 编排

@@ -50,7 +50,8 @@ from PySide6.QtWidgets import (QFrame, QGraphicsOpacityEffect, QHBoxLayout,
                                QStackedWidget, QToolButton, QVBoxLayout, QWidget)
 
 import dsh_icons as icons
-from dsh_host import compat, config, contract, dwm, netenv, updater
+from dsh_host import (compat, config, contract, dwm, netenv, provision,
+                      storage, updater)
 from dsh_host.version import HOST_REPO, HOST_VERSION
 
 FONT = '"Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", sans-serif'
@@ -722,7 +723,7 @@ class PanelHost:
 
     def __init__(self, install=None, handle=None, host_release=None,
                  theme=None, open_path=None, open_web=None, log_dir=None,
-                 flag=None, set_flag=None, action=None):
+                 flag=None, set_flag=None, action=None, data_dir=None):
         self._install = install
         self._handle = handle
         self._release = host_release
@@ -730,6 +731,9 @@ class PanelHost:
         self.open_path = open_path or (lambda p: None)
         self.open_web = open_web or (lambda: None)
         self.log_dir = log_dir or (lambda: "")
+        #: 桌面壳数据根（"常规 → 数据目录"用）。默认直接问 config，
+        #: 这样面板能脱离主窗口单独跑自测。
+        self.data_dir = data_dir or config.data_root
         self._flag = flag or (lambda name: False)
         self._set_flag = set_flag or (lambda name, value: None)
         self.action = action or (lambda name: None)
@@ -1014,89 +1018,21 @@ class OverviewPage(BasePage):
             c1.add(w)
         self.layout_.addWidget(c1)
 
-        c2 = Card("更新与外观", self.pal)
-        self.toggles = {}
-        for name, title, hint in self.FLAGS:
-            if name == "adaptive_titlebar" and not dwm.available():
-                continue
-            row = ToggleRow(title, hint, self.host.flag(name), self.pal,
-                            lambda on, n=name: self.host.set_flag(n, on))
-            self.toggles[name] = row
-            c2.add(row)
-        self.layout_.addWidget(c2)
-
+        # 只留一个主动作。更新、外观、开发者、数据目录都搬去了「常规」——
+        # 以前这些全堆在概览里，用户想看个端口都得先划过一屏设置（2026-10-20 重排）。
+        c2 = Card("进入工作", self.pal)
+        c2.add_text("更新与外观、开发者选项、数据目录都在「常规」页。")
         holder = QWidget()
         row = QHBoxLayout(holder)
-        row.setContentsMargins(16, 2, 16, 2)
+        row.setContentsMargins(16, 4, 16, 10)
         row.setSpacing(8)
-        self.btn_update = QPushButton("检查 DSH 更新")
-        self.btn_update.setObjectName("action")
-        self.btn_update.clicked.connect(lambda: self.host.action("check_update"))
-        self.btn_stable = QPushButton("回归稳定版")
-        self.btn_stable.setObjectName("action")
-        self.btn_stable.clicked.connect(lambda: self.host.action("go_stable"))
-        self.btn_rollback = QPushButton("回滚到上一版本")
-        self.btn_rollback.setObjectName("action")
-        self.btn_rollback.clicked.connect(lambda: self.host.action("rollback"))
-        for b in (self.btn_update, self.btn_stable, self.btn_rollback):
-            row.addWidget(b)
-        row.addStretch(1)
-        self.layout_.addWidget(holder)
-
-        holder2 = QWidget()
-        acts = QHBoxLayout(holder2)
-        acts.setContentsMargins(16, 0, 16, 0)
-        acts.setSpacing(8)
         btn_web = QPushButton("打开 DSH 界面")
         btn_web.setObjectName("primary")
         btn_web.clicked.connect(lambda: self.host.open_web())
-        btn_log = QPushButton("打开日志目录")
-        btn_log.setObjectName("action")
-        btn_log.clicked.connect(lambda: self.host.open_path(self.host.log_dir()))
-        acts.addWidget(btn_web)
-        acts.addWidget(btn_log)
-        acts.addStretch(1)
-        self.layout_.addWidget(holder2)
-
-        # --- 开发者 ---
-        # 默认关：观测层不该让普通用户付开销（网络拦截是"每个请求一次回调"）。
-        # 开启后立刻弹开发者窗口——开关的意思就是"现在要看"。
-        c3 = Card("开发者", self.pal)
-        self.toggles["dev_mode"] = ToggleRow(
-            "开发者模式",
-            "开启后直接打开 Chromium 自带的开发者工具"
-            "（Elements / Console / Network / Sources 与浏览器完全一致），"
-            "同时开始记录网络请求。",
-            self.host.flag("dev_mode"), self.pal,
-            lambda on: self.host.set_flag("dev_mode", on))
-        c3.add(self.toggles["dev_mode"])
-
-        dev_row = QWidget()
-        dl = QHBoxLayout(dev_row)
-        dl.setContentsMargins(16, 4, 16, 4)
-        dl.setSpacing(8)
-        self.btn_dev = QPushButton("开发者工具")
-        self.btn_dev.setObjectName("action")
-        self.btn_dev.setToolTip("Chromium 自带的完整开发者工具；"
-                                "关闭窗口即释放它占用的渲染实例")
-        self.btn_dev.clicked.connect(lambda: self.host.action("open_devtools"))
-        self.btn_log = QPushButton("轻量日志")
-        self.btn_log.setObjectName("action")
-        self.btn_log.setToolTip("控制台与请求记录一直保留在内存里，"
-                                "工具没开着的时候也能回看报错（布局页只是坐标快照）")
-        self.btn_log.clicked.connect(lambda: self.host.action("open_devlog"))
-        for b in (self.btn_dev, self.btn_log):
-            b.setEnabled(self.host.flag("dev_mode"))
-            if not self.host.flag("dev_mode"):
-                b.setToolTip("先开启上方的开发者模式")
-        # 开关与按钮状态联动：面板不重进这一页也能看到按钮变可用
-        self.toggles["dev_mode"].btn.toggled.connect(self.btn_dev.setEnabled)
-        self.toggles["dev_mode"].btn.toggled.connect(self.btn_log.setEnabled)
-        dl.addWidget(self.btn_dev)
-        dl.addWidget(self.btn_log)
-        dl.addStretch(1)
-        c3.add(dev_row)
-        self.layout_.addWidget(c3)
+        row.addWidget(btn_web)
+        row.addStretch(1)
+        c2.add(holder)
+        self.layout_.addWidget(c2)
 
         self.layout_.addStretch(1)
         self.refresh()
@@ -1134,6 +1070,183 @@ class OverviewPage(BasePage):
         for c in self.findChildren(Card):
             c.set_palette_colors(pal)
         for r in getattr(self, "toggles", {}).values():
+            r.set_palette_colors(pal)
+
+
+class GeneralPage(BasePage):
+    """常规：更新、外观、开发者、数据目录。
+
+    为什么单独一页（2026-10-20 重排）
+    --------------------------------
+    这几组都是**设置**，不是"看一眼就走"的状态。以前全塞在概览里，
+    概览就变成了"状态卡 + 四组设置"的大杂烩——用户只是想看个端口，
+    却要先划过一屏开关和按钮。
+
+    数据目录放在这一页的最下面：它属于"偶尔维护一次"的东西，
+    但必须有个固定的、找得到的位置——因为删掉 exe 不会带走数据。
+    """
+
+    FLAGS = (
+        ("prerelease_opt_in", "加入预览计划",
+         "跟随官方的候选与尝鲜版本线。官方明示预览版可能含破坏性变更。"),
+        ("adaptive_titlebar", "标题栏跟随界面配色",
+         "让窗口标题栏跟随 DSH 界面的主色。需要 Windows 11。"),
+    )
+
+    def build(self) -> None:
+        self.layout_.addWidget(_label("常规", "h1"))
+        self.layout_.addWidget(_label(
+            "更新、外观、开发者选项，以及数据目录的位置与清理。"))
+
+        # --- 更新与外观 ---
+        c1 = Card("更新与外观", self.pal)
+        self.toggles = {}
+        for name, title, hint in self.FLAGS:
+            if name == "adaptive_titlebar" and not dwm.available():
+                continue
+            row = ToggleRow(title, hint, self.host.flag(name), self.pal,
+                            lambda on, n=name: self.host.set_flag(n, on))
+            self.toggles[name] = row
+            c1.add(row)
+        self.layout_.addWidget(c1)
+
+        holder = QWidget()
+        row = QHBoxLayout(holder)
+        row.setContentsMargins(16, 2, 16, 8)
+        row.setSpacing(8)
+        self.btn_update = QPushButton("检查 DSH 更新")
+        self.btn_update.setObjectName("action")
+        self.btn_update.clicked.connect(lambda: self.host.action("check_update"))
+        self.btn_stable = QPushButton("回归稳定版")
+        self.btn_stable.setObjectName("action")
+        self.btn_stable.clicked.connect(lambda: self.host.action("go_stable"))
+        self.btn_rollback = QPushButton("回滚到上一版本")
+        self.btn_rollback.setObjectName("action")
+        self.btn_rollback.clicked.connect(lambda: self.host.action("rollback"))
+        for b in (self.btn_update, self.btn_stable, self.btn_rollback):
+            row.addWidget(b)
+        row.addStretch(1)
+        self.layout_.addWidget(holder)
+
+        # --- 开发者 ---
+        c2 = Card("开发者", self.pal)
+        self.toggles["dev_mode"] = ToggleRow(
+            "开发者模式",
+            "开启后直接打开 Chromium 自带的开发者工具"
+            "（Elements / Console / Network / Sources 与浏览器完全一致），"
+            "同时开始记录网络请求。",
+            self.host.flag("dev_mode"), self.pal,
+            lambda on: self.host.set_flag("dev_mode", on))
+        c2.add(self.toggles["dev_mode"])
+
+        dev_row = QWidget()
+        dl = QHBoxLayout(dev_row)
+        dl.setContentsMargins(16, 4, 16, 6)
+        dl.setSpacing(8)
+        self.btn_dev = QPushButton("开发者工具")
+        self.btn_dev.setObjectName("action")
+        self.btn_dev.setToolTip("Chromium 自带的完整开发者工具；"
+                                "关闭窗口即释放它占用的渲染实例")
+        self.btn_dev.clicked.connect(lambda: self.host.action("open_devtools"))
+        self.btn_log = QPushButton("轻量日志")
+        self.btn_log.setObjectName("action")
+        self.btn_log.setToolTip("控制台与请求记录一直保留在内存里，"
+                                "工具没开着的时候也能回看报错（布局页只是坐标快照）")
+        self.btn_log.clicked.connect(lambda: self.host.action("open_devlog"))
+        self.btn_dir = QPushButton("打开日志目录")
+        self.btn_dir.setObjectName("action")
+        self.btn_dir.clicked.connect(lambda: self.host.open_path(self.host.log_dir()))
+        for b in (self.btn_dev, self.btn_log):
+            b.setEnabled(self.host.flag("dev_mode"))
+            if not self.host.flag("dev_mode"):
+                b.setToolTip("先开启上方的开发者模式")
+        self.toggles["dev_mode"].btn.toggled.connect(self.btn_dev.setEnabled)
+        self.toggles["dev_mode"].btn.toggled.connect(self.btn_log.setEnabled)
+        for b in (self.btn_dev, self.btn_log, self.btn_dir):
+            dl.addWidget(b)
+        dl.addStretch(1)
+        c2.add(dev_row)
+        self.layout_.addWidget(c2)
+
+        # --- 数据目录 ---
+        c3 = Card("数据目录", self.pal)
+        self.card_data = c3
+        self.kv_root = KeyValueRow("位置", "—", self.pal)
+        self.kv_usage = KeyValueRow("占用", "—", self.pal)
+        c3.add(self.kv_root)
+        c3.add(self.kv_usage)
+        self.group_rows: list[KeyValueRow] = []
+        c3.add_text("删掉 exe 不会带走这些数据——换机、重装前可以在这里搬家或清理。")
+        dir_row = QWidget()
+        dr = QHBoxLayout(dir_row)
+        dr.setContentsMargins(16, 4, 16, 10)
+        dr.setSpacing(8)
+        self.btn_open_dir = QPushButton("打开位置")
+        self.btn_open_dir.setObjectName("action")
+        self.btn_open_dir.clicked.connect(
+            lambda: self.host.open_path(self.host.data_dir()))
+        self.btn_move = QPushButton("迁移到其他磁盘…")
+        self.btn_move.setObjectName("action")
+        self.btn_move.clicked.connect(lambda: self.host.action("migrate_data"))
+        self.btn_clear = QPushButton("清理缓存")
+        self.btn_clear.setObjectName("action")
+        self.btn_clear.setToolTip("只清浏览器缓存与日志，保留设置和登录态")
+        self.btn_clear.clicked.connect(lambda: self.host.action("clear_cache"))
+        self.btn_wipe = QPushButton("清空全部数据…")
+        self.btn_wipe.setObjectName("action")
+        self.btn_wipe.setToolTip("删除全部数据，回到首次运行的状态")
+        self.btn_wipe.clicked.connect(lambda: self.host.action("clear_all"))
+        for b in (self.btn_open_dir, self.btn_move, self.btn_clear, self.btn_wipe):
+            dr.addWidget(b)
+        dr.addStretch(1)
+        c3.add(dir_row)
+        self.layout_.addWidget(c3)
+
+        self.layout_.addStretch(1)
+        self.refresh()
+
+    def refresh(self) -> None:
+        for name, row in self.toggles.items():
+            row.set_checked(self.host.flag(name))
+        on = self.host.flag("dev_mode")
+        for b in (self.btn_dev, self.btn_log):
+            b.setEnabled(on)
+
+        info = storage.breakdown()
+        self.kv_root.set(info["root"])
+        self.kv_usage.set("%s · %d 个文件"
+                          % (storage.str_of_bytes(info["bytes"]), info["files"]))
+        # 明细行重建（组数很少，重建比增删维护简单）
+        for r in self.group_rows:
+            r.setParent(None)
+            r.deleteLater()
+        self.group_rows = []
+        card = getattr(self, "card_data", None)
+        for g in info["groups"]:
+            r = KeyValueRow("　" + g["label"],
+                            "%s · %d 个文件"
+                            % (storage.str_of_bytes(g["bytes"]), g["files"]),
+                            self.pal)
+            r.setToolTip(g["hint"])
+            if card is not None and hasattr(card, "add"):
+                card.add(r)
+            self.group_rows.append(r)
+
+    def on_show(self) -> None:
+        if not self._built:
+            super().on_show()
+        else:
+            self.refresh()
+
+    def apply_palette(self, pal: dict) -> None:
+        super().apply_palette(pal)
+        if not self._built:
+            return
+        for w in (self.kv_root, self.kv_usage):
+            w.set_palette_colors(pal)
+        for c in self.findChildren(Card):
+            c.set_palette_colors(pal)
+        for r in self.toggles.values():
             r.set_palette_colors(pal)
 
 
@@ -1263,34 +1376,122 @@ class DeployPage(BasePage):
         QTimer.singleShot(1200, lambda: btn.setText(old))
 
 
-class ConnectPage(BasePage):
-    """连接（远程入口，占位）。"""
+class RunModePage(BasePage):
+    """运行方式：私有 / 公共 / 远程。
+
+    为什么要能选（2026-10-20）
+    ------------------------
+    复用用户已有的 DSH 是我们的优势（不重复占磁盘、版本和命令行一致），
+    但它有个副作用：**和命令行的 npm 抢同一个 node_modules**。
+    2026-10-20 那次"版本号正常、界面却一堆接口 404"，根因就是 npm 只升了主包，
+    58 个精确版本的子依赖还留在旧版。
+
+    「私有」把这份安装搬进应用自己的数据目录，与系统完全隔离；
+    「公共」保持现在的行为。选择权交给用户：在意磁盘就共用，在意稳定就独立。
+    """
 
     def build(self) -> None:
-        self.layout_.addWidget(_label("连接", "h1"))
-        self.layout_.addWidget(_label("远程连接还在规划中，这里先说明我们打算怎么做。"))
+        self.layout_.addWidget(_label("运行方式", "h1"))
+        self.layout_.addWidget(_label(
+            "决定这个窗口用哪一份 DSH 运行。切换后会重启后台服务，"
+            "聊天记录与登录态不受影响。"))
 
-        c1 = Card("规划中的形态", self.pal)
-        # 用一段文本而不是三条独立 label：独立 label 之间的间距只能靠各自的
-        # 内边距堆，看起来是散的；整段交给 QLabel 自己排版更稳。
-        c1.add_text("\n".join((
-            "· 把另一台设备上的 DSH 呈现在本机窗口里，多个设备各开一个窗口",
-            "· 目标设备可以还没启动 DSH——由连接过程带着把它拉起来",
-            "· 连接方式依托你已有的通道（SSH 隧道或组网），不额外占用端口",
-        )))
+        self.kv_mode = KeyValueRow("当前使用", "—", self.pal)
+        self.kv_ver = KeyValueRow("实际版本", "—", self.pal)
+        c0 = Card("现在", self.pal)
+        c0.add(self.kv_mode)
+        c0.add(self.kv_ver)
+        self.layout_.addWidget(c0)
+
+        # --- 私有 ---
+        c1 = Card("私有安装（推荐）", self.pal)
+        self.kv_priv = KeyValueRow("状态", "—", self.pal)
+        c1.add(self.kv_priv)
+        c1.add_text("在应用自己的数据目录里放一份 DSH，和命令行里那份互不影响。"
+                    "更新只动这一份，不会再出现「主程序升了、组件还停在旧版」。")
+        h1 = QWidget()
+        r1 = QHBoxLayout(h1)
+        r1.setContentsMargins(16, 4, 16, 10)
+        r1.setSpacing(8)
+        self.btn_private = QPushButton("启用私有")
+        self.btn_private.setObjectName("primary")
+        self.btn_private.clicked.connect(lambda: self.host.action("use_private"))
+        r1.addWidget(self.btn_private)
+        r1.addStretch(1)
+        c1.add(h1)
         self.layout_.addWidget(c1)
 
-        c2 = Card("一条不会变的底线", self.pal)
-        c2.add_text(
-            "我们不会让 DSH 监听外网，也不会改它的绑定设置。"
-            "DSH 的接口上有执行命令的能力，官方正是因为这个才把监听范围锁在本机"
-            "（它自己的启动器里写着：绑定到全网段等于把远程代码执行暴露到网络上）。"
-            "绕过这条限制，等于替官方做它明确拒绝的安全决定，而且上游一加校验我们就得崩。")
-        c2.add_text(
-            "所以传输由我们这一侧负责：DSH 仍然只听本机，由隧道把它的本机端口借过来"
-            "——对外只需要一条通道。")
+        # --- 公共 ---
+        c2 = Card("公共安装（与命令行共用）", self.pal)
+        self.kv_pub = KeyValueRow("状态", "—", self.pal)
+        c2.add(self.kv_pub)
+        c2.add_text("直接用命令行里那份 DSH，不额外占磁盘。"
+                    "代价是它也受你在终端里执行的升级影响——"
+                    "两边同时改同一份文件时，可能出现组件版本对不齐。")
+        h2 = QWidget()
+        r2 = QHBoxLayout(h2)
+        r2.setContentsMargins(16, 4, 16, 10)
+        r2.setSpacing(8)
+        self.btn_public = QPushButton("启用公共")
+        self.btn_public.setObjectName("action")
+        self.btn_public.clicked.connect(lambda: self.host.action("use_system"))
+        r2.addWidget(self.btn_public)
+        r2.addStretch(1)
+        c2.add(h2)
         self.layout_.addWidget(c2)
+
+        # --- 远程 ---
+        c3 = Card("远程 DSH（规划中）", self.pal)
+        c3.add_text("\n".join((
+            "· 把另一台设备上的 DSH 呈现在本机窗口里，多台设备各开一个窗口",
+            "· 目标设备可以还没启动 DSH——由连接过程带着把它拉起来",
+            "· 依托你已有的通道（SSH 隧道或组网），不额外占端口",
+        )))
+        c3.add_text(
+            "底线不变：我们不会让 DSH 监听外网。它仍然只听本机，"
+            "由隧道把本机端口借过来——官方正是因为这个能力才把监听锁死在本机。")
+        self.layout_.addWidget(c3)
+
         self.layout_.addStretch(1)
+        self.refresh()
+
+    def refresh(self) -> None:
+        mode = str(config.get("dsh_source") or "auto")
+        label = {"private": "私有安装", "system": "公共安装（命令行那份）"}.get(
+            mode, "自动（私有优先）")
+        self.kv_mode.set(label)
+        inst = self.host.install()
+        self.kv_ver.set(("%s · %s" % (inst.version, inst.source)) if inst else "未检测")
+
+        if provision.private_ready():
+            self.kv_priv.set("已安装 · %s" % provision.private_version())
+        else:
+            self.kv_priv.set("未安装")
+        self.btn_private.setText("正在使用" if mode == "private" else "启用私有")
+        self.btn_private.setEnabled(mode != "private")
+
+        system_hint = "未检测到"
+        for src, path, _node in contract.candidate_bin_js(prefer="system"):
+            system_hint = "%s · %s" % (src, os.path.basename(path))
+            break
+        self.kv_pub.set(system_hint)
+        self.btn_public.setText("正在使用" if mode == "system" else "启用公共")
+        self.btn_public.setEnabled(mode != "system")
+
+    def on_show(self) -> None:
+        if not self._built:
+            super().on_show()
+        else:
+            self.refresh()
+
+    def apply_palette(self, pal: dict) -> None:
+        super().apply_palette(pal)
+        if not self._built:
+            return
+        for w in (self.kv_mode, self.kv_ver, self.kv_priv, self.kv_pub):
+            w.set_palette_colors(pal)
+        for c in self.findChildren(Card):
+            c.set_palette_colors(pal)
 
 
 class StatusPage(BasePage):
@@ -1502,8 +1703,9 @@ class ControlPanel(QWidget):
 
     PAGES = (
         ("layout-dashboard", "概览", OverviewPage),
+        ("plug", "运行方式", RunModePage),
         ("package", "本机部署", DeployPage),
-        ("plug", "连接", ConnectPage),
+        ("settings", "常规", GeneralPage),
         ("activity", "状态检测", StatusPage),
         ("info", "关于", AboutPage),
     )
@@ -1772,7 +1974,8 @@ def selftest_checks() -> list:
     check("页签数量与定义一致", len(panel.navs) == len(ControlPanel.PAGES),
           "%d 个" % len(panel.navs))
     titles = [n.text().strip() for n in panel.navs]
-    check("页签名正确", titles == ["概览", "本机部署", "连接", "状态检测", "关于"],
+    check("页签名正确",
+          titles == ["概览", "运行方式", "本机部署", "常规", "状态检测", "关于"],
           "、".join(titles))
 
     # 部署页必须有「重新安装 DSH」入口：半升级（主包新、子依赖旧）的唯一
@@ -1792,7 +1995,7 @@ def selftest_checks() -> list:
         check("五个页面都能切换并完成构建", False,
               "%s: %s" % (type(e).__name__, e))
 
-    sp = panel.pages.get(3)
+    sp = panel.pages.get(4)
     check("状态检测页覆盖全部预期项",
           sp is not None and set(sp.rows.keys()) == {k for k, _n in CHECK_ROWS},
           "、".join(sp.rows.keys()) if sp is not None else "状态页未构建")
@@ -1954,17 +2157,25 @@ def selftest_checks() -> list:
                 hits.append(lbl.text()[:30])
     check("面板不含 Emoji", not hits, "、".join(hits[:3]))
 
-    # --- 托盘搬过来的设置项必须在面板里存在 ---
-    ov = panel.pages.get(0)
-    toggles = getattr(ov, "toggles", {}) if ov is not None else {}
-    check("概览页承载了从托盘搬来的开关",
+    # --- 设置项从概览迁到「常规」页（2026-10-20 重排）---
+    gp = panel.pages.get(3)
+    toggles = getattr(gp, "toggles", {}) if gp is not None else {}
+    check("「常规」页承载了更新与外观、开发者开关",
           {"prerelease_opt_in", "dev_mode"} <= set(toggles),
           "、".join(toggles) or "无")
     # 开发者模式下才给入口：默认关着的时候按钮必须是灰的，否则用户点了
     # 会被"还没开启"顶回来，属于无意义交互。
     check("开发者按钮在模式关闭时不可点",
-          ov is not None and hasattr(ov, "btn_dev")
-          and not ov.btn_dev.isEnabled() and not ov.btn_log.isEnabled())
+          gp is not None and hasattr(gp, "btn_dev")
+          and not gp.btn_dev.isEnabled() and not gp.btn_log.isEnabled())
+    # 概览只留状态与主操作：不该再出现更新按钮（那是常规页的事）
+    ov = panel.pages.get(0)
+    check("概览已瘦身（更新按钮不在概览）",
+          ov is not None and not hasattr(ov, "btn_update"))
+    # 运行方式页三档齐全
+    rp = panel.pages.get(1)
+    check("运行方式页给出私有 / 公共两档入口",
+          rp is not None and hasattr(rp, "btn_private") and hasattr(rp, "btn_public"))
 
     check("后台检测线程能干净收尾", panel.shutdown(15000))
 

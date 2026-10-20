@@ -301,11 +301,17 @@ def _node_for(bin_js: str) -> str | None:
     return node if node and os.path.isfile(node) else None
 
 
-def candidate_bin_js():
+def candidate_bin_js(prefer: str | None = None):
     """所有"看起来装了 DSH"的位置 → (来源, bin.js, node 覆盖值)。
 
     这里**不校验能否运行**——那是 read_version 的事。解耦之后，诊断层才能区分
     "根本没装"和"装了但跑不起来"（后者通常是 Node 版本过旧），给出不同的建议。
+
+    `prefer` 是来源偏好（2026-10-20 加，控制面板可切）：
+      auto     私有优先，没有就回退系统（出厂行为）
+      private  **只**用私有那份——找不到就报"需要安装"，绝不静默回退到系统
+      system   跳过私有，用 PATH / npm 全局
+    显式覆盖（DSH_BIN / 配置里的 dsh_bin）永远排在最前，不受偏好影响。
     """
     cfg = config.load()
 
@@ -317,11 +323,20 @@ def candidate_bin_js():
     if c and os.path.isfile(c):
         yield "配置文件", c, cfg.get("dsh_node")
 
-    # 2. 我们私有管理的安装。存在就一定优先——它是唯一由我们说准了位置、
+    mode = (prefer or config.get("dsh_source") or "auto")
+    mode = str(mode).strip().lower()
+    if mode not in ("auto", "private", "system"):
+        mode = "auto"
+
+    # 2. 我们私有管理的安装。auto 下存在就一定优先——它是唯一由我们说准了位置、
     #    且能免管理员更新的那一份。（想强制用别处，在设置里指定 dsh_bin）
-    priv = os.path.join(config.node_global_dir(), BIN_REL)
-    if os.path.isfile(priv):
-        yield "私有 prefix", priv, None
+    if mode in ("auto", "private"):
+        priv = os.path.join(config.node_global_dir(), BIN_REL)
+        if os.path.isfile(priv):
+            yield "私有目录", priv, None
+
+    if mode == "private":
+        return          # 只认私有：找不到就是"没装"，由调用方报错
 
     # 3. PATH 上的 dsh 包装（等价于"用户在终端敲 dsh 会跑什么"）
     seen: set[str] = set()

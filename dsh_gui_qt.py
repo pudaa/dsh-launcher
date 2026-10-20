@@ -64,7 +64,7 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QSystemTrayIcon, QDialog,
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QProgressBar, QStackedWidget,
-    QPlainTextEdit, QPushButton,
+    QPlainTextEdit, QPushButton, QFileDialog,
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEngineProfile
@@ -73,7 +73,8 @@ import dsh_console
 import dsh_devtools
 import dsh_panel
 import dsh_theme
-from dsh_host import config, contract, dwm, provision, selfupdate, updater
+from dsh_host import (config, contract, dwm, provision, selfupdate,
+                      storage, updater)
 from dsh_host.contract import DshError, ServiceHandle
 from dsh_host.version import HOST_VERSION
 
@@ -1104,6 +1105,35 @@ class ReinstallDialog(QDialog):
             event.ignore()
             return
         super().closeEvent(event)
+
+
+class ServiceSwapWorker(QThread):
+    """换完配置（来源 / 数据目录）后，按新配置把后台服务拉起来。
+
+    为什么单独一个 worker：切换来源要重新 `resolve_install`（偏好变了），
+    迁移数据目录之后连日志路径都变了——旧 handle 整体失效，只能停掉重来。
+    """
+    done = Signal(bool, str, object)
+
+    def __init__(self, old_handle, logf):
+        super().__init__()
+        self.old_handle = old_handle
+        self.logf = logf
+
+    def run(self):
+        try:
+            if self.old_handle is not None:
+                contract.stop(self.old_handle,
+                              port=(self.old_handle.port or None))
+                contract.save_state(None)
+            inst = contract.resolve_install(force=True)
+            h = contract.launch(inst, int(config.get("port") or 0),
+                                self.logf, cwd=config.log_dir())
+            contract.wait_ready(h)
+            contract.save_state(h)
+            self.done.emit(True, h.url, h)
+        except Exception as e:                                 # noqa: BLE001
+            self.done.emit(False, "%s: %s" % (type(e).__name__, e), None)
 
 
 # ------------------------------------------------------------------ 主窗口
@@ -2275,6 +2305,142 @@ class MainWindow(QMainWindow):
         elif name == "dev_mode":
             self._toggle_dev_mode(bool(value))
 
+    # ---------------------------------------------------- 运行方式与数据目录
+
+    def _drop_webview(self) -> None:
+        """释放 WebEngine 实例。
+
+        删/搬数据目录前**必须**先做这一步：Windows 上 WebEngine 进程会锁住
+        profile 目录里的缓存文件，不释放就删不掉、也复制不完整。
+        """
+        try:
+            if self.view is not None:
+                self.stack.removeWidget(self.view)
+                self.view.deleteLater()
+                self.view = None
+                self.page = None
+            if self.profile is not None:
+                self.profile.deleteLater()
+                self.profile = None
+        except Exception:                                      # noqa: BLE001
+            pass
+        QApplication.processEvents()
+
+    def _swap_service(self, note: str = "") -> None:
+        """按当前配置重启后台服务（来源 / 数据目录变了之后）。"""
+        if getattr(self, "_swapping", False):
+            self._info("正在重启服务，请稍候。")
+            return
+        self._swapping = True
+        self.stack.setCurrentIndex(0)
+        self._set_tip("正在按新配置重启服务…")
+        w = ServiceSwapWorker(self.handle, config.service_log())
+        self._swap_worker = w
+
+        def done(ok: bool, detail: str, handle) -> None:
+            self._swapping = False
+            if ok and handle is not None:
+                if note:
+                    host_log(note)
+                self._on_ready(handle)
+            else:
+                host_log("重启服务失败：%s" % detail)
+                self._warn("服务没有起来：\n\n%s\n\n可到「状态检测」页查看详情。" % detail)
+
+        w.done.connect(done)
+        w.start()
+
+    def _switch_source(self, mode: str) -> None:
+        """切换 DSH 来源。私有未就绪时先复制一份现有安装。"""
+        if str(config.get("dsh_source") or "auto") == mode:
+            return
+        if mode == "private" and not provision.private_ready():
+            inst = self.handle.install if self.handle else None
+            if inst is None:
+                self._info("还没有可用的 DSH。先到「本机部署」准备运行环境。")
+                return
+            if not dsh_theme.MessageDialog.ask(
+                    self, "准备私有副本",
+                    "会在应用自己的数据目录里放一份 DSH（约 250 MB），"
+                    "与命令行里那份互不影响。\n\n"
+                    "现在把当前安装（%s）复制过去，通常几十秒。" % inst.version,
+                    "复制并启用", "取消"):
+                return
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                ok, detail = provision.import_private(inst, on_line=host_log)
+            finally:
+                QApplication.restoreOverrideCursor()
+            if not ok:
+                self._warn("准备私有副本失败：\n\n%s" % detail)
+                return
+        config.set(dsh_source=mode)
+        self._swap_service("运行方式切换为 %s" % mode)
+
+    def _migrate_data(self) -> None:
+        info = storage.breakdown()
+        target = QFileDialog.getExistingDirectory(
+            self, "选择新的数据目录（建议空目录）", info["root"])
+        if not target:
+            return
+        if not dsh_theme.MessageDialog.ask(
+                self, "迁移数据目录",
+                "把数据从\n%s\n搬到\n%s\n\n"
+                "先停止后台服务，复制完成后自动重启。共 %d 个文件（%s）。"
+                % (info["root"], target, info["files"],
+                   storage.str_of_bytes(info["bytes"])),
+                "开始迁移", "取消"):
+            return
+        old = info["root"]
+        self._stop_service()
+        self._drop_webview()
+        try:
+            new_root = storage.migrate(target, on_line=host_log)
+        except storage.StorageError as e:
+            self._warn("迁移失败：\n\n%s" % e)
+            self._swap_service()
+            return
+        if not storage.remove_old(old):
+            host_log("旧数据目录未能完全删除：%s" % old)
+        self._swap_service("数据目录迁移到 %s" % new_root)
+        self._info("数据已搬到：\n%s\n\n旧目录里没有删干净的部分可以手动清理。"
+                   % new_root)
+
+    def _clear_cache(self) -> None:
+        info = storage.breakdown()
+        if not dsh_theme.MessageDialog.ask(
+                self, "清理缓存",
+                "删除浏览器缓存、日志与登录态（约 %s）。\n\n"
+                "设置和 DSH 安装不受影响；清理后需要重新登录 DSH。"
+                % storage.str_of_bytes(info["bytes"]),
+                "清理", "取消"):
+            return
+        self._stop_service()
+        self._drop_webview()
+        try:
+            n, b = storage.clear_cache()
+        except storage.StorageError as e:
+            self._warn("清理失败：\n\n%s" % e)
+            self._swap_service()
+            return
+        self._swap_service("已清理缓存：%d 个文件（%s）"
+                           % (n, storage.str_of_bytes(b)))
+
+    def _clear_all(self) -> None:
+        info = storage.breakdown()
+        if not dsh_theme.MessageDialog.ask(
+                self, "清空全部数据",
+                "删除桌面壳的全部数据（%s，%d 个文件）：设置、登录态、日志，"
+                "以及私有 DSH 安装。\n\n这个操作不可撤销。"
+                % (storage.str_of_bytes(info["bytes"]), info["files"]),
+                "全部清空", "取消"):
+            return
+        self._stop_service()
+        self._drop_webview()
+        n, _b = storage.clear_all()
+        self._warn("已清空全部数据（%d 个文件）。\n\n"
+                   "退出应用后重新启动，会回到首次运行的引导流程。" % n)
+
     def _panel_action(self, name: str) -> None:
         if name == "check_update":
             self._check_update(manual=True)
@@ -2286,6 +2452,16 @@ class MainWindow(QMainWindow):
             self._prepare_env()
         elif name == "reinstall_dsh":
             self._reinstall_dsh()
+        elif name == "use_private":
+            self._switch_source("private")
+        elif name == "use_system":
+            self._switch_source("system")
+        elif name == "migrate_data":
+            self._migrate_data()
+        elif name == "clear_cache":
+            self._clear_cache()
+        elif name == "clear_all":
+            self._clear_all()
         elif name == "open_devtools":
             self._open_inspector()
         elif name == "open_devlog":

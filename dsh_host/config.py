@@ -41,11 +41,65 @@ def _local_appdata() -> str:
     return os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
 
 
+def default_root() -> str:
+    """出厂的数据根（不读指针、不建目录）。"""
+    return os.path.join(_local_appdata(), APP_NAME)
+
+
+def pointer_path() -> str:
+    """位置指针。**永远固定在默认根下**——数据根可以搬，它不能搬。
+
+    只有几十字节，留着它才能知道"数据搬去哪了"。
+    """
+    return os.path.join(default_root(), "location.json")
+
+
+_root_cache: str | None = None
+
+
 def data_root() -> str:
-    """桌面壳数据根。目录不存在则创建。"""
-    d = os.path.join(_local_appdata(), APP_NAME)
-    os.makedirs(d, exist_ok=True)
-    return d
+    """桌面壳数据根。目录不存在则创建。
+
+    2026-10-20：根目录可以搬到别的磁盘（C 盘紧张时），由 `location.json`
+    指向。指针读不到或指向的位置不存在，就退回默认根——**不静默新建空目录**，
+    否则用户会以为数据丢了（这里 makedirs 的是已经确定的位置）。
+    """
+    global _root_cache
+    if _root_cache:
+        return _root_cache
+    root = default_root()
+    try:
+        with open(pointer_path(), encoding="utf-8") as f:
+            configured = (json.load(f) or {}).get("root")
+        if isinstance(configured, str) and configured.strip():
+            root = configured.strip()
+    except (OSError, ValueError):
+        pass
+    os.makedirs(root, exist_ok=True)
+    _root_cache = root
+    return root
+
+
+def set_data_root(target: str) -> None:
+    """把指针改到 `target`（目标目录不会被创建——调用方已经复制完数据）。
+
+    指向默认根时**删除指针文件**，回到出厂状态，少一个概念。
+    """
+    global _root_cache
+    target = (target or "").strip()
+    if not target:
+        raise ValueError("目标目录为空")
+    if os.path.normcase(os.path.abspath(target)) == \
+            os.path.normcase(os.path.abspath(default_root())):
+        try:
+            os.remove(pointer_path())
+        except OSError:
+            pass
+    else:
+        os.makedirs(default_root(), exist_ok=True)
+        with open(pointer_path(), "w", encoding="utf-8") as f:
+            json.dump({"root": os.path.abspath(target)}, f, ensure_ascii=False, indent=2)
+    _root_cache = None
 
 
 def runtime_dir() -> str:
@@ -116,6 +170,10 @@ def node_global_dir() -> str:
 
 # 默认值即"出厂设置"。用户改动写入 settings.json，缺省键在这里兜底。
 DEFAULTS: dict = {
+    # DSH 来源偏好（2026-10-20）：auto = 私有优先、没有就回退系统；
+    # private = 只认数据目录里那份（与系统完全隔离，不会有半升级）；
+    # system = 用 PATH / npm 全局那份（与命令行共用，会被 CLI 的升级影响）。
+    "dsh_source": "auto",
     # 服务端口：3080 优先，被占用且允许降级时改用 --port 0 由系统分配
     "port": 3080,
     "port_auto_fallback": True,

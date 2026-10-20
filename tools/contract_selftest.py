@@ -442,7 +442,49 @@ def main_lite() -> int:
           accept_release(_rel("2.4.0-beta.1"), include_prerelease=True))
 
     print(LINE)
-    print("[Host] 网络代理提示")
+    print("[Host] 数据目录搬迁")
+    # 2026-10-20：数据根可搬（C 盘紧张时），搬迁逻辑必须钉住——
+    # 它删的是用户数据，错一次就没法交代。全程用临时 LOCALAPPDATA 隔离。
+    import tempfile
+
+    from dsh_host import storage
+
+    _old_local = os.environ.get("LOCALAPPDATA")
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["LOCALAPPDATA"] = tmp
+        config._root_cache = None
+        try:
+            root = config.data_root()
+            os.makedirs(os.path.join(root, "logs"), exist_ok=True)
+            with open(os.path.join(root, "logs", "a.log"), "w", encoding="utf-8") as f:
+                f.write("x" * 200)
+            f1, b1 = storage.tree_usage(root)
+            check("能统计数据目录占用", f1 >= 1 and b1 >= 200,
+                  "%d 个文件 / %d 字节" % (f1, b1))
+
+            target = os.path.join(tmp, "moved")
+            new_root = storage.migrate(target)
+            check("迁移后指针指向新位置",
+                  os.path.normcase(config.data_root())
+                  == os.path.normcase(os.path.abspath(new_root)))
+            f2, _b2 = storage.tree_usage(new_root)
+            check("新位置文件数与原来一致", f2 == f1, "%d → %d" % (f1, f2))
+            check("指针文件落在默认根",
+                  os.path.isfile(os.path.join(tmp, config.APP_NAME, "location.json")))
+
+            storage.remove_old(root)
+            check("旧目录的数据已清除",
+                  not os.path.isdir(os.path.join(root, "logs")))
+            check("指针本身被保留",
+                  os.path.isfile(os.path.join(tmp, config.APP_NAME, "location.json")))
+        finally:
+            if _old_local is None:
+                os.environ.pop("LOCALAPPDATA", None)
+            else:
+                os.environ["LOCALAPPDATA"] = _old_local
+            config._root_cache = None
+
+
     # 2026-10-20 实测：chat.deepseek.com 直连 429、走代理 403。
     # DSH 只认环境变量里的代理，不读系统代理，于是"账号资料不可用"极难归因。
     from dsh_host import netenv
