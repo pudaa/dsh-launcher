@@ -35,7 +35,7 @@ from collections import deque
 from dataclasses import dataclass
 
 from PySide6.QtCore import QRegularExpression, Qt, QTimer, QUrl
-from PySide6.QtGui import (QColor, QFont, QTextCharFormat, QTextCursor,
+from PySide6.QtGui import (QColor, QDesktopServices, QFont, QTextCharFormat, QTextCursor,
                            QTextDocument, QSyntaxHighlighter)
 from PySide6.QtWebEngineCore import (QWebEnginePage, QWebEngineProfile,
                                      QWebEngineUrlRequestInterceptor)
@@ -302,6 +302,16 @@ class ShellPage(QWebEnginePage):
                     return False
                 if where == "ignore":
                     return False
+            elif is_main_frame:
+                # 脚本发起的主框架导航（window.location / 重定向）去了外部站点：
+                # 与官方桌面端一致——阻止它，交给系统浏览器。
+                # 官方 apps/desktop 的 will-navigate 就是 preventDefault +
+                # shell.openExternal。放行的后果是主窗口被带离 DSH，
+                # 和 about:blank 那次白屏是同一种事故。
+                where = nav_disposition(url, self._base())
+                if where == "external":
+                    self._deliver_external(url)
+                    return False
         except Exception:                                      # noqa: BLE001
             pass
         return True
@@ -412,8 +422,30 @@ class PopupWindow(QMainWindow):
         view.setPage(page)
         self.setCentralWidget(view)
         self.view = view
+        # 弹窗一旦被导航到外部站点，就交给系统浏览器（对齐官方桌面端）。
+        view.urlChanged.connect(self._on_url_changed)
         if url.isValid() and not url.isEmpty():
             view.load(url)
+
+    def _on_url_changed(self, url) -> None:
+        """被导航到外部站点 → 系统浏览器打开，然后关掉自己。
+
+        官方 `apps/desktop` 的做法是 `setWindowOpenHandler` 直接
+        `shell.openExternal(url)` + `{action:'deny'}`，**根本不开 WebEngine 窗口**；
+        主窗口被导航到外部时同样 preventDefault + openExternal。
+        我们没有 host 的 IPC 通道去监听"等待浏览器授权"，所以保留 about:blank
+        占位窗口以兼容 DSH 现在的流程，但外部登录页一律不自己渲染：
+        一是和官方行为一致，二是 Chromium 里加载 chat.deepseek.com 受代理影响
+        会变成一片空白（2026-10-20 实测），用户在浏览器里至少能看到地址栏、
+        能自己处理代理或换浏览器。
+        """
+        u = url if isinstance(url, QUrl) else QUrl(str(url or ""))
+        if u.isValid() and not u.isEmpty() and u.scheme().lower() in ("http", "https"):
+            try:
+                QDesktopServices.openUrl(u)
+            except Exception:                                  # noqa: BLE001
+                pass
+            self.close()
 
 
 # ------------------------------------------------------------------ 注入脚本
