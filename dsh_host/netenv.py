@@ -12,6 +12,7 @@
 而本机实测（无认证，只看状态码）：
 
     chat.deepseek.com/auth-api/v0/users/current
+    platform.deepseek.com/dsh/authorize（登录授权页，实测同样 403）
         直连 429（通，只是限流）    走代理 403（被拒）
     api.deepseek.com/models
         直连 401（通，只是缺 key）
@@ -54,5 +55,7 @@ def proxy_hint() -> str:
             "DSH 只会走环境变量里配的代理（它不读系统的代理设置），"
             "而账号相关的请求经代理会被拒绝——表现是「账号资料暂不可用」，"
             "登录状态和余额却显示正常，很容易误判成登录过期。\n\n"
-            "要排除的话：设置环境变量 NO_PROXY=chat.deepseek.com 后重启桌面壳。"
+            "要排除的话，两个域名都得写：\n"
+            "NO_PROXY=platform.deepseek.com,chat.deepseek.com\n"
+            "然后重启桌面壳。"
             "（本项目不会替你改环境变量，这一步由你决定。）")

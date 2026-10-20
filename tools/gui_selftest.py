@@ -489,11 +489,15 @@ def host_update_checks() -> list[str]:
               f"  closeEvent={hasattr(getattr(g, 'ReinstallDialog', None), 'closeEvent')}"
               f"  动作接线={'reinstall_dsh' in inspect.getsource(g.MainWindow._panel_action)}")
 
-    # 1g. 登录窗口：window.open 一律拒绝（对齐官方 deny），不能开 WebEngine 窗口。
-    #     Qt 下自建窗口拿不到有效的 window 对象，DSH 后续导航不会发生，
-    #     结果就是一个永远空白的窗口 + 登录卡住（2026-10-20 实测）。
-    #     同时仍要保留刷新入口作为页面跑偏时的自救。
     import dsh_devtools as _dt
+    from PySide6.QtCore import QUrl as _QUrl
+    from PySide6.QtWebEngineCore import (QWebEnginePage as _WEP,
+                                         QWebEngineProfile as _QWEP)
+    from PySide6.QtWebEngineWidgets import QWebEngineView as _QWEV
+
+    # 1g. 登录窗口：window.open 交给 Qt，授权页转系统浏览器。
+    #     Qt 的 createWindow 默认返回 nullptr，不重写的话页面里
+    #     window.open() 只能拿到 null，DSH 的登录流程就卡死。
     _src = inspect.getsource(_dt.ShellPage._on_new_window)
     ok = ('"about"' in _src and "openIn" in _src
           and hasattr(_dt.ShellPage, "createWindow")
@@ -503,6 +507,32 @@ def host_update_checks() -> list[str]:
         failures.append("登录弹窗/刷新入口")
         print(f"        openIn={'openIn' in _src}"
               f"  createWindow={hasattr(_dt.ShellPage, 'createWindow')}")
+
+    # 1h. 导航策略全分支回归。主框架防护曾因引用未定义变量被 except 吞掉、
+    #    表现为"什么都没拦"，静态断言抓不到——必须逐场景跑。
+    _app = QApplication.instance() or QApplication([])
+    _prof = _QWEP("gui-selftest-nav", _app)
+    _mv = _QWEV()
+    _mp = _dt.ShellPage(_prof, _mv, base_url=lambda: "http://127.0.0.1:3080/",
+                        view=_mv)
+    _T = _WEP.NavigationType
+    _nav = [
+        ("同源主框架",   "http://127.0.0.1:3080/app", _T.NavigationTypeOther, True, True),
+        ("外部主框架",   "https://chat.deepseek.com/x", _T.NavigationTypeOther, True, False),
+        ("空白主框架",   "about:blank", _T.NavigationTypeOther, True, False),
+        ("外部点击",     "https://x.com/", _T.NavigationTypeLinkClicked, True, False),
+        ("外部iframe",   "https://x.com/", _T.NavigationTypeOther, False, True),
+        ("JS主框架",     "javascript:void(0)", _T.NavigationTypeOther, True, True),
+        ("空URL主框架",  "", _T.NavigationTypeOther, True, True),
+        ("异端口主框架", "http://127.0.0.1:9999/", _T.NavigationTypeOther, True, False),
+    ]
+    _bad = [n for n, u, t, m, want in _nav
+            if _mp.acceptNavigationRequest(_QUrl(u), t, m) != want]
+    print("  [%s] 导航策略八个分支全部符合预期%s"
+          % ("OK  " if not _bad else "FAIL",
+             "" if not _bad else "  " + "、".join(_bad)))
+    if _bad:
+        failures.append("导航策略")
 
     # 2. 源码运行时不支持自更新（避免替换掉开发的 py 文件）
     supported, reason = su.self_update_supported()

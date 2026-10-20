@@ -303,14 +303,22 @@ class ShellPage(QWebEnginePage):
                 if where == "ignore":
                     return False
             elif is_main_frame:
-                # 脚本发起的主框架导航（window.location / 重定向）去了外部站点：
-                # 与官方桌面端一致——阻止它，交给系统浏览器。
+                # 脚本发起的主框架导航（window.location / 重定向）：
+                # 与官方桌面端一致——外部站点交给系统浏览器。
                 # 官方 apps/desktop 的 will-navigate 就是 preventDefault +
-                # shell.openExternal。放行的后果是主窗口被带离 DSH，
-                # 和 about:blank 那次白屏是同一种事故。
+                # shell.openExternal。放行的后果是主窗口被带离 DSH。
+                # u / scheme 要在这里重新取：LinkClicked 分支里那两个变量
+                # 是本分支的外层，直接引用会 NameError，而 except 会把它
+                # 吞掉、表现为"什么都没拦"（2026-10-20 回归测试抓到）。
+                u = url if isinstance(url, QUrl) else QUrl(str(url or ""))
+                scheme = u.scheme().lower()
                 where = nav_disposition(url, self._base())
                 if where == "external":
                     self._deliver_external(url)
+                    return False
+                # 主框架去 about:blank 同理：那是 window.open 的占位地址，
+                # 主窗口从来不该去那里（2026-10-20 白屏事故的原始形态）。
+                if scheme == "about" and not u.host():
                     return False
         except Exception:                                      # noqa: BLE001
             pass
