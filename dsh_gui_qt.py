@@ -586,12 +586,15 @@ class UpdateWorker(QThread):
     line = Signal(str)
     done = Signal(bool, str, object)
 
-    def __init__(self, target: str, handle, restart_port: int, logf: str):
+    def __init__(self, target: str, handle, restart_port: int, logf: str,
+                 fresh: bool = True):
         super().__init__()
         self.target = target
         self.handle = handle
         self.restart_port = restart_port
         self.logf = logf
+        #: 是否先卸载旧包。更新与重装都该为 True——半升级就是"没卸就装"留下的。
+        self.fresh = fresh
 
     def run(self):
         box: dict = {}
@@ -615,7 +618,8 @@ class UpdateWorker(QThread):
         try:
             inst = contract.resolve_install()
             ok, detail = updater.update_to(inst, self.target, stop_service,
-                                           start_service, on_line=self.line.emit)
+                                           start_service, on_line=self.line.emit,
+                                           fresh=self.fresh)
             self.done.emit(ok, detail, box.get("handle"))
         except Exception as e:                                   # noqa: BLE001
             self.done.emit(False, f"{type(e).__name__}: {e}", box.get("handle"))
@@ -997,6 +1001,108 @@ class HostUpdateDialog(QDialog):
 
     def _restart(self):
         self.done(self.RESTART_NOW)
+
+
+class ReinstallDialog(QDialog):
+    """重新安装 DSH（修复半升级 / 损坏的安装）。
+
+    为什么单独一个窗口，不复用 UpdateDialog
+    ------------------------------------
+    UpdateDialog 的每句文案都建立在"目标版本 ≠ 当前版本"之上（升级 / 降级 /
+    旧版兼容性警告）。重装的目标就是当前版本，套进去会得到"升级到同一个版本"
+    这种自相矛盾的说法。这里只需要三件事：说清会做什么、显示进度、报结果。
+
+    背景（2026-10-20）
+    ------------------
+    `npm install -g` 可能只升主包、把精确版本的子依赖留在旧版。表现是
+    "版本号正常，界面却一堆接口 404 / 账号信息读不出来"。这个入口让用户
+    不必自己敲 npm 就能把安装重新做一遍。
+    """
+
+    def __init__(self, parent, version: str, handle):
+        super().__init__(parent)
+        self.setWindowTitle("重新安装 DSH")
+        self.setMinimumWidth(600)
+        self.resize(620, 420)
+        self.version = version
+        self.handle = handle
+        self.new_handle = None
+        self._worker = None
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(12)
+
+        headline = QLabel(
+            "将重新安装 DeepSeek Harness v%s（就是当前这个版本）。" % version)
+        headline.setObjectName("dlgBody")
+        headline.setWordWrap(True)
+        lay.addWidget(headline)
+
+        detail = QLabel(
+            "用途：修复「版本号看着正常、界面却报接口 404 或账号信息读不出来」"
+            "这类更新没装干净的情况。\n\n"
+            "过程：停止服务 → 卸载旧包 → 重新安装 → 校验各组件版本 → 重启服务。\n"
+            "聊天记录、登录状态和设置都在 DSH_HOME 里，不会被改动。")
+        detail.setObjectName("dlgHint")
+        detail.setWordWrap(True)
+        detail.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        lay.addWidget(detail)
+
+        self.log = dsh_theme.NotesView()
+        lay.addWidget(self.log, 1)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        self.go_btn = QPushButton("开始重新安装")
+        self.go_btn.setObjectName("primary")
+        self.go_btn.clicked.connect(self._start)
+        self.close_btn = QPushButton("取消")
+        self.close_btn.clicked.connect(self.reject)
+        row.addWidget(self.go_btn)
+        row.addWidget(self.close_btn)
+        lay.addLayout(row)
+
+        dsh_theme.style_dialog(self)
+
+    def _start(self):
+        self.go_btn.setEnabled(False)
+        self.close_btn.setEnabled(False)
+        self.log.clear()
+        self.log.append_line("开始重新安装 v%s…" % self.version)
+        self._worker = UpdateWorker(self.version, self.handle,
+                                    int(config.get("port") or 0),
+                                    config.service_log(), fresh=True)
+        self._worker.line.connect(self.log.append_line)
+        self._worker.line.connect(host_log)
+        self._worker.done.connect(self._on_done)
+        self._worker.start()
+
+    def _on_done(self, ok: bool, detail: str, new_handle):
+        self.new_handle = new_handle
+        self.close_btn.setEnabled(True)
+        host_log("重新安装%s：%s"
+                 % ("成功" if ok else "未完成", detail.replace("\n", " | ")[:400]))
+        if ok:
+            self.log.append_line("\n重新安装完成：DSH %s" % detail)
+            self.go_btn.setText("完成")
+            self.go_btn.setEnabled(True)
+            try:
+                self.go_btn.clicked.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            self.go_btn.clicked.connect(self.accept)
+        else:
+            self.log.append_line("\n重新安装未完成：\n" + detail)
+            self.go_btn.setEnabled(True)
+
+    def closeEvent(self, event):                                  # noqa: N802
+        # 安装过程不能被打断：中途退出会留下"卸载了但没装回去"的状态，
+        # 那比原来更糟。运行期间窗口点叉一律不响应。
+        if self._worker is not None and self._worker.isRunning():
+            event.ignore()
+            return
+        super().closeEvent(event)
 
 
 # ------------------------------------------------------------------ 主窗口
@@ -1793,6 +1899,25 @@ class MainWindow(QMainWindow):
         if prev:
             self._show_update_dialog(prev)
 
+    def _reinstall_dsh(self):
+        """按当前版本重装一遍 DSH。
+
+        存在理由：`npm install -g` 可能只升主包，把精确版本的子依赖留在旧版。
+        那种状态下版本号完全正常，但界面会报接口 404 / 账号信息读不出来——
+        用户没有任何办法自己判断，只能重装。这个入口就是那条路，
+        而且把"先卸载再装"和"子依赖校验"都收在 updater 里，不需要用户懂 npm。
+        """
+        if not self.handle or not getattr(self.handle, "install", None):
+            self._info("DSH 还没运行起来。先让它启动，再来重装。")
+            return
+        inst = self.handle.install
+        dlg = ReinstallDialog(self, inst.version, self.handle)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.new_handle:
+            self.handle = dlg.new_handle
+            self._ensure_webview()
+            self.stack.setCurrentIndex(1)
+            self.view.load(QUrl(self.handle.url))
+
     def _show_update_dialog(self, target: str):
         if not self.handle:
             return
@@ -2109,6 +2234,8 @@ class MainWindow(QMainWindow):
             self._rollback()
         elif name == "provision":
             self._prepare_env()
+        elif name == "reinstall_dsh":
+            self._reinstall_dsh()
         elif name == "open_devtools":
             self._open_inspector()
         elif name == "open_devlog":

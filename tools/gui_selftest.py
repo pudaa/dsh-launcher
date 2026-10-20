@@ -476,6 +476,19 @@ def host_update_checks() -> list[str]:
         print(f"        append_line={hasattr(dsh_theme.NotesView, 'append_line')}"
               f"  追加可见={append_ok}  残留旧调用={leaks}")
 
+    # 1f. 「重新安装 DSH」入口（2026-10-20）：半升级的唯一自助修复路径。
+    #     三个要素缺一不可：对话框存在、能在安装途中挡住关闭（中途退出会留下
+    #     "卸了没装回去"的残局）、面板动作真的接到主窗口。
+    ok = (hasattr(g, "ReinstallDialog")
+          and hasattr(g.ReinstallDialog, "closeEvent")
+          and "reinstall_dsh" in inspect.getsource(g.MainWindow._panel_action))
+    print(f"  [{'OK  ' if ok else 'FAIL'}] 提供「重新安装 DSH」入口且安装中不可关闭")
+    if not ok:
+        failures.append("重新安装入口")
+        print(f"        ReinstallDialog={hasattr(g, 'ReinstallDialog')}"
+              f"  closeEvent={hasattr(getattr(g, 'ReinstallDialog', None), 'closeEvent')}"
+              f"  动作接线={'reinstall_dsh' in inspect.getsource(g.MainWindow._panel_action)}")
+
     # 2. 源码运行时不支持自更新（避免替换掉开发的 py 文件）
     supported, reason = su.self_update_supported()
     ok = (supported is False) and bool(reason)

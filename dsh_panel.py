@@ -1181,6 +1181,25 @@ class DeployPage(BasePage):
         lay.addStretch(1)
         c3.add(holder)
         self.layout_.addWidget(c3)
+
+        # 修复入口。为什么放在部署页而不是概览页：它不是日常动作，
+        # 只在"更新过、但界面不对劲"时才需要——那种场景用户第一反应就是
+        # 跑到部署页找重装。
+        c4 = Card("更新之后界面不对劲？", self.pal)
+        c4.add_text("版本号看着正常，但界面报接口错误、账号信息显示不出来？"
+                    "这通常是上一次更新没装干净——部分组件还留在旧版本。"
+                    "重新安装一遍即可修复，聊天记录、登录状态和设置都不会动。")
+        holder2 = QWidget()
+        lay2 = QHBoxLayout(holder2)
+        lay2.setContentsMargins(16, 4, 16, 10)
+        btn2 = QPushButton("重新安装 DSH")
+        btn2.setObjectName("action")
+        btn2.clicked.connect(lambda: self.host.action("reinstall_dsh"))
+        lay2.addWidget(btn2)
+        lay2.addStretch(1)
+        c4.add(holder2)
+        self.layout_.addWidget(c4)
+
         self.layout_.addStretch(1)
 
     def _link_row(self, title: str, url: str) -> QWidget:
@@ -1747,6 +1766,13 @@ def selftest_checks() -> list:
     titles = [n.text().strip() for n in panel.navs]
     check("页签名正确", titles == ["概览", "本机部署", "连接", "状态检测", "关于"],
           "、".join(titles))
+
+    # 部署页必须有「重新安装 DSH」入口：半升级（主包新、子依赖旧）的唯一
+    # 自助修复路径，2026-10-20 加。没有它用户只能回命令行敲 npm。
+    import inspect as _inspect
+    _deploy_src = _inspect.getsource(DeployPage)
+    check("部署页提供「重新安装 DSH」入口",
+          "reinstall_dsh" in _deploy_src and "重新安装" in _deploy_src)
 
     try:
         for i in range(len(ControlPanel.PAGES)):

@@ -442,6 +442,45 @@ def main_lite() -> int:
           accept_release(_rel("2.4.0-beta.1"), include_prerelease=True))
 
     print(LINE)
+    print("[Host] 安装完整性（半升级防护）")
+    # 背景（2026-10-20）：`npm install -g` 可能只升主包，把精确版本的子依赖
+    # 留在旧版。表现为"版本号正常，界面却报接口 404"——光看版本号查不出来。
+    import inspect
+    import json as _json
+    import tempfile
+    import types
+
+    from dsh_host import updater
+
+    check("安装默认先卸载（根除半升级）",
+          inspect.signature(updater.install_version).parameters["fresh"].default is True)
+    check("更新流程默认先卸载",
+          inspect.signature(updater.update_to).parameters["fresh"].default is True)
+    check("提供「重新安装」入口", callable(getattr(updater, "reinstall", None)))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pkg = os.path.join(tmp, "node_modules", "@deepseek-ai", "dsh")
+        os.makedirs(pkg)
+        with open(os.path.join(pkg, "package.json"), "w", encoding="utf-8") as f:
+            _json.dump({"version": "2.0.0", "dependencies": {
+                "@deepseek-ai/a": "2.0.0",       # 精确，实际 1.0.0 → 应报
+                "@deepseek-ai/b": "~1.2.3",      # 范围，跳过
+                "@deepseek-ai/c": "2.0.0",       # 精确，缺失 → 应报
+            }}, f)
+        for name, ver in (("@deepseek-ai/a", "1.0.0"), ("@deepseek-ai/b", "1.2.9")):
+            d = os.path.join(tmp, "node_modules", *name.split("/"))
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "package.json"), "w", encoding="utf-8") as f:
+                _json.dump({"version": ver}, f)
+        fake = types.SimpleNamespace(prefix=tmp, version="2.0.0")
+        drift = updater.check_dependency_consistency(fake)
+        names = sorted(n for n, _w, _g in drift)
+        check("能识别「主包新、子依赖旧」的半升级",
+              names == ["@deepseek-ai/a", "@deepseek-ai/c"], str(names))
+        check("范围型依赖不误报", "@deepseek-ai/b" not in names)
+
+
+    print(LINE)
     if failures:
         print("失败项：", "、".join(failures))
         return 1

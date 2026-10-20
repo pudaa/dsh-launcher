@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import ssl
 import urllib.error
 import urllib.request
@@ -272,14 +273,53 @@ def _npm_prefix_args(install: contract.DshInstall) -> list[str]:
     return [] if same else ["--prefix", install.prefix]
 
 
+def uninstall_version(install: contract.DshInstall, on_line=None,
+                      timeout: float = 300):
+    """卸载全局 DSH。返回 (是否成功, 输出文本)。
+
+    为什么更新前要先卸（2026-10-20 定）
+    ----------------------------------
+    `npm install -g <pkg>@<ver>` 并不保证把**子依赖**一起升上去。本机实测过
+    一次典型事故：`dsh` 已经是 0.2.1-rc.2，而 `dsh-client-*` 等一批精确依赖
+    仍停在 0.1.5-rc.2 —— npm 认为它们"已经在了"，于是跳过。后果是旧前端去
+    请求新服务端已移除的端点，控制台一堆 404，而版本号看起来完全正常。
+
+    先卸再装能把这个状态清掉：卸载会连带移除不再被引用的依赖，
+    重装时 npm 必须按新版清单重新解析整棵树。
+    """
+    if not install.npm_cli:
+        return False, "未找到 npm 入口，无法卸载。"
+    args = [install.node, install.npm_cli, "uninstall", "-g", PKG_NAME,
+            "--no-fund", "--no-audit"]
+    args += _npm_prefix_args(install)
+    if on_line:
+        on_line("$ npm uninstall -g %s" % PKG_NAME)
+    rc, out, err = contract.run_capture(args, timeout=timeout)
+    text = ((out or "") + (err or "")).strip()
+    if on_line and text:
+        for line in text.splitlines()[-8:]:
+            on_line(line)
+    return rc == 0, text
+
+
 def install_version(install: contract.DshInstall, version: str,
-                    on_line=None, timeout: float = 600):
+                    on_line=None, timeout: float = 600, fresh: bool = True):
     """通过 npm 安装指定版本。返回 (是否成功, 输出文本)。
 
     调用方必须先把服务停掉——Windows 上 node_modules 可能被占用。
+
+    `fresh=True`（默认）先卸载旧版本再装。卸载失败**不算致命**：可能本来
+    就没装（首次安装），此时直接装即可。
     """
     if not install.npm_cli:
         return False, "未找到 npm 入口，无法执行更新。请确认 node/npm 安装完整。"
+
+    if fresh:
+        if on_line:
+            on_line("先卸载旧版本，避免子依赖被 npm 跳过…")
+        uninstall_version(install, on_line=on_line)
+        # 卸载后 npm 的 prefix 可能仍需重新确认，但 args 是按当前 install 算的，
+        # 首次安装时也照样成立。
 
     args = [install.node, install.npm_cli, "install", "-g", f"{PKG_NAME}@{version}",
             "--no-fund", "--no-audit", "--loglevel=http"]
@@ -295,6 +335,72 @@ def install_version(install: contract.DshInstall, version: str,
     return rc == 0, text
 
 
+# ---------------------------------------------------------------- 半升级检查
+
+def _installed_version(prefix: str, name: str) -> str:
+    """某个依赖实际装在哪、什么版本。两处都查：全局顶层与 dsh 自己的 node_modules。"""
+    bases = (prefix,
+             os.path.join(prefix, "node_modules", *PKG_NAME.split("/")))
+    for base in bases:
+        p = os.path.join(base, "node_modules", *name.split("/"), "package.json")
+        try:
+            with open(p, encoding="utf-8") as f:
+                return str(json.load(f).get("version") or "")
+        except (OSError, ValueError):
+            continue
+    return ""
+
+
+def check_dependency_consistency(install: contract.DshInstall) -> list[tuple[str, str, str]]:
+    """检查 DSH 的**精确版本**依赖是否都装成了同一个版本。
+
+    返回 `[(包名, 期望, 实际)]`，空列表表示一致。实际版本缺失时记为"缺失"。
+
+    为什么只比精确版本
+    ------------------
+    `~4.0.5` 这类范围本来就允许浮动，拿字面量去比会全是误报。
+    而 `0.2.1-rc.2` 这种精确值一旦对不上，就是真正的半升级——
+    2026-10-20 实测到的正是这一类：主包升了，`dsh-client-*` 全留在旧版，
+    表现为前端请求 404、账号信息读不出来，光看版本号看不出来。
+    """
+    pkg = os.path.join(install.prefix, "node_modules", *PKG_NAME.split("/"))
+    try:
+        with open(os.path.join(pkg, "package.json"), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    drift: list[tuple[str, str, str]] = []
+    for name, spec in (data.get("dependencies") or {}).items():
+        want = str(spec).strip()
+        if not want or want[0] not in "0123456789":
+            continue
+        got = _installed_version(install.prefix, name)
+        if got != want:
+            drift.append((name, want, got or "缺失"))
+    return drift
+
+
+def remove_drifted(install: contract.DshInstall, drift, on_line=None) -> list[str]:
+    """删掉版本不一致的依赖目录，让下一次安装重新拉。
+
+    只删**全局顶层**那一份，且只删 drift 点名的包——它们都是 DSH 自己的
+    精确依赖，删掉后由紧接着的 npm install 补回来，不会波及其它全局包。
+    """
+    emit = on_line or (lambda s: None)
+    removed: list[str] = []
+    for name, _want, _got in drift:
+        p = os.path.join(install.prefix, "node_modules", *name.split("/"))
+        if not os.path.isdir(p):
+            continue
+        try:
+            shutil.rmtree(p)
+            removed.append(p)
+            emit("已清理旧版本依赖：%s" % name)
+        except OSError as e:
+            emit("清理失败：%s（%s）" % (name, e))
+    return removed
+
+
 def verify(install: contract.DshInstall, expected: str) -> tuple[bool, str]:
     """安装后复验：重新定位并读取版本，确认真的换过去了。"""
     try:
@@ -306,12 +412,42 @@ def verify(install: contract.DshInstall, expected: str) -> tuple[bool, str]:
     return True, fresh.version
 
 
+def _resolve_or(install: contract.DshInstall) -> contract.DshInstall:
+    """重新定位一次安装（卸载/重装之后 prefix 可能变）。取不到就用传入的。"""
+    try:
+        return contract.resolve_install(force=True)
+    except contract.DshError:
+        return install
+
+
+def _install_drift(install: contract.DshInstall) -> list[tuple[str, str, str]]:
+    return check_dependency_consistency(_resolve_or(install))
+
+
+def reinstall(install: contract.DshInstall, stop_service, start_service,
+              on_line=None):
+    """按**当前版本**重装一遍，用于修复半升级或损坏的安装。
+
+    流程与 `update_to` 完全一致（含"先卸再装"和子依赖一致性校验），
+    区别只在目标版本取自当前安装。所以它既能修"更新到一半"的状态，
+    也能修手动改坏的状态——不需要用户自己去命令行敲 npm。
+    """
+    return update_to(install, install.version, stop_service, start_service,
+                     on_line=on_line, fresh=True)
+
+
 def update_to(current_install: contract.DshInstall, version: str,
-              stop_service, start_service, on_line=None):
+              stop_service, start_service, on_line=None, fresh: bool = True):
     """完整更新事务。
 
-    停服 → 记录用户数据指纹 → npm 安装 → 校验 → 比对指纹 → 重启。
-    任何一步失败自动把版本装回去。
+    停服 → 记录用户数据指纹 → npm 安装 → 版本校验 → **子依赖一致性校验**
+    → 比对指纹 → 重启。任何一步失败自动把版本装回去。
+
+    `fresh=True`（默认）会先卸载旧版本。这不是为了"装干净"的洁癖：
+    2026-10-20 实测发现 `npm install -g` 可能只升主包、把精确版本的子依赖
+    留在旧版，界面表现为控制台一堆 404，而版本号看起来完全正常。
+    卸载 + 重装是唯一能不依赖 npm 内部策略就把它清掉的做法；
+    后面那条一致性校验是第二道闸，两者都不通过就明确报出来。
 
     关于"会不会丢聊天记录"
     ----------------------
@@ -348,7 +484,7 @@ def update_to(current_install: contract.DshInstall, version: str,
     emit("更新前用户数据：%s" % before.describe())
 
     emit("执行官方 npm 安装…")
-    ok, text = install_version(current_install, version, on_line=emit)
+    ok, text = install_version(current_install, version, on_line=emit, fresh=fresh)
     if not ok:
         emit("安装失败，回滚到 %s" % original)
         install_version(current_install, original, on_line=emit)
@@ -367,6 +503,36 @@ def update_to(current_install: contract.DshInstall, version: str,
         except contract.DshError:
             pass
         check_data(before)
+        start_service()
+        return False, detail
+
+    # --- 子依赖一致性：npm 可能只升主包，把精确版本的依赖留在旧版 ---
+    # 这是 2026-10-20 那次"控制台一堆 404、版本号却正常"事故的兜底。
+    drift = _install_drift(current_install)
+    if drift:
+        emit("发现 %d 个子依赖没跟上主包：" % len(drift))
+        for name, want, got in drift[:8]:
+            emit("  · %s：期望 %s，实际 %s" % (name, want, got))
+        if len(drift) > 8:
+            emit("  · …另有 %d 个" % (len(drift) - 8))
+        emit("清理这些旧版本后重装…")
+        target = _resolve_or(current_install)
+        remove_drifted(target, drift, on_line=emit)
+        ok2, text2 = install_version(target, version, on_line=emit, fresh=False)
+        if not ok2:
+            emit("清理后重装失败：\n" + text2[-600:])
+        drift = _install_drift(target)
+
+    if drift:
+        detail = (
+            "安装完成，但仍有 %d 个子依赖是旧版本（例如 %s 期望 %s、实际 %s）。\n\n"
+            "这种状态下界面会出现接口 404、账号信息读不出来等问题，"
+            "但版本号看起来是正常的。\n"
+            "请稍后再试一次，或在「本机部署」页点「重新安装 DSH」。"
+            % (len(drift), drift[0][0], drift[0][1], drift[0][2]))
+        emit(detail)
+        check_data(before)
+        config.set(previous_version=original, last_good_version=detail)
         start_service()
         return False, detail
 
