@@ -2560,7 +2560,7 @@ class MainWindow(QMainWindow):
         except Exception as e:                                 # noqa: BLE001
             host_log("内存采样失败：%s: %s" % (type(e).__name__, e))
             return
-        page = self.page
+        page = getattr(self, "page", None)   # __init__ 里到 _ensure_webview 之前还没有它
         if page is None:
             self._write_mem(snap, "")
             return
