@@ -28,7 +28,7 @@ import json
 import os
 import shutil
 
-from . import config, contract
+from . import config, contract, storage
 
 # winget 里 Node.js 的官方标识（已实测：OpenJS.NodeJS.LTS → 24.19.0）
 NODE_WINGET_ID = "OpenJS.NodeJS.LTS"
@@ -195,7 +195,7 @@ def private_ready() -> bool:
     return bool(private_version()) and os.path.isfile(private_bin())
 
 
-def import_private(install, on_line=None) -> tuple[bool, str]:
+def import_private(install, on_line=None, on_progress=None) -> tuple[bool, str]:
     """把系统里那份 DSH 复制成私有副本，**不重新下载**。
 
     为什么要有这条路：用户机器上已经装好 DSH 了，让他为了"隔离"再等十几分钟
@@ -204,6 +204,9 @@ def import_private(install, on_line=None) -> tuple[bool, str]:
 
     复制完只校验"能不能读出版本号"，不做运行验证——那是切换后
     `resolve_install` 的事，它失败会明确报出来。
+
+    2026-10-21：复制改走 `storage.copy_tree`（逐文件进度），并且整个函数
+    由界面的后台线程调用——原来的 `copytree` 在 GUI 线程里会冻结几十秒。
     """
     emit = on_line or (lambda s: None)
     if install is None:
@@ -215,13 +218,12 @@ def import_private(install, on_line=None) -> tuple[bool, str]:
     if not os.path.isdir(src):
         return False, "在 %s 下没找到 DSH 的程序文件。" % install.prefix
 
-    files = sum(len(f) for _r, _d, f in os.walk(src))
-    emit("把现有安装复制到数据目录（%d 个文件）…" % files)
+    emit("把现有安装复制到数据目录…")
     try:
         if os.path.isdir(dst):
-            shutil.rmtree(dst)
-        shutil.copytree(src, dst)
-    except OSError as e:
+            storage.remove_tree(dst, on_progress=on_progress)
+        storage.copy_tree(src, dst, on_progress=on_progress)
+    except (OSError, storage.StorageError) as e:
         return False, ("复制失败：%s\n\n可以改用「安装到数据目录」，"
                        "它会重新下载一份（更慢，但不受源目录状态影响）。" % e)
 

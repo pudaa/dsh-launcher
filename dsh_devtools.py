@@ -50,12 +50,23 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup,
                                QWidget)
 
 import dsh_console
-from dsh_host import config
+from dsh_host import config, procmem
 from dsh_host.version import HOST_VERSION
 from dsh_panel import FONT, palette
 
 MAX_CONSOLE = 2000
 MAX_NET = 2000
+
+#: 心跳看门狗的探测间隔（毫秒）。只在主窗口可见时发送。
+WATCHDOG_INTERVAL_MS = 15000
+#: 连续几次"DOM 为空"才判定白屏（3 × 15s ≈ 45 s，吸收首屏渲染的短暂空窗）。
+WATCHDOG_BLANK_STRIKES = 3
+#: 一次心跳允许的最长往返（毫秒）。渲染进程只是忙时会慢，给足宽限。
+RENDER_BUSY_MS = 25000
+#: 120 秒内最多自动恢复几次（渲染进程退出 / 白屏 / 无响应共用这个计数）。
+RELOAD_BURST = 3
+#: 探测白屏用的 JS：返回 body 的子元素数。空页面 = 0，渲染进程死了不回调。
+WATCHDOG_JS = "document.body ? document.body.childElementCount : -1"
 
 #: 可以安全交给系统处理的非 http 协议。`javascript:` / `data:` / `blob:`
 #: 必须留在内核里，否则页面里的按钮会直接失效。
@@ -299,7 +310,8 @@ class ShellPage(QWebEnginePage):
     """
 
     def __init__(self, profile, parent, base_url=None, recorder=None,
-                 open_external=None, view=None, capture_console: bool = False):
+                 open_external=None, view=None, capture_console: bool = False,
+                 notify=None):
         super().__init__(profile, parent)
         self._base_url = base_url or (lambda: "")
         self.recorder = recorder or Recorder()
@@ -307,6 +319,9 @@ class ShellPage(QWebEnginePage):
         #: 每次 console 消息都会回调进 Python，虽然便宜，但不是零成本。
         self.capture_console = bool(capture_console)
         self._open_external = open_external
+        #: 页面监护（白屏/崩溃）给用户的一句话通知（托盘气泡之类）。
+        #: 缺省不通知，只写日志——自测里就是这个形态。
+        self._notify_cb = notify
         #: Qt6 的 QWebEnginePage **不再有 `view()`**（那是 Qt5 的 API），
         #: 所以视图引用必须由调用方显式传进来。
         self._view = view if view is not None else (
@@ -318,6 +333,177 @@ class ShellPage(QWebEnginePage):
         # 但别的调用方可能用；实测默认返回 False、开启后能真正写进系统剪贴板。
         self.settings().setAttribute(
             QWebEngineSettings.WebAttribute.JavascriptCanAccessClipboard, True)
+
+        # ---- 页面存活监护（2026-10-21 用户报"长任务后页面变空白"）----
+        # 见 _on_render_terminated / _watchdog_tick 的说明：渲染进程被杀后
+        # QtWebEngine 不会自己恢复（浏览器里那种"崩溃了"页面这里就是一片空白），
+        # 主窗口之前也没有任何监听——于是一旦发生就永久空白，只能手动刷新。
+        self._loaded_ok = False
+        self._reload_requests: deque = deque()      # 近期恢复请求时间戳（防循环）
+        self._hb_pending_since: float | None = None  # 心跳在途（None=空闲）
+        self._hb_blank = 0                          # 连续"DOM 为空"的次数
+        self.loadFinished.connect(self._on_load_ok)
+        self.renderProcessTerminated.connect(self._on_render_terminated)
+        # 心跳看门狗只挂在**主页面**上（popup 页 view=None，不值得也没有视图可判）
+        if self._view is not None:
+            self._watchdog = QTimer(self)
+            self._watchdog.setInterval(WATCHDOG_INTERVAL_MS)
+            self._watchdog.timeout.connect(self._watchdog_tick)
+            self._watchdog.start()
+        else:
+            self._watchdog = None
+
+    # ---- 页面存活监护 ----
+
+    def _shell_log(self, msg: str) -> None:
+        """写桌面壳日志。dsh_gui_qt 不能反向 import（会成环），所以就地写。"""
+        try:
+            with open(config.host_log(), "a", encoding="utf-8") as f:
+                f.write("%s  %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+        except OSError:
+            pass
+
+    def _notify(self, msg: str) -> None:
+        if self._notify_cb is not None:
+            try:
+                self._notify_cb(msg)
+            except Exception:                                  # noqa: BLE001
+                pass
+
+    def _on_load_ok(self, ok: bool) -> None:
+        try:
+            self._loaded_ok = bool(ok)
+        except RuntimeError:
+            return
+        self._hb_pending_since = None
+        self._hb_blank = 0
+
+    def _may_recover(self, why: str) -> bool:
+        """统一的恢复闸门：120 秒内最多 RELOAD_BURST 次，防"恢复→崩→恢复"循环。"""
+        now = time.monotonic()
+        while self._reload_requests and now - self._reload_requests[0] > 120:
+            self._reload_requests.popleft()
+        if len(self._reload_requests) >= RELOAD_BURST:
+            self._shell_log("页面监护：%s，但近期恢复次数过多，停止自动恢复" % why)
+            return False
+        self._reload_requests.append(now)
+        return True
+
+    def _on_render_terminated(self, status, code) -> None:
+        """渲染进程退出：先记证据，再尝试自动恢复。
+
+        status/code 必须落日志——这是区分"崩溃(=代码缺陷)"与"被杀(=内存不足)"
+        的唯一线索，缺了它下次还得靠猜。
+        """
+        name = getattr(status, "name", str(status))
+        try:
+            url = self.url().toString()
+        except RuntimeError:
+            url = ""
+        # 崩溃当下的内存快照是"是被杀(OOM)还是自己崩"的唯一现场证据：
+        # 渲染进程已经退出时拿不到它自己的数，但同一棵树里的其它进程还在。
+        try:
+            mem = procmem.summary_line()
+        except Exception:                                      # noqa: BLE001
+            mem = ""
+        self._shell_log("渲染进程退出：status=%s code=%s url=%s%s"
+                        % (name, code, url, (" ｜ " + mem) if mem else ""))
+        if not self._loaded_ok:
+            return          # 还没成功加载过：那是启动流程的事，这里不抢
+        if not self._may_recover("渲染进程退出"):
+            self._notify("渲染进程反复退出，已停止自动恢复。请手动刷新（F5）"
+                         "或重启应用；持续出现说明内存不足。")
+            return
+        # 留 500 ms 让 Qt 完成渲染进程的清理，再原地重载（保留当前路由与令牌）
+        QTimer.singleShot(500, self._recover_page)
+
+    def _watchdog_tick(self) -> None:
+        """心跳看门狗：活着但空白 / 彻底无响应，都自动重载。
+
+        为什么必须有它：用户报的问题是"长任务跑着跑着页面变空白"，而空白有两种
+        形态——渲染进程被杀（renderProcessTerminated 能接到）和**进程还活着、
+        页面却是空的**（前端把根节点卸载了 / 渲染进程主循环卡死，Qt 什么信号都
+        不发）。后者只能主动探。
+
+        成本：每 WATCHDOG_INTERVAL_MS 一次 JS 往返，只在窗口可见时发，
+        空闲时是一次空转的查表。误判靠"连续 N 次"吸收：长任务期间渲染进程
+        只是忙，JS 往返会慢但不会连续 3 轮（≈45 秒）都慢。
+        """
+        now = time.monotonic()
+        if self._hb_pending_since is not None:
+            # 上一次心跳还没回来：给 RENDER_BUSY_MS 宽限，超时按"无响应"处理
+            if now - self._hb_pending_since > RENDER_BUSY_MS:
+                self._hb_pending_since = None
+                self._hb_strike("JS 无响应")
+            return
+        if not self._loaded_ok:
+            return
+        view = self._view
+        try:
+            if view is None or not view.isVisible() or view.isMinimized():
+                return          # 隐藏/最小化时 Chromium 会节流，探测会误判
+        except RuntimeError:
+            return
+        self._hb_pending_since = now
+        try:
+            self.runJavaScript(WATCHDOG_JS, self._hb_done)
+        except RuntimeError:
+            self._hb_pending_since = None
+
+    def _recover_page(self, force_base: bool = False) -> None:
+        """恢复页面：优先 `reload()`，必要时回到带令牌的入口地址。
+
+        为什么不能无脑 `reload()`（2026-10-20 那次事故的教训）：如果页面已经
+        跑偏成 `about:blank`（登录流程里 `window.open` 的产物），reload 只会把
+        空白页再载一遍——用户看到的就是"刷新了还是白的"。
+
+        所以这里检查当前的 scheme：只有 http/https 才 reload，否则退回
+        `base_url`（= 主窗口手里那个带 token 的地址）。
+        """
+        if not force_base:
+            try:
+                u = self.url()
+                if u.isValid() and u.scheme() in ("http", "https"):
+                    self.reload()
+                    return
+            except RuntimeError:
+                pass          # 页对象正在销毁
+        base = ""
+        try:
+            base = self._base()
+        except Exception:                                      # noqa: BLE001
+            base = ""
+        if base:
+            self.setUrl(QUrl(base))
+        else:
+            try:
+                self.reload()
+            except RuntimeError:
+                pass
+
+    def _hb_done(self, value) -> None:
+        self._hb_pending_since = None
+        try:
+            n = int(value)          # JS 里取的是 document.body 的子元素数
+        except (TypeError, ValueError):
+            n = -1                  # null / 异常 → 当作异常状态，计入连续计数
+        if n > 0:
+            self._hb_blank = 0      # 页面有内容：一切正常
+            return
+        self._hb_blank += 1
+        self._shell_log("页面监护：DOM 为空（连续 %d 次）" % self._hb_blank)
+        if self._hb_blank >= WATCHDOG_BLANK_STRIKES:
+            self._hb_blank = 0
+            if self._may_recover("页面空白"):
+                self._notify("页面变为空白，已自动重新加载。")
+                # DOM 都空了，当前地址常常已经不可信 → 直接回入口地址
+                self._recover_page(force_base=True)
+
+    def _hb_strike(self, why: str) -> None:
+        self._shell_log("页面监护：%s，准备自动重载" % why)
+        if self._may_recover(why):
+            self._notify("页面无响应，已自动重新加载。")
+            self._recover_page(force_base=True)
 
     # ---- 导航策略 ----
 
@@ -440,7 +626,8 @@ class ShellPage(QWebEnginePage):
         page = ShellPage(self.profile(), self, base_url=self._base,
                          recorder=self.recorder,
                          open_external=self._open_external,
-                         view=None, capture_console=self.capture_console)
+                         view=None, capture_console=self.capture_console,
+                         notify=self._notify_cb)
         page._is_popup = True
         return page
 
@@ -1820,5 +2007,52 @@ def selftest_checks() -> list:
     check("_on_new_window 不调用 accept/reject",
           "reject" not in touched and "accept" not in touched,
           "、".join(sorted(map(str, touched & {"reject", "accept"}))))
+
+    # --- 2026-10-21「长任务后页面变空白」的页面监护 ---
+    # 阈值与限流是这段逻辑仅有的可错点：太灵敏会在渲染进程忙时误重载
+    # （打断用户正在跑的对话），太迟钝等于没有。
+    class _WatchdogStub:
+        def __init__(self):
+            self._reload_requests = deque()
+            self._hb_blank = 0
+            self._loaded_ok = True
+            self.recoveries = 0
+            self.logs = []
+
+        def _may_recover(self, why):
+            return ShellPage._may_recover(self, why)
+
+        def _shell_log(self, msg):
+            self.logs.append(msg)
+
+        def _notify(self, msg):
+            pass
+
+        def _recover_page(self, force_base=False):
+            self.recoveries += 1
+
+    wd = _WatchdogStub()
+    ShellPage._hb_done(wd, 0)
+    ShellPage._hb_done(wd, 0)
+    early = wd.recoveries
+    ShellPage._hb_done(wd, 0)
+    one = wd.recoveries
+    ShellPage._hb_done(wd, 9)          # 页面有内容 → 计数归零
+    reset = wd._hb_blank == 0
+    for _ in range(3):                 # 再连续 3 次空 → 第 2 次恢复
+        ShellPage._hb_done(wd, 0)
+    two = wd.recoveries
+    for _ in range(3):                 # 第 3 次
+        ShellPage._hb_done(wd, 0)
+    three = wd.recoveries
+    for _ in range(9):                 # 继续崩：120s 内已到 3 次，此后必须停手
+        ShellPage._hb_done(wd, 0)
+    check("白屏要连续 3 次才判（两次空不动）", early == 0, str(early))
+    check("第三次连续为空触发恢复", one == 1, str(one))
+    check("页面正常后计数归零", reset)
+    check("120 秒内最多恢复 3 次",
+          two == 2 and three == 3 and wd.recoveries == 3,
+          "%d / %d / %d" % (two, three, wd.recoveries))
+    check("超出上限时写清原因", any("次数过多" in m for m in wd.logs))
 
     return failures

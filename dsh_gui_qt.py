@@ -74,7 +74,7 @@ import dsh_console
 import dsh_devtools
 import dsh_panel
 import dsh_theme
-from dsh_host import (config, contract, dwm, provision, selfupdate,
+from dsh_host import (config, contract, dwm, procmem, provision, selfupdate,
                       storage, updater)
 from dsh_host.contract import DshError, ServiceHandle
 from dsh_host.version import HOST_VERSION
@@ -1196,6 +1196,198 @@ class ServiceSwapWorker(QThread):
             self.done.emit(False, "%s: %s" % (type(e).__name__, e), None)
 
 
+class DataTaskWorker(QThread):
+    """数据目录的重活：迁移 / 清缓存 / 清空 / 复制私有安装。
+
+    为什么要单独一个线程（2026-10-21，老大第二次提"同类卡顿"）
+    ----------------------------------------------------------
+    `copytree` / `rmtree` 在 727 MB、6.6 万个文件上是十几秒到几十秒的纯 IO。
+    以前它们直接跑在 GUI 线程里：窗口不重绘、Windows 还会盖一层"未响应"白纱，
+    用户以为程序死了——而它只是在数盘。
+
+    这里只做 IO，**不碰任何 QWidget**：所有界面更新都靠信号回到主线程
+    （Qt 的 AutoConnection 会自动排队）。
+
+    `done(ok, detail, payload)`：payload 是 dict，避免为了四种任务各定一套签名。
+    """
+
+    line = Signal(str)                   # 一行进展文案
+    progress = Signal(int, int, str)     # (已完成, 总数, 当前文件名)；总数=0 → 不确定
+    done = Signal(bool, str, object)
+
+    def __init__(self, task: str, parent=None, **kw):
+        super().__init__(parent)
+        self.task = task
+        self.kw = kw
+
+    def _prog(self, done, total, name: str = ""):
+        self.progress.emit(int(done), int(total), str(name or ""))
+
+    def run(self):
+        try:
+            if self.task == "migrate":
+                old = self.kw["old"]
+                new_root = storage.migrate(self.kw["target"],
+                                           on_line=self.line.emit,
+                                           on_progress=self._prog)
+                # 删旧目录同样是几十秒的活，一并留在这个线程里——否则"迁移完了
+                # 但窗口又卡住十秒"，用户会以为迁移失败。
+                self.line.emit("清理旧目录（%s）…" % old)
+                cleaned = storage.remove_old(old, on_progress=self._prog)
+                if not cleaned:
+                    self.line.emit("旧目录没能删干净，可手动清理：%s" % old)
+                self.done.emit(True, new_root, {"root": new_root,
+                                                "cleaned": cleaned})
+            elif self.task == "clear_cache":
+                n, b = storage.clear_cache(on_progress=self._prog,
+                                           on_line=self.line.emit)
+                self.done.emit(True, "", {"files": n, "bytes": b})
+            elif self.task == "clear_all":
+                n, b = storage.clear_all(on_progress=self._prog)
+                self.done.emit(True, "", {"files": n, "bytes": b})
+            elif self.task == "private":
+                ok, detail = provision.import_private(
+                    self.kw["install"], on_line=self.line.emit,
+                    on_progress=self._prog)
+                self.done.emit(bool(ok), detail,
+                               {"version": detail if ok else "",
+                                "error": "" if ok else detail})
+            else:
+                self.done.emit(False, "未知的数据任务：%s" % self.task,
+                               {"error": "未知的数据任务"})
+        except storage.StorageError as e:
+            self.done.emit(False, str(e), {"error": str(e)})
+        except Exception as e:                                 # noqa: BLE001
+            msg = "%s: %s" % (type(e).__name__, e)
+            self.done.emit(False, msg, {"error": msg})
+
+
+class DataTaskDialog(QDialog):
+    """带进度条的数据操作窗口（迁移 / 清理 / 私有副本）。
+
+    为什么不复用 ReinstallDialog：那个窗口的文案全是"重装 DSH"，进度反馈靠
+    一行行日志。这里用户要判断的是"还要等多久"，所以必须有**真实进度条**，
+    外加一行正在处理的文件（让人觉得它真的在动，而不是在假转圈）。
+
+    运行期间不允许关窗：复制到一半被关掉会留下"半个新目录"，那是最难收拾的状态。
+    """
+
+    def __init__(self, parent, title: str, headline: str, hint: str,
+                 worker: DataTaskWorker):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(560)
+        self.resize(580, 340)
+        self._worker = worker
+        self.result_payload = None
+        self.ok = False
+        #: 进展文案先攒着，任务结束后再落 host.log。
+        #: 为什么不能边跑边写（2026-10-21 冒烟测试发现）：`host_log()` 写在
+        #: `data_root()/logs/host.log` —— 而"清缓存"正要把 logs 目录删掉。
+        #: 一边删目录、一边往里面 open(..., "a") 写新文件，Windows 上会撞
+        #: "文件被占用"，删不干净；迁移数据目录时路径还会中途换成新根，
+        #: 那几行日志会直接落空。攒到收尾一次性写，两个问题一起没有。
+        self._pending_log: list[str] = []
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(12)
+
+        head = QLabel(headline)
+        head.setObjectName("dlgBody")
+        head.setWordWrap(True)
+        lay.addWidget(head)
+
+        tip = QLabel(hint)
+        tip.setObjectName("dlgHint")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 0)          # 数文件之前是不确定进度
+        self.bar.setTextVisible(True)
+        self.bar.setFormat("正在统计文件数…")
+        lay.addWidget(self.bar)
+
+        self.now = QLabel("")
+        self.now.setObjectName("dlgHint")
+        self.now.setWordWrap(False)
+        lay.addWidget(self.now)
+
+        self.log = dsh_theme.NotesView()
+        lay.addWidget(self.log, 1)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        self.close_btn = QPushButton("请稍候…")
+        self.close_btn.setEnabled(False)
+        self.close_btn.clicked.connect(self.accept)
+        row.addWidget(self.close_btn)
+        lay.addLayout(row)
+
+        dsh_theme.style_dialog(self)
+
+        worker.line.connect(self._on_line)
+        worker.progress.connect(self._on_progress)
+        worker.done.connect(self._on_done)
+        worker.finished.connect(self._on_thread_finished)
+
+    # ---- 信号 ----
+
+    def _on_line(self, msg: str) -> None:
+        self.log.append_line(msg)
+        self._pending_log.append(msg)
+
+    def _flush_log(self) -> None:
+        """收尾时把攒下的进展一次性写进 host.log。"""
+        for msg in self._pending_log:
+            host_log(msg)
+        self._pending_log.clear()
+
+    def _on_progress(self, done: int, total: int, name: str = "") -> None:
+        if name:
+            # 只保留文件名本身：全路径太长会把窗口撑宽
+            self.now.setText(name if len(name) <= 60 else "…" + name[-57:])
+        if total <= 0:
+            self.bar.setRange(0, 0)
+            self.bar.setFormat("%d 个文件…" % done)
+            return
+        self.bar.setRange(0, total)
+        self.bar.setValue(min(done, total))
+        self.bar.setFormat("%v / %m 个文件（%p%%）")
+
+    def _on_done(self, ok: bool, detail: str, payload) -> None:
+        self.ok = bool(ok)
+        self.result_payload = payload
+        self._flush_log()
+        if ok:
+            self.bar.setRange(0, 1)
+            self.bar.setValue(1)
+            self.bar.setFormat("完成")
+            self.close_btn.setText("关闭")
+            self.log.append_line("完成。")
+        else:
+            self.bar.setRange(0, 1)
+            self.bar.setValue(0)
+            self.bar.setFormat("未完成")
+            self.close_btn.setText("关闭")
+            self.log.append_line("未完成：\n" + detail)
+            host_log("数据任务失败：%s" % detail.replace("\n", " | ")[:400])
+        self.close_btn.setEnabled(True)
+
+    def _on_thread_finished(self) -> None:
+        # QThread 结束后必须有一个明确的收尾点（见记忆里的 Qt 陷阱：
+        # 线程活着退出解释器会让 Qt abort）。等它自己结束再放行。
+        self._worker.wait(2000)
+
+    def closeEvent(self, event):                                  # noqa: N802
+        if self._worker.isRunning():
+            event.ignore()               # 复制中途关窗会留下半个目录
+            return
+        self._worker.wait(2000)
+        super().closeEvent(event)
+
+
 # ------------------------------------------------------------------ 主窗口
 
 LOADING_HTML = """
@@ -1214,6 +1406,17 @@ LOADING_HTML = """
   <h2>正在启动 DSH</h2><p>DeepSeek Harness · 首次启动需要 10-30 秒</p></div>
 </body></html>
 """
+
+
+#: 内存采样间隔（毫秒）。60 秒一次够画出"一天里怎么涨"的曲线，
+#: 而写入量只有 1440 行/天。
+MEM_SAMPLE_MS = 60_000
+#: mem.log 的单文件上限；超了就只保留最后一段重写（不滚动归档，
+#: 因为这份日志的价值全在"最近几小时"）。
+MEM_LOG_MAX_BYTES = 2 * 1024 * 1024
+#: 网页进程 PrivateBytes 超过它就在日志里写一条"可以重新加载页面"的提示。
+#: **只提示，不自动重载**——自动重载会打断正在跑的对话，代价比省内存大。
+MEM_WEB_WARN_MB = 1200
 
 
 class MainWindow(QMainWindow):
@@ -1243,6 +1446,8 @@ class MainWindow(QMainWindow):
         self._inspector = None            # Chromium DevTools 窗口（关闭即销毁）
         self._theme_timer = None          # 主题跟踪定时器（低频）
         self._last_titlebar_rgb = None    # 上次上色用的界面色，用于变更比对
+        self._mem_timer = None            # 内存采样定时器（每分钟一行日志）
+        self._data_worker = None          # 数据目录重活的当前 worker
 
         self.stack = QStackedWidget()
         # 关键：**StackAll** —— 所有页都参与排版、且都保持 show 状态，
@@ -1280,6 +1485,9 @@ class MainWindow(QMainWindow):
 
         self.starter = None
         self._launch_startup()
+        # 内存采样（2026-10-21）：先启动、后采样——它只是在旁边记数字，
+        # 不参与任何启动决策，绝不能拖慢首屏。
+        self._start_mem_watch()
 
     def _launch_startup(self):
         # 重入守卫：切换来源、面板「自动准备运行环境」都会走到这里。没有守卫时
@@ -1355,6 +1563,7 @@ class MainWindow(QMainWindow):
             open_external=self._open_external_url,
             view=self.view,
             capture_console=dev_on,
+            notify=self._page_notify,
         )
         self.view.setPage(self.page)
         # 右键交还给网页自己处理。
@@ -2302,6 +2511,100 @@ class MainWindow(QMainWindow):
         else:
             self._info("服务还没就绪，暂时没有可打开的地址。")
 
+    def _page_notify(self, msg: str) -> None:
+        """页面监护（渲染进程退出/白屏自动恢复）给用户的一句话。
+
+        托盘气泡是这里唯一不打断操作的形式——自动恢复本身已经做了恢复，
+        通知只是解释"刚才闪了一下/刷新了一下"是什么原因。
+        """
+        host_log("页面监护：%s" % msg)
+        tray = getattr(self, "tray", None)
+        if tray is not None and tray.isVisible():
+            try:
+                tray.showMessage("DSH 页面", msg)
+            except Exception:                                   # noqa: BLE001
+                pass
+
+    # ------------------------------------------------------------- 内存采样
+    #
+    # 老大问的是"WebEngine 占了 1.7 GB，是不是泄露"。这个问题没法靠看任务
+    # 管理器回答：那一个数字里混着三块内存，而且 Windows 会随时裁剪
+    # WorkingSet（窗口最小化时 1.2 GB 能缩到 16 MB，看着像"释放了"，其实
+    # PrivateBytes 一点没动）。所以先把三块分开、按时间记下来。
+    #
+    # 判读方法写在 `dsh_host/procmem.py` 的模块注释里；结论看 `logs/mem.log`。
+    # 采样本身 = 一次进程快照 + 一次 JS 往返，每分钟一次，成本可以忽略。
+
+    #: JS 侧内存探针：Chromium 的 `performance.memory` 是非标准接口，取不到就
+    #: 只报 DOM 节点数。返回值必须是字符串——PySide6 对 object 一律给空串。
+    JS_MEM_PROBE = ("(function(){try{var m=performance.memory||{};"
+                    "return JSON.stringify({h:m.usedJSHeapSize||0,"
+                    "t:m.totalJSHeapSize||0,"
+                    "n:document.getElementsByTagName('*').length});}"
+                    "catch(e){return '';}})()")
+
+    def _start_mem_watch(self) -> None:
+        if not hasattr(procmem, "snapshot"):
+            return
+        if self._mem_timer is not None:
+            return
+        t = QTimer(self)
+        t.setInterval(MEM_SAMPLE_MS)
+        t.timeout.connect(self._mem_tick)
+        t.start()
+        self._mem_timer = t
+
+    def _mem_tick(self) -> None:
+        try:
+            snap = procmem.snapshot()
+        except Exception as e:                                 # noqa: BLE001
+            host_log("内存采样失败：%s: %s" % (type(e).__name__, e))
+            return
+        page = self.page
+        if page is None:
+            self._write_mem(snap, "")
+            return
+        try:
+            page.runJavaScript(
+                self.JS_MEM_PROBE,
+                lambda v: self._write_mem(snap, v))
+        except RuntimeError:
+            # 视图正在销毁/重建（换来源、迁移数据），这一轮就只记进程数据
+            self._write_mem(snap, "")
+
+    def _write_mem(self, snap: dict, js_raw) -> None:
+        series = procmem.summary_line_from(snap) if hasattr(
+            procmem, "summary_line_from") else ""
+        parts = [series] if series else []
+        data = dsh_devtools._as_json(js_raw) if isinstance(js_raw, str) else None
+        if isinstance(data, dict):
+            h = data.get("h") or 0
+            t = data.get("t") or 0
+            n = data.get("n")
+            if h:
+                parts.append("JS 堆 %.0f/%.0f MB"
+                             % (h / 1048576.0, t / 1048576.0))
+            if isinstance(n, int) and n >= 0:
+                parts.append("DOM %d 节点" % n)
+        web = (snap.get("groups") or {}).get("webengine") or {}
+        if (web.get("private") or 0) >= MEM_WEB_WARN_MB:
+            parts.append("网页进程已超过 %d MB，可「重新加载页面」释放"
+                         % MEM_WEB_WARN_MB)
+        line = "%s  %s" % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                           " ｜ ".join(parts))
+        path = os.path.join(config.log_dir(), "mem.log")
+        try:
+            if os.path.isfile(path) and os.path.getsize(path) > MEM_LOG_MAX_BYTES:
+                # 只留最后一段：这份日志的价值在"最近几小时"
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    tail = f.read().splitlines()[-400:]
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(tail) + "\n")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+
     def _open_external_url(self, url):
         """把页面里的异源链接交给系统默认浏览器。
 
@@ -2491,6 +2794,25 @@ class MainWindow(QMainWindow):
         w.done.connect(done)
         w.start()
 
+    def _run_data_task(self, task: str, title: str, headline: str, hint: str,
+                       **kw) -> tuple[bool, object]:
+        """起一个 DataTaskWorker，用模态进度窗等它跑完。
+
+        模态是刻意的：这期间主窗口不可操作，而底下的服务/WebEngine 已经被
+        我们停掉释放了——让用户还能点点点只会得到一堆"连不上"。
+        """
+        w = DataTaskWorker(task, None, **kw)
+        dlg = DataTaskDialog(self, title, headline, hint, w)
+        self._data_worker = w          # 持有引用，别让 GC 在 run() 中途收走
+        try:
+            w.start()
+            dlg.exec()
+            w.wait(5000)               # 兜底：线程活着退出会让 Qt abort
+        finally:
+            w.deleteLater()
+            self._data_worker = None
+        return dlg.ok, dlg.result_payload
+
     def _switch_source(self, mode: str) -> None:
         """切换 DSH 来源。私有未就绪时先复制一份现有安装。"""
         if str(config.get("dsh_source") or "auto") == mode:
@@ -2507,18 +2829,22 @@ class MainWindow(QMainWindow):
                     "现在把当前安装（%s）复制过去，通常几十秒。" % inst.version,
                     "复制并启用", "取消"):
                 return
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            try:
-                ok, detail = provision.import_private(inst, on_line=host_log)
-            finally:
-                QApplication.restoreOverrideCursor()
+            ok, payload = self._run_data_task(
+                "private", "准备私有副本",
+                "正在把 %s 复制到应用的数据目录。" % inst.version,
+                "约 250 MB、上千个文件。复制在后台进行，界面不会假死；"
+                "中途请不要关闭窗口——留下半个副本比没有更难收拾。",
+                install=inst)
             if not ok:
-                self._warn("准备私有副本失败：\n\n%s" % detail)
+                self._warn("准备私有副本失败：\n\n%s"
+                           % ((payload or {}).get("error") or "详见日志"))
                 return
         config.set(dsh_source=mode)
         self._swap_service("运行方式切换为 %s" % mode)
 
     def _migrate_data(self) -> None:
+        # 这里的 breakdown() 只为了弹窗里那句"共 N 个文件"；它带 3 秒预算，
+        # 不会像复制本身那样几十秒。真正的重活全在后台线程里。
         info = storage.breakdown()
         target = QFileDialog.getExistingDirectory(
             self, "选择新的数据目录（建议空目录）", info["root"])
@@ -2535,14 +2861,18 @@ class MainWindow(QMainWindow):
         old = info["root"]
         self._stop_service()
         self._drop_webview()
-        try:
-            new_root = storage.migrate(target, on_line=host_log)
-        except storage.StorageError as e:
-            self._warn("迁移失败：\n\n%s" % e)
+        ok, payload = self._run_data_task(
+            "migrate", "迁移数据目录",
+            "正在把数据复制到\n%s" % target,
+            "复制完成后会核对文件数，再清理旧目录。整个过程在后台进行，"
+            "界面不会再出现「未响应」。",
+            target=target, old=old)
+        if not ok:
+            err = (payload or {}).get("error") or "详见日志。原目录未被改动。"
+            self._warn("迁移失败：\n\n%s" % err)
             self._swap_service()
             return
-        if not storage.remove_old(old):
-            host_log("旧数据目录未能完全删除：%s" % old)
+        new_root = (payload or {}).get("root") or target
         self._swap_service("数据目录迁移到 %s" % new_root)
         self._info("数据已搬到：\n%s\n\n旧目录里没有删干净的部分可以手动清理。"
                    % new_root)
@@ -2558,14 +2888,19 @@ class MainWindow(QMainWindow):
             return
         self._stop_service()
         self._drop_webview()
-        try:
-            n, b = storage.clear_cache()
-        except storage.StorageError as e:
-            self._warn("清理失败：\n\n%s" % e)
+        ok, payload = self._run_data_task(
+            "clear_cache", "清理缓存",
+            "正在删除浏览器缓存、日志与登录态。",
+            "删除在后台进行；完成后会自动重启服务，需要重新登录 DSH。")
+        if not ok:
+            self._warn("清理失败：\n\n%s" % ((payload or {}).get("error")
+                                            or "详见日志"))
             self._swap_service()
             return
+        p = payload or {}
         self._swap_service("已清理缓存：%d 个文件（%s）"
-                           % (n, storage.str_of_bytes(b)))
+                           % (p.get("files", 0),
+                              storage.str_of_bytes(p.get("bytes", 0))))
 
     def _clear_all(self) -> None:
         info = storage.breakdown()
@@ -2578,7 +2913,15 @@ class MainWindow(QMainWindow):
             return
         self._stop_service()
         self._drop_webview()
-        n, _b = storage.clear_all()
+        ok, payload = self._run_data_task(
+            "clear_all", "清空全部数据",
+            "正在删除桌面壳的全部数据。",
+            "删除在后台进行，完成后需要退出应用重新启动。")
+        if not ok:
+            self._warn("清空未完成：\n\n%s" % ((payload or {}).get("error")
+                                              or "详见日志"))
+            return
+        n = (payload or {}).get("files", 0)
         self._warn("已清空全部数据（%d 个文件）。\n\n"
                    "退出应用后重新启动，会回到首次运行的引导流程。" % n)
 
@@ -2694,7 +3037,8 @@ class MainWindow(QMainWindow):
         QApplication.quit()
 
     #: 退出时要等它收尾的后台任务（属性名）。面板自己的线程由 panel.shutdown() 管。
-    _WORKERS = ("starter", "_reverify", "_checker", "_host_checker", "_swap_worker")
+    _WORKERS = ("starter", "_reverify", "_checker", "_host_checker",
+                "_swap_worker", "_data_worker")
 
     def _join_workers(self, timeout_ms: int = 4000) -> list:
         """等主窗口的后台线程收尾，返回超时没等到的属性名。

@@ -74,6 +74,13 @@ jobs:
           DSH_GUI_SELFTEST_STATIC: "1"
         run: python tools/gui_selftest.py
 
+      - name: 数据目录后台任务冒烟
+        # 上面两条都是源码字符串检查，拦不住"后台任务跑起来其实是死的"。
+        # 这条真起 QThread、真删/真复制（临时目录，绝不碰用户数据根）。
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python tools/datatask_smoke.py
+
       - name: 打包
         shell: bash
         env:

@@ -1281,6 +1281,7 @@ def health_checks() -> list:
     dev = read("dsh_devtools.py")
     console = read("dsh_console.py")
     storage = read(os.path.join("dsh_host", "storage.py"))
+    procmem_src = read(os.path.join("dsh_host", "procmem.py"))
     theme = read("dsh_theme.py")
 
     # ① 关掉最后一个窗口不能退出进程（否则绕过 _quit，服务变孤儿）
@@ -1320,6 +1321,53 @@ def health_checks() -> list:
     check("提示性单发定时器绑定了控件",
           "QTimer.singleShot(1400, button" in dev
           and "QTimer.singleShot(1200, btn" in panel)
+
+    # ⑨ 页面监护（2026-10-21 用户报"长任务后页面变空白，只能手动刷新"）
+    # 渲染进程被杀后 Qt 不给任何默认恢复（就是一片空白），必须自己监听重载；
+    # 而"进程活着但页面空了"只能靠 JS 心跳主动探。两条路径缺一条，
+    # 症状就会以另一种形式复发。
+    check("渲染进程退出会被监听并自动重载",
+          "renderProcessTerminated.connect(self._on_render_terminated)" in dev
+          and "self.reload()" in dev)
+    check("自动恢复有防循环闸门（120s 内限次）",
+          "_may_recover" in dev and "RELOAD_BURST" in dev)
+    check("白屏靠 JS 心跳探测（DOM 为空计数）",
+          "WATCHDOG_JS" in dev and "childElementCount" in dev)
+    check("恢复走 _recover_page（不会把 about:blank 再 reload 一遍）",
+          "def _recover_page(" in dev
+          and 'u.scheme() in ("http", "https")' in dev
+          and "self.setUrl(QUrl(base))" in dev)
+    check("心跳在窗口不可见时暂停（Chromium 节流会误判）",
+          "view.isVisible()" in dev and "view.isMinimized()" in dev)
+
+    # ⑩ 数据目录的重活必须在后台线程（2026-10-21 补 2.3.8 的漏项）
+    # 迁移 / 清缓存 / 清空 / 复制私有安装，在 727 MB、6.6 万个文件上是
+    # 十几秒到几十秒的纯 IO。回归钉三件事：GUI 侧不再有同步 copytree/rmtree、
+    # 四个入口都走 DataTaskWorker、进度回调有节流。
+    check("数据目录重活在后台线程里跑",
+          "class DataTaskWorker(QThread)" in gui
+          and "self._run_data_task(" in gui)
+    check("四个入口都走后台任务",
+          gui.count("self._run_data_task(") >= 4)
+    check("GUI 里不再有同步 copytree/rmtree",
+          "shutil.copytree" not in gui and "shutil.rmtree" not in gui)
+    check("复制/删除都带进度回调",
+          "def copy_tree(" in storage and "def remove_tree(" in storage
+          and "on_progress" in storage)
+    check("进度回调有节流（防跨线程事件洪水）",
+          "PROGRESS_MIN_INTERVAL_S" in storage and "_reporter(" in storage)
+    check("进度窗在任务运行中不许关",
+          "if self._worker.isRunning():" in gui and "event.ignore()" in gui)
+
+    # ⑪ 内存取证（2026-10-21 用户报"WebEngine 占 1.7 GB 是不是泄露"）
+    # 没有分进程、分时间的数据只能靠猜；而且 WorkingSet 会被系统裁剪，
+    # 必须按 PrivateBytes 判读。这两条钉住"采样与判据都还在"。
+    check("内存采样覆盖壳/网页/node 三块",
+          "def snapshot(" in procmem_src and "webengine" in procmem_src)
+    check("内存按 PrivateBytes 判读而不是 WorkingSet",
+          "PagefileUsage" in procmem_src)
+    check("主窗口每分钟落一行 mem.log",
+          "MEM_SAMPLE_MS" in gui and "mem.log" in gui)
     return failures
 
 
