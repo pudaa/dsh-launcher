@@ -57,8 +57,8 @@ if _UI_LANG:
         os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
             _flags + " --lang=" + _UI_LANG).strip()
 
-from PySide6.QtCore import (QCoreApplication, QEvent, Qt, QThread, Signal,
-                            QTimer, QUrl)
+from PySide6.QtCore import (QCoreApplication, QEvent, QStandardPaths, Qt,
+                            QThread, Signal, QTimer, QUrl)
 from PySide6.QtGui import (QIcon, QAction, QDesktopServices, QImage,
                            QKeySequence, QShortcut)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
@@ -1437,6 +1437,7 @@ class MainWindow(QMainWindow):
         self.host_release = None          # 有值表示桌面壳有新版本可用
         self.view = None
         self.profile = None
+        self.downloads = None             # 下载处理器（父对象是 profile，随它回收）
         self.loading_page = None
         # 页面观测记录在窗口创建之前就存在：开发者模式可能在运行中被打开，
         # 那时要能回看"打开之前"发生的报错。
@@ -1545,6 +1546,17 @@ class MainWindow(QMainWindow):
         # 看起来像产品缺陷，其实是两个进程抢同一个缓存目录。
         self.profile.setPersistentStoragePath(
             os.environ.get("DSH_PROFILE_DIR") or config.profile_dir())
+        # 下载必须自己接（2026-10-21 老大报"点下载 session 没反应"）：
+        # QtWebEngine 对没人处理的 downloadRequested **静默取消**，而前端
+        # `a.download` 的 click 早就同步返回了 —— 不报错、不落盘、什么都不发生。
+        # 父对象给 profile：换来源/迁移数据重建 profile 时一起回收，不会残留。
+        self.downloads = dsh_devtools.DownloadManager(
+            self.profile,
+            choose_path=self._ask_download_path,
+            notify=self._download_notify,
+            log=host_log,
+            parent=self.profile,
+        )
         # 拦截器**不在关闭时挂载**：挂上之后每个请求都会回调进 Python
         # （图片、字体、轮询都算），"关闭状态只读一个布尔值"也是有成本的。
         # 关闭时干脆不挂，开关打开时再挂（见 _apply_dev_mode）。
@@ -2605,6 +2617,32 @@ class MainWindow(QMainWindow):
         except OSError:
             pass
 
+    def _ask_download_path(self, suggested: str) -> str:
+        """网页要下载文件时问一句存哪。返回空串 = 用户取消。
+
+        为什么弹框而不是直接丢进"下载"文件夹：这是用户主动点的动作，
+        官方桌面端（Electron）的默认行为也是弹保存框；而且 DSH 导出的
+        session 包可能几十 MB，事后让人去翻文件夹找它不合适。
+        """
+        start_dir = QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.DownloadLocation)
+        if not start_dir:
+            start_dir = os.path.expanduser("~")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存下载文件", os.path.join(start_dir, suggested))
+        return path or ""
+
+    def _download_notify(self, msg: str) -> None:
+        """下载的开始 / 完成 / 失败各给一句话（托盘气泡，不打断操作）。"""
+        host_log("下载：%s" % msg)
+        tray = getattr(self, "tray", None)
+        if tray is not None and tray.isVisible():
+            try:
+                tray.showMessage("DSH 下载", msg,
+                                 QSystemTrayIcon.MessageIcon.Information, 4000)
+            except Exception:                                   # noqa: BLE001
+                pass
+
     def _open_external_url(self, url):
         """把页面里的异源链接交给系统默认浏览器。
 
@@ -2760,6 +2798,8 @@ class MainWindow(QMainWindow):
                 self.view = None
                 self.page = None
             if self.profile is not None:
+                # 下载处理器挂在 profile 上，profile 释放后它也没有意义了
+                self.downloads = None
                 self.profile.deleteLater()
                 self.profile = None
         except Exception:                                      # noqa: BLE001

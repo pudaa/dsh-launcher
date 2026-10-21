@@ -1670,3 +1670,62 @@ Qt 只提供了 `renderProcessTerminated(status, code)` 这个信号，用不用
 回归分两层：`gui_selftest.health_checks()` 做源码级检查（拦住"改回同步实现"），
 `tools/datatask_smoke.py` 真起线程、真删真复制（拦住"后台任务其实是死的"），
 两条都挂在 CI 上。
+
+## 19. "点了没反应"的第三种形态：下载被静默取消（v2.4.1）
+
+### 19.1 现场
+
+DSH 的「下载 session」按钮点下去毫无反应：没有文件、没有报错、没有提示。
+前端实现原文（`dsh-session-log-export/lib/client.js`）：
+
+```js
+function downloadUrl(url, filename) {
+    const anchor = document.createElement("a");
+    anchor.href = url;          // 同源 Host 下载地址
+    anchor.download = filename; // 关键：这个属性让它变成"下载"而不是"导航"
+    anchor.click();
+}
+```
+
+`anchor.click()` 是**同步**返回的，前端拿不到任何"下载是否被接受"的信息。
+而 QtWebEngine 对 `QWebEngineProfile.downloadRequested` 的默认处理是
+**取消**：没人接这个信号，请求就消失，连 warning 都没有。
+
+### 19.2 这是一类问题，不是孤例
+
+同一个模式的三个已知实例（都属于「Qt 默认拒绝，且拒绝得一声不响」）：
+
+| 能力 | 不处理的后果 | 现状 |
+|---|---|---|
+| `navigator.clipboard.writeText()` | Promise 以 `NotAllowedError` 结束，前端 catch 后静默 return | 已修（同源放行 + `JavascriptCanAccessClipboard`） |
+| `window.open()` / `target=_blank` | `createWindow` 返回 null，弹窗永远空白 | 已修（`openIn` 交给 Chromium / 外链进系统浏览器） |
+| `a[download]` 下载 | 请求被取消，不落盘、不提示 | **本节修的就是它** |
+
+### 19.3 实现要点（`dsh_devtools.DownloadManager`）
+
+- **挂接点**：`QWebEngineProfile.downloadRequested`。profile 在切来源/迁移数据时
+  会重建，所以挂在 `_ensure_webview` 里、父对象给 profile，一起回收。
+- **顺序**：先 `setDownloadDirectory` + `setDownloadFileName`，**再** `accept()`。
+  accept 之后再设无效（Qt 会忽略并打 warning）。
+- **信号先接再 accept**：小文件可能瞬间完成，先 accept 会漏掉 `stateChanged`。
+- **用户取消要显式 `cancel()`**：请求悬着不处理，Qt 侧会算作失败。
+- **文件名不可信**：网页能给任意名字（含路径分隔符、控制字符、Windows 设备名），
+  统一过 `browser_safe_filename()`；同名文件走 `unique_download_path()` 加 `(1)`。
+- **反馈**：保存对话框本身是"有反应"的第一步；开始 / 完成 / 中断各发一条托盘气泡，
+  并在 `host.log` 留痕（否则下次又是"点了没反应，也不知道为什么"）。
+
+### 19.4 顺手核实过的其它静默能力
+
+对着 `%LOCALAPPDATA%\DSH-Web\node-global\node_modules\@deepseek-ai\*\lib\client.js`
+逐个查了前端实际用到的浏览器能力：
+
+| 能力 | 前端是否使用 | 处理 |
+|---|---|---|
+| `showSaveFilePicker`（File System Access） | **不用** | 无需处理 |
+| `requestFullscreen` | **不用** | 无需处理（将来要用得接 `fullScreenRequested`，否则同样没反应） |
+| `getUserMedia` / `getDisplayMedia` | **不用** | 无需处理（现在权限处理器会明确拒绝并**写日志**） |
+| `window.print()` | **不用** | 无需处理（将来要用得接 `printRequested`，还要多打一份 QtPrintSupport） |
+| `a[download]` | 会话导出用 | **已接** |
+
+`_on_feature_permission` 现在把每次拒绝都写进 `host.log`（`权限被拒绝：Feature @ origin`）——
+这类"没反应"事后唯一能查的就是日志。

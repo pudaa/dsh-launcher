@@ -1368,6 +1368,17 @@ def health_checks() -> list:
           "PagefileUsage" in procmem_src)
     check("主窗口每分钟落一行 mem.log",
           "MEM_SAMPLE_MS" in gui and "mem.log" in gui)
+
+    # ⑫ 下载（2026-10-21 用户报"点下载 session 没反应"）
+    # QtWebEngine 对没人接的 downloadRequested 是**静默取消**，而前端
+    # `a.download` 的 click 同步返回——去掉处理器的症状就是"点了没反应"。
+    check("下载信号被接上（否则被静默取消）",
+          "class DownloadManager" in dev and "downloadRequested.connect" in dev)
+    check("主窗口在 profile 创建时挂下载管理器",
+          "dsh_devtools.DownloadManager(" in gui
+          and "choose_path=self._ask_download_path" in gui)
+    check("保存位置由用户选择，取消时显式 cancel",
+          "getSaveFileName" in gui and "request.cancel()" in dev)
     return failures
 
 

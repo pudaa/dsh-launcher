@@ -34,11 +34,11 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
-from PySide6.QtCore import QRegularExpression, Qt, QTimer, QUrl
+from PySide6.QtCore import QObject, QRegularExpression, Qt, QTimer, QUrl
 from PySide6.QtGui import (QColor, QFont, QTextCharFormat, QTextCursor,
                            QTextDocument, QSyntaxHighlighter)
-from PySide6.QtWebEngineCore import (QWebEnginePage, QWebEngineProfile,
-                                     QWebEngineSettings,
+from PySide6.QtWebEngineCore import (QWebEngineDownloadRequest, QWebEnginePage,
+                                     QWebEngineProfile, QWebEngineSettings,
                                      QWebEngineUrlRequestInterceptor)
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup,
@@ -658,6 +658,11 @@ class ShellPage(QWebEnginePage):
                 QWebEnginePage.PermissionPolicy.PermissionGrantedByUser
                 if allow
                 else QWebEnginePage.PermissionPolicy.PermissionDeniedByUser)
+            if not allow:
+                # 拒绝要留痕：这类"页面点了没反应"事后唯一能查的就是日志
+                self._shell_log("权限被拒绝：%s @ %s"
+                                % (getattr(feature, "name", feature),
+                                   redact(origin.toString())))
         except Exception:                                      # noqa: BLE001
             pass
 
@@ -782,6 +787,164 @@ JS_ENV = r"""
   });
 })()
 """
+
+
+# --------------------------------------------------------------- 浏览器下载
+#
+# 为什么必须有这一段（2026-10-21 老大报"点下载 session 没反应"）
+# ------------------------------------------------------------------
+# DSH 的导出按钮原文（`dsh-session-log-export/lib/client.js`）：
+#
+#     function downloadUrl(url, filename) {
+#         const anchor = document.createElement("a");
+#         anchor.href = url;
+#         anchor.download = filename;
+#         anchor.click();
+#     }
+#
+# 在浏览器里 `download` 属性会把这次点击交给下载管理器。而在 QtWebEngine 里，
+# 没有人接 `QWebEngineProfile.downloadRequested` 时，**请求被直接取消**：
+# 不落盘、不报错、也不弹任何提示；而 `anchor.click()` 早就同步返回了，
+# 前端以为"已经交给浏览器"，于是什么都不做。
+#
+# 这是同一个坑的第三种形态（前两种：剪贴板权限、window.open）。共同点：
+# **Qt 的默认行为是拒绝，而且拒绝得一声不响。**
+
+#: Windows 文件名里不合法、或会让资源管理器困惑的字符
+_BAD_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+#: Windows 设备名，做文件名会直接失败（不论扩展名）
+_RESERVED_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL"]
+    + ["COM%d" % i for i in range(1, 10)]
+    + ["LPT%d" % i for i in range(1, 10)])
+
+
+def browser_safe_filename(name, fallback: str = "download.bin") -> str:
+    """把网页给的文件名洗成 Windows 能落盘的形状。
+
+    网页给的名字不可信（可能带路径分隔符、控制字符，或者干脆是 `..`）。
+    清洗顺序：去掉非法字符 → 去掉结尾的点和空格（Windows 会静默吞掉）→
+    设备名加前缀 → 空名回退。
+    """
+    s = _BAD_FILENAME.sub("_", str(name or "")).strip()
+    s = s.rstrip(". ")
+    if not s or s in (".", ".."):
+        return fallback
+    stem, ext = os.path.splitext(s)
+    if stem.upper() in _RESERVED_NAMES:
+        s = "_" + s
+    # 单段长度留足余量：260 字符的整路径限制比文件名限制更早撞上
+    if len(s) > 180:
+        s = s[:180 - len(ext)] + ext
+    return s
+
+
+def unique_download_path(directory: str, filename: str) -> str:
+    """同名文件已存在时按 `名字 (1).ext` 递增，不静默覆盖。"""
+    path = os.path.join(directory, filename)
+    if not os.path.exists(path):
+        return path
+    stem, ext = os.path.splitext(filename)
+    for i in range(1, 1000):
+        cand = os.path.join(directory, "%s (%d)%s" % (stem, i, ext))
+        if not os.path.exists(cand):
+            return cand
+    return os.path.join(directory, "%s (%d)%s" % (stem, os.getpid(), ext))
+
+
+class DownloadManager(QObject):
+    """把网页发起的下载接到桌面上。
+
+    `choose_path(filename) -> str`：问用户存哪，返回完整路径；返回空串表示取消。
+    **不注入时一律按取消处理**——没有界面就没人能回答"存哪"，
+    宁可明确取消，也不要悄悄写到某个用户找不到的地方。
+    `notify(text)`：一句话告知（开始 / 完成 / 失败），由界面层接到托盘气泡。
+    """
+
+    def __init__(self, profile, choose_path=None, notify=None, log=None,
+                 parent=None):
+        super().__init__(parent)
+        self._choose = choose_path
+        self._notify = notify
+        self._log = log or (lambda _s: None)
+        self._active: dict = {}
+        self.attach(profile)
+
+    def attach(self, profile) -> None:
+        """接上 profile 的下载信号。profile 重建（换来源/迁移数据）后要重挂。"""
+        try:
+            profile.downloadRequested.connect(self._on_requested)
+        except (AttributeError, RuntimeError, TypeError) as e:
+            self._log("挂接下载处理器失败：%s: %s" % (type(e).__name__, e))
+
+    # ---- 信号 ----
+
+    def _on_requested(self, request) -> None:
+        try:
+            suggested = (request.downloadFileName()
+                         or request.suggestedFileName() or "")
+        except RuntimeError:
+            return                                  # 请求已失效
+        name = browser_safe_filename(suggested)
+
+        path = ""
+        if self._choose is not None:
+            try:
+                path = str(self._choose(name) or "")
+            except Exception as e:                  # noqa: BLE001
+                self._log("选择下载位置失败：%s: %s" % (type(e).__name__, e))
+                path = ""
+        if not path:
+            # 用户取消：必须显式 cancel，否则请求会悬着（Qt 释放时算作失败）
+            self._log("下载已取消：%s" % name)
+            try:
+                request.cancel()
+            except RuntimeError:
+                pass
+            return
+
+        folder, fname = os.path.split(path)
+        fname = browser_safe_filename(fname or name)
+        try:
+            # 顺序有讲究：**先设目录与文件名，再 accept**。
+            # accept 之后再设会无效（Qt 会打 warning 并忽略）。
+            if folder:
+                request.setDownloadDirectory(folder)
+            request.setDownloadFileName(fname)
+            # 完成/中断的信号要赶在 accept 之前接上：小文件可能瞬间就结束
+            request.stateChanged.connect(
+                lambda state, req=request: self._on_state(req, state))
+            request.accept()
+        except (RuntimeError, TypeError) as e:
+            self._log("下载未能开始：%s: %s" % (type(e).__name__, e))
+            return
+
+        self._active[request] = {"path": path}
+        self._log("开始下载：%s" % path)
+        if self._notify is not None:
+            self._notify("正在下载 %s" % fname)
+
+    def _on_state(self, request, state) -> None:
+        S = QWebEngineDownloadRequest.DownloadState
+        if state == S.DownloadCompleted:
+            info = self._active.pop(request, None)
+            path = (info or {}).get("path") or ""
+            self._log("下载完成：%s" % path)
+            if self._notify is not None:
+                self._notify("已保存到 %s" % path)
+        elif state in (S.DownloadCancelled, S.DownloadInterrupted):
+            self._active.pop(request, None)
+            reason = ""
+            try:
+                reason = getattr(request.interruptReason(), "name", "") or ""
+            except RuntimeError:
+                pass
+            self._log("下载未完成（%s）：%s"
+                      % (getattr(state, "name", state), reason))
+            if self._notify is not None:
+                self._notify("下载未完成%s"
+                             % (("：" + reason) if reason else "（已取消或中断）"))
 
 
 # ------------------------------------------------------------------ 窗口
@@ -2054,5 +2217,103 @@ def selftest_checks() -> list:
           two == 2 and three == 3 and wd.recoveries == 3,
           "%d / %d / %d" % (two, three, wd.recoveries))
     check("超出上限时写清原因", any("次数过多" in m for m in wd.logs))
+
+    # --- 2026-10-21「点下载 session 没反应」---
+    # QtWebEngine 对没人接的 `downloadRequested` **静默取消**，而前端
+    # `a.download` 的 click 早已同步返回 —— "没反应"是唯一症状。
+    # 这里钉三件事：名字要洗、取消要显式 cancel、完成后要告诉用户存哪。
+    check("下载文件名清洗（非法字符 / 设备名 / 空名）",
+          browser_safe_filename("a/b:c*?.zip") == "a_b_c__.zip"
+          and browser_safe_filename("CON.txt").startswith("_")
+          and browser_safe_filename("") == "download.bin")
+
+    import tempfile as _tf
+    _dl_dir = _tf.mkdtemp(prefix="dl-selftest-")
+    open(os.path.join(_dl_dir, "x.zip"), "w", encoding="utf-8").close()
+    check("同名下载不静默覆盖",
+          unique_download_path(_dl_dir, "x.zip").endswith("x (1).zip"),
+          os.path.basename(unique_download_path(_dl_dir, "x.zip")))
+
+    class _Sig:
+        def __init__(self):
+            self.fn = None
+
+        def connect(self, fn):
+            self.fn = fn
+
+        def emit(self, *a):
+            if self.fn is not None:
+                self.fn(*a)
+
+    class _FakeProfile:
+        def __init__(self):
+            self.downloadRequested = _Sig()
+
+    class _FakeReq:
+        def __init__(self, name="dsh-session-abc.zip"):
+            self.name = name
+            self.dir = ""
+            self.fname = ""
+            self.accepted = False
+            self.cancelled = False
+            self.stateChanged = _Sig()
+
+        def downloadFileName(self):
+            return self.name
+
+        def suggestedFileName(self):
+            return self.name
+
+        def setDownloadDirectory(self, d):
+            self.dir = d
+
+        def setDownloadFileName(self, n):
+            self.fname = n
+
+        def accept(self):
+            self.accepted = True
+
+        def cancel(self):
+            self.cancelled = True
+
+        def interruptReason(self):
+            return (QWebEngineDownloadRequest.DownloadInterruptReason
+                    .FileAccessDenied)
+
+    S = QWebEngineDownloadRequest.DownloadState
+    target = os.path.join(_dl_dir, "saved.zip")
+    prof = _FakeProfile()
+    notes: list[str] = []
+    DownloadManager(prof, choose_path=lambda _n: target,
+                    notify=notes.append, log=lambda _s: None)
+    r1 = _FakeReq()
+    prof.downloadRequested.emit(r1)
+    check("下载请求被接受并落到所选目录",
+          r1.accepted and not r1.cancelled
+          and os.path.normcase(r1.dir) == os.path.normcase(_dl_dir)
+          and r1.fname == "saved.zip",
+          "%s / %s" % (r1.dir, r1.fname))
+    check("开始下载时有反馈", any("正在下载" in n for n in notes))
+    r1.stateChanged.emit(S.DownloadCompleted)
+    check("下载完成后告知保存位置", any("已保存到" in n for n in notes),
+          notes[-1] if notes else "")
+
+    prof2 = _FakeProfile()
+    r2 = _FakeReq()
+    DownloadManager(prof2, choose_path=lambda _n: "", notify=notes.append,
+                    log=lambda _s: None)
+    prof2.downloadRequested.emit(r2)
+    check("用户取消时显式 cancel（不留悬空请求）",
+          r2.cancelled and not r2.accepted)
+
+    prof3 = _FakeProfile()
+    r3 = _FakeReq()
+    notes3: list[str] = []
+    DownloadManager(prof3, choose_path=lambda _n: os.path.join(_dl_dir, "f3.zip"),
+                    notify=notes3.append, log=lambda _s: None)
+    prof3.downloadRequested.emit(r3)
+    r3.stateChanged.emit(S.DownloadInterrupted)
+    check("下载中断会告知原因", any("未完成" in n for n in notes3),
+          notes3[-1] if notes3 else "")
 
     return failures
