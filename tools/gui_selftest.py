@@ -1205,6 +1205,63 @@ def stack_overlay_checks() -> list[str]:
     return failures
 
 
+def popup_repaint_checks() -> list[str]:
+    """原生弹层出现/关闭时必须给 Web 视图补帧（2026-10-24 现场）。
+
+    实测：点开原生 <select> 后 QWebEngineView 停止呈现（StackAll 下露出
+    下面的加载页），JS/DOM 正常、reload 无效，而 view.update() 立刻恢复。
+    这里不弹真实弹层，只把事件过滤器这条线钉住——用桩视图数 update() 次数。
+    """
+    failures: list[str] = []
+
+    def check(name: str, ok: bool, extra: str = "") -> None:
+        print(f"  [{'OK  ' if ok else 'FAIL'}] {name}{('  ' + extra) if extra else ''}")
+        if not ok:
+            failures.append(name)
+
+    import dsh_devtools
+    from PySide6.QtCore import QEvent
+    from PySide6.QtWidgets import QLabel, QMenu
+    from PySide6.QtTest import QTest
+
+    class StubView(QLabel):
+        def __init__(self):
+            super().__init__("stub")
+            self.updates = 0
+
+        def update(self, *a):          # noqa: D401  (只数次数，不真画)
+            self.updates += 1
+
+    stub = StubView()
+    guard = dsh_devtools.PopupRepaintGuard(lambda: stub)
+    menu = QMenu()
+    menu.addAction("x")
+    def _kind(w):
+        return w.windowType() & g.Qt.WindowType.WindowType_Mask
+
+    check("弹层对象是 Popup 顶层窗口",
+          menu.isWindow() and _kind(menu) == g.Qt.WindowType.Popup)
+    guard.eventFilter(menu, QEvent(QEvent.Type.Show))
+    QTest.qWait(400)
+    check("弹层出现后给视图补帧", stub.updates >= 1, "update %d 次" % stub.updates)
+    before = stub.updates
+    guard.eventFilter(menu, QEvent(QEvent.Type.Hide))
+    QTest.qWait(400)
+    check("弹层关闭后补帧", stub.updates > before,
+          "update %d 次" % stub.updates)
+    # 非 popup 的普通窗口不该被当成弹层（避免每次开窗口都重绘网页）
+    plain = g.QWidget()
+    before = stub.updates
+    check("对照窗口不是 Popup",
+          plain.isWindow() and _kind(plain) == g.Qt.WindowType.Window)
+    guard.eventFilter(plain, QEvent(QEvent.Type.Show))
+    QTest.qWait(400)
+    check("普通窗口不触发网页重绘", stub.updates == before,
+          "update %d → %d" % (before, stub.updates))
+    guard.deleteLater()
+    return failures
+
+
 def terminal_checks() -> list[str]:
     """开发者面板「终端」页：能否读到输出、整段复制、暂停/归位、搜索。"""
     failures: list[str] = []
@@ -1322,23 +1379,101 @@ def health_checks() -> list:
           "QTimer.singleShot(1400, button" in dev
           and "QTimer.singleShot(1200, btn" in panel)
 
-    # ⑨ 页面监护（2026-10-21 用户报"长任务后页面变空白，只能手动刷新"）
-    # 渲染进程被杀后 Qt 不给任何默认恢复（就是一片空白），必须自己监听重载；
-    # 而"进程活着但页面空了"只能靠 JS 心跳主动探。两条路径缺一条，
-    # 症状就会以另一种形式复发。
-    check("渲染进程退出会被监听并自动重载",
-          "renderProcessTerminated.connect(self._on_render_terminated)" in dev
-          and "self.reload()" in dev)
+    # ⑨ 页面监护（2026-10-21 用户报"长任务后页面变空白，只能手动刷新"；
+    #    2026-10-24 又出现"DOM 活着但一个像素都不再画"的合成表面失效）
+    check("渲染进程退出会被监听并自动恢复",
+          "renderProcessTerminated.connect(self._on_render_terminated)" in dev)
     check("自动恢复有防循环闸门（120s 内限次）",
           "_may_recover" in dev and "RELOAD_BURST" in dev)
     check("白屏靠 JS 心跳探测（DOM 为空计数）",
           "WATCHDOG_JS" in dev and "childElementCount" in dev)
-    check("恢复走 _recover_page（不会把 about:blank 再 reload 一遍）",
+    check("心跳在窗口不可见时暂停（Chromium 节流会误判）",
+          "view.isVisible()" in dev and "view.isMinimized()" in dev)
+    # PySide6 6.11 的 QWebEnginePage **没有** reload()：v2.4.1 的自动恢复
+    # 直接写 self.reload()，异常被 Qt 吞进定时器槽（打包版无控制台），
+    # 所以"白屏自愈"一次都没真正执行过。用 AST 钉死，注释里提到不算。
+    import ast as _ast
+    _bad_reload = []
+    for _n in _ast.walk(_ast.parse(dev)):
+        if (isinstance(_n, _ast.Call)
+                and isinstance(_n.func, _ast.Attribute)
+                and _n.func.attr == "reload"
+                and isinstance(_n.func.value, _ast.Name)
+                and _n.func.value.id == "self"):
+            _bad_reload.append(_n.lineno)
+    check("不再调用不存在的 QWebEnginePage.reload()",
+          not _bad_reload, "行号 %s" % _bad_reload)
+    check("reload 走视图 / triggerAction(Reload)",
+          "view.reload()" in dev and "WebAction.Reload" in dev)
+    check("恢复仍走 _recover_page（不把 about:blank 再 reload 一遍）",
           "def _recover_page(" in dev
           and 'u.scheme() in ("http", "https")' in dev
           and "self.setUrl(QUrl(base))" in dev)
-    check("心跳在窗口不可见时暂停（Chromium 节流会误判）",
-          "view.isVisible()" in dev and "view.isMinimized()" in dev)
+    check("自动恢复用尽后升级为宿主重建视图",
+          "_escalate_to_host" in dev and "hard_recover" in dev)
+    check("宿主注入硬重建回调",
+          "hard_recover=self._reset_webview" in gui
+          and "def _reset_webview(" in gui)
+    check("重建视图保留 profile（登录态不丢）",
+          "def _reset_webview_now" in gui and "_ensure_webview()" in gui)
+    check("重建有防循环上限（120s/2 次）",
+          "SURFACE_RESET_LIMIT" in gui and "SURFACE_RESET_WINDOW_S" in gui)
+    check("连按「重新加载页面」第二次直接重建视图",
+          "MANUAL_RESET_WINDOW_S" in gui
+          and "self._reset_webview(manual=True)" in gui)
+    check("弹层出现/关闭时给 Web 视图补帧（首选防线）",
+          "class PopupRepaintGuard" in dev
+          and "PopupRepaintGuard(" in gui
+          and "installEventFilter(self)" in dev)
+    check("弹层 Show 的同一拍就补帧（delay=0 实测能直接prevent）",
+          "self._schedule(0)" in dev)
+    # 根因侧：加载页在 StackAll 里一直可见，indeterminate 进度条的动画定时器
+    # 会永远跑；它既是白烧资源，也是"原生弹层后停帧"的触发条件。
+    check("加载页进度条在 Web 视图露出后停掉动画",
+          "self.progress = bar" in gui and "def _loading_busy(" in gui
+          and "self._loading_busy(False)" in gui)
+    check("需要重新显示加载页时恢复动画",
+          gui.count("self._loading_busy(True)") >= 3)
+
+    # ⑨b 渲染后端（2026-10-24 闪退定案）
+    # 两次 dump 逐帧相同：Chrome_InProcGpuThread 里 Qt6WebEngineCore+0xd224d3，
+    # ANGLE input-layout 缓存空指针。上游无修复、6.12.0 同一段机器码逐字节相同，
+    # 所以默认改软件渲染；用户可在控制面板显式开回硬件加速（重启生效）。
+    config_src = read(os.path.join("dsh_host", "config.py"))
+    check("默认硬件加速（跟随惯例，不拿全体性能兜底）",
+          '"webengine_hw_accel": True' in config_src)
+    check("可显式关闭：面板 / settings.json / 环境变量",
+          "webengine_hw_accel" in config_src
+          and "DSH_WEBENGINE_HW_ACCEL" in gui
+          and "def _decide_hw_accel(" in gui)
+    # 崩溃哨兵的纯逻辑（2026-10-24）：默认硬件加速；只有"上次没正常退出"
+    # 才自动降级一次。这里不依赖文件系统，直接喂三种 marker。
+    _now = 1_000_000.0
+    check("崩溃哨兵：默认走硬件加速",
+          g._decide_hw_accel(True, None, _now)[0] is True)
+    check("崩溃哨兵：上次异常退出 → 本次软件渲染",
+          g._decide_hw_accel(True, {"started_at": _now - 600}, _now)[0] is False)
+    check("崩溃哨兵：陈旧标记不触发降级",
+          g._decide_hw_accel(True, {"started_at": _now - 3 * 86400}, _now)[0]
+          is True)
+    check("崩溃哨兵：用户显式关闭时永远软件渲染",
+          g._decide_hw_accel(False, None, _now)[0] is False)
+    check("哨兵：启动写、正常退出删（atexit 兜底）",
+          "def _write_webengine_marker(" in gui
+          and "atexit.register(_clear_webengine_marker)" in gui
+          and "_clear_webengine_marker()" in gui)
+    check("降级时托盘提示用户（并指向面板）",
+          "def _notify_safe_mode(" in gui and "兼容模式" in gui)
+    try:
+        _flags_at = gui.index("QTWEBENGINE_CHROMIUM_FLAGS")
+        _pyside_at = gui.index("from PySide6.QtCore")
+    except ValueError:
+        _flags_at, _pyside_at = -1, -1
+    check("Chromium flags 在导入 PySide6 之前设置（只读一次）",
+          0 <= _flags_at < _pyside_at,
+          "flags@%s pyside@%s" % (_flags_at, _pyside_at))
+    check("面板提供硬件加速开关（重启生效）",
+          "webengine_hw_accel" in panel)
 
     # ⑩ 数据目录的重活必须在后台线程（2026-10-21 补 2.3.8 的漏项）
     # 迁移 / 清缓存 / 清空 / 复制私有安装，在 727 MB、6.6 万个文件上是
@@ -1429,6 +1564,10 @@ def main() -> int:
     state["stack_failures"] = stack_overlay_checks()
     print()
 
+    print("== 原生弹层补帧（<select> 打开后主视图停帧）==")
+    state["popup_repaint_failures"] = popup_repaint_checks()
+    print()
+
     print("== 开发者面板终端页（复制 / 暂停 / 归位 / 搜索）==")
     state["terminal_failures"] = terminal_checks()
     print()
@@ -1447,6 +1586,7 @@ def main() -> int:
                or state.get("panel_failures") or state.get("devtools_failures")
                or state.get("theme_failures") or state.get("console_failures")
                or state.get("stack_failures") or state.get("terminal_failures")
+               or state.get("popup_repaint_failures")
                or state.get("health_failures"))
         if bad:
             print("\n用例失败：", "、".join(bad))
@@ -1635,7 +1775,9 @@ def main() -> int:
            or state.get("panel_failures") or state.get("webview_failures")
            or state.get("devtools_failures") or state.get("theme_failures")
            or state.get("console_failures") or state.get("stack_failures")
-           or state.get("terminal_failures") or state.get("health_failures"))
+           or state.get("terminal_failures")
+           or state.get("popup_repaint_failures")
+           or state.get("health_failures"))
     # on_ready 里一旦抛异常，后面的检查会被静默跳过、测试却仍然"通过"。
     # 用一个完成标记把这种情况变成失败。
     if "handle" in state and not state.get("ready_checks_done"):

@@ -34,7 +34,8 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
-from PySide6.QtCore import QObject, QRegularExpression, Qt, QTimer, QUrl
+from PySide6.QtCore import (QEvent, QObject, QRegularExpression, Qt, QTimer,
+                             QUrl)
 from PySide6.QtGui import (QColor, QFont, QTextCharFormat, QTextCursor,
                            QTextDocument, QSyntaxHighlighter)
 from PySide6.QtWebEngineCore import (QWebEngineDownloadRequest, QWebEnginePage,
@@ -65,6 +66,7 @@ WATCHDOG_BLANK_STRIKES = 3
 RENDER_BUSY_MS = 25000
 #: 120 秒内最多自动恢复几次（渲染进程退出 / 白屏 / 无响应共用这个计数）。
 RELOAD_BURST = 3
+
 #: 探测白屏用的 JS：返回 body 的子元素数。空页面 = 0，渲染进程死了不回调。
 WATCHDOG_JS = "document.body ? document.body.childElementCount : -1"
 
@@ -311,7 +313,7 @@ class ShellPage(QWebEnginePage):
 
     def __init__(self, profile, parent, base_url=None, recorder=None,
                  open_external=None, view=None, capture_console: bool = False,
-                 notify=None):
+                 notify=None, hard_recover=None):
         super().__init__(profile, parent)
         self._base_url = base_url or (lambda: "")
         self.recorder = recorder or Recorder()
@@ -339,9 +341,12 @@ class ShellPage(QWebEnginePage):
         # QtWebEngine 不会自己恢复（浏览器里那种"崩溃了"页面这里就是一片空白），
         # 主窗口之前也没有任何监听——于是一旦发生就永久空白，只能手动刷新。
         self._loaded_ok = False
+        self._escalated = False                     # 已请求宿主重建（只提一次）
         self._reload_requests: deque = deque()      # 近期恢复请求时间戳（防循环）
         self._hb_pending_since: float | None = None  # 心跳在途（None=空闲）
         self._hb_blank = 0                          # 连续"DOM 为空"的次数
+        #: 宿主注入的"重建 Web 视图"回调（界面层才能换视图；这里只管升级）。
+        self._hard_recover_cb = hard_recover
         self.loadFinished.connect(self._on_load_ok)
         self.renderProcessTerminated.connect(self._on_render_terminated)
         # 心跳看门狗只挂在**主页面**上（popup 页 view=None，不值得也没有视图可判）
@@ -377,6 +382,7 @@ class ShellPage(QWebEnginePage):
             return
         self._hb_pending_since = None
         self._hb_blank = 0
+        self._escalated = False
 
     def _may_recover(self, why: str) -> bool:
         """统一的恢复闸门：120 秒内最多 RELOAD_BURST 次，防"恢复→崩→恢复"循环。"""
@@ -411,11 +417,11 @@ class ShellPage(QWebEnginePage):
         if not self._loaded_ok:
             return          # 还没成功加载过：那是启动流程的事，这里不抢
         if not self._may_recover("渲染进程退出"):
-            self._notify("渲染进程反复退出，已停止自动恢复。请手动刷新（F5）"
-                         "或重启应用；持续出现说明内存不足。")
+            self._notify("渲染进程反复退出，已停止自动刷新；正在重建视图…")
+            self._escalate_to_host("渲染进程反复退出")
             return
         # 留 500 ms 让 Qt 完成渲染进程的清理，再原地重载（保留当前路由与令牌）
-        QTimer.singleShot(500, self._recover_page)
+        QTimer.singleShot(500, self, self._recover_page)
 
     def _watchdog_tick(self) -> None:
         """心跳看门狗：活着但空白 / 彻底无响应，都自动重载。
@@ -450,24 +456,44 @@ class ShellPage(QWebEnginePage):
         except RuntimeError:
             self._hb_pending_since = None
 
+    # ---- 恢复动作 ----
+
+    def _reload(self) -> bool:
+        """可用的 reload。
+
+        **PySide6 6.11 的 QWebEnginePage 没有 reload()**（那是 Qt5 的 API）。
+        v2.4.1 的自动恢复直接写 self.reload()，异常被 Qt 吞进定时器槽里
+        （打包版没有控制台，连 traceback 都看不到），于是「白屏自愈」
+        从来没真正执行过。这里显式走视图的 reload，再回退到 triggerAction。
+        """
+        view = self._view
+        if view is not None:
+            try:
+                view.reload()
+                return True
+            except RuntimeError:
+                pass
+        try:
+            self.triggerAction(QWebEnginePage.WebAction.Reload)
+            return True
+        except Exception:                                      # noqa: BLE001
+            return False
+
     def _recover_page(self, force_base: bool = False) -> None:
-        """恢复页面：优先 `reload()`，必要时回到带令牌的入口地址。
+        """恢复页面：优先 reload，必要时回到带令牌的入口地址。
 
-        为什么不能无脑 `reload()`（2026-10-20 那次事故的教训）：如果页面已经
-        跑偏成 `about:blank`（登录流程里 `window.open` 的产物），reload 只会把
-        空白页再载一遍——用户看到的就是"刷新了还是白的"。
-
-        所以这里检查当前的 scheme：只有 http/https 才 reload，否则退回
-        `base_url`（= 主窗口手里那个带 token 的地址）。
+        为什么不能无脑 reload（2026-10-20 事故的教训）：如果页面已经跑偏成
+        about:blank（登录流程里 window.open 的产物），reload 只会把空白页
+        再载一遍——用户看到的就是「刷新了还是白的」。
         """
         if not force_base:
             try:
                 u = self.url()
-                if u.isValid() and u.scheme() in ("http", "https"):
-                    self.reload()
-                    return
             except RuntimeError:
-                pass          # 页对象正在销毁
+                u = QUrl()          # 页对象正在销毁
+            if u.isValid() and u.scheme() in ("http", "https"):
+                if self._reload():
+                    return
         base = ""
         try:
             base = self._base()
@@ -475,11 +501,28 @@ class ShellPage(QWebEnginePage):
             base = ""
         if base:
             self.setUrl(QUrl(base))
-        else:
-            try:
-                self.reload()
-            except RuntimeError:
-                pass
+            return
+        self._reload()
+
+    def _escalate_to_host(self, why: str) -> None:
+        """自动恢复手段用尽：请宿主重建 Web 视图（换掉合成表面）。
+
+        2026-10-24 实测：QtWebEngine 6.11 打开原生 <select> 弹层后，视图会
+        停止呈现（DOM/JS 全正常，reload 无效），只有换一个 QWebEngineView
+        才恢复。正常路径已被 PopupRepaintGuard + 停掉加载页动画挡住；这里是
+        兜底：反复恢复失败时升级成重建视图。宿主自己做限流（120s/2 次）。
+        """
+        cb = self._hard_recover_cb
+        if cb is None or self._escalated:
+            return
+        self._escalated = True
+        self._notify("页面反复无法恢复，正在重建 Web 视图…")
+        try:
+            cb()
+        except Exception as e:                                 # noqa: BLE001
+            self._shell_log("页面监护：重建视图失败 %s: %s"
+                            % (type(e).__name__, e))
+
 
     def _hb_done(self, value) -> None:
         self._hb_pending_since = None
@@ -498,12 +541,16 @@ class ShellPage(QWebEnginePage):
                 self._notify("页面变为空白，已自动重新加载。")
                 # DOM 都空了，当前地址常常已经不可信 → 直接回入口地址
                 self._recover_page(force_base=True)
+            else:
+                self._escalate_to_host("页面空白反复恢复失败")
 
     def _hb_strike(self, why: str) -> None:
         self._shell_log("页面监护：%s，准备自动重载" % why)
         if self._may_recover(why):
             self._notify("页面无响应，已自动重新加载。")
             self._recover_page(force_base=True)
+        else:
+            self._escalate_to_host("页面无响应反复恢复失败")
 
     # ---- 导航策略 ----
 
@@ -678,6 +725,76 @@ class ShellPage(QWebEnginePage):
             self.recorder.add_console(LEVEL_NAMES.get(level, "log"), message,
                                       line, source)
         except Exception:                                      # noqa: BLE001
+            pass
+
+
+# ------------------------------------------------------------------ 弹层补帧
+
+class PopupRepaintGuard(QObject):
+    """原生弹层出现/消失时，给 Web 视图补一帧。
+
+    2026-10-24 实测（tools/probe_popup_*.py，PySide6 6.11.2 / Windows）：
+    点开一个原生 <select> 弹层后，QWebEngineView **停止呈现**——StackAll
+    布局里能看到垫在下面的加载页透出来，而 JS/DOM 全部正常、reload 无效；
+    对视图调用一次 update()（+repaint()）立刻恢复。
+
+    所以这里监听**应用内所有顶层 Popup 窗口**的 Show/Hide/Close：弹层一出现
+    就补一帧，关闭后再补一帧。对非 WebEngine 的弹层（托盘菜单等）调用
+    view.update() 只是一次廉价重绘，没有副作用。
+
+    只做这件事、不承担恢复职责：真正的兜底是 ShellPage 的像素级监护。
+    """
+
+    def __init__(self, view_getter, parent=None):
+        super().__init__(parent)
+        self._view_getter = view_getter
+        self._last = 0.0
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+
+    def eventFilter(self, obj, ev):                       # noqa: N802
+        t = ev.type()
+        if t in (QEvent.Type.Show, QEvent.Type.Hide, QEvent.Type.Close,
+                 QEvent.Type.WindowActivate, QEvent.Type.WindowDeactivate):
+            try:
+                if not obj.isWindow():
+                    return False
+                # 注意：Qt.WindowType 不是位标志！Popup 的值本身含 Window 位
+                # （Popup = 0x9），所以 windowType() & Popup 对**所有顶层窗口**
+                # 都为真。必须用 WindowType_Mask 先取窗口类别再比较。
+                kind = obj.windowType() & Qt.WindowType.WindowType_Mask
+                if kind != Qt.WindowType.Popup:
+                    return False
+            except (RuntimeError, AttributeError):
+                return False
+            # 实测（delay=0，probe_popup_run.py --scenario popup-hook）：
+            # 在 Show 的同一拍补一帧就足以让「停帧」根本不发生；再补两拍
+            # 吸收弹层尺寸确定、关闭后的重排。
+            self._schedule(0)
+            self._schedule(60)
+            self._schedule(260)
+        return False
+
+    def _schedule(self, delay_ms: int) -> None:
+        QTimer.singleShot(delay_ms, self, self.nudge)
+
+    def nudge(self) -> None:
+        """让主视图重画一帧。调用方也可以直接调（自测 / 像素监护）。"""
+        now = time.monotonic()
+        if now - self._last < 0.04:          # 合并同一轮里的多次事件
+            return
+        self._last = now
+        view = None
+        try:
+            view = self._view_getter()
+        except Exception:                                  # noqa: BLE001
+            view = None
+        if view is None:
+            return
+        try:
+            view.update()
+        except RuntimeError:
             pass
 
 
@@ -2180,6 +2297,7 @@ def selftest_checks() -> list:
             self._hb_blank = 0
             self._loaded_ok = True
             self.recoveries = 0
+            self.escalations = 0
             self.logs = []
 
         def _may_recover(self, why):
@@ -2193,6 +2311,10 @@ def selftest_checks() -> list:
 
         def _recover_page(self, force_base=False):
             self.recoveries += 1
+
+        def _escalate_to_host(self, why):
+            self.escalations += 1
+            self.logs.append("escalate:" + why)
 
     wd = _WatchdogStub()
     ShellPage._hb_done(wd, 0)
@@ -2217,6 +2339,10 @@ def selftest_checks() -> list:
           two == 2 and three == 3 and wd.recoveries == 3,
           "%d / %d / %d" % (two, three, wd.recoveries))
     check("超出上限时写清原因", any("次数过多" in m for m in wd.logs))
+    # 2026-10-24：自动恢复用尽不能就此停手——升级为「重建 Web 视图」，
+    # 那是唯一能治"合成表面丢失"的手段（宿主自己会限流）。
+    check("恢复次数用尽后升级为重建视图", wd.escalations >= 1,
+          "%d 次" % wd.escalations)
 
     # --- 2026-10-21「点下载 session 没反应」---
     # QtWebEngine 对没人接的 `downloadRequested` **静默取消**，而前端

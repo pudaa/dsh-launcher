@@ -294,28 +294,13 @@ def _grab_window_bgra(hwnd: int):
         return b"", 0, 0
 
 
-def capture_window_top(hwnd: int, rows_frac: float = 0.06
-                       ) -> tuple[int, int, int] | None:
-    """截取窗口**客户区**顶部一条，统计主色调。截不到有效内容返回 None。
-
-    两段式判断（重要，别简化成一段）
-    -------------------------------
-      · **取色**只看顶部一条（要匹配的是界面顶部的观感）
-      · **空白判定**看整个客户区
-
-    为什么不能只拿顶部一条做空白判定：真实界面的顶部 6% 很可能本身
-    就是一条纯色工具栏——那是完全正常的，若据此判"没渲染"就会误杀，
-    标题栏永远上不了色。
+def _client_region(hwnd: int, w: int, h: int) -> tuple[int, int, int, int]:
+    """算客户区在整窗位图里的 (原点 x, 原点 y, 宽, 高)。
 
     客户区偏移用 GetClientRect + ClientToScreen 算，不猜：
     PrintWindow 给的是含标题栏与边框的整窗位图，直接裁顶部会取到
     系统标题栏的颜色（那就成了"标题栏跟随标题栏"，毫无意义）。
     """
-    data, w, h = _grab_window_bgra(hwnd)
-    if not data or w <= 0 or h <= 0:
-        return None
-
-    # 客户区在整窗位图中的原点
     try:
         user32 = ctypes.windll.user32
         crect = _RECT()
@@ -328,33 +313,60 @@ def capture_window_top(hwnd: int, rows_frac: float = 0.06
         oy = max(0, pt.y - wrect.top)
         cw = min(crect.right, w - ox)
         ch = min(crect.bottom, h - oy)
+        return ox, oy, cw, ch
     except Exception:                                          # noqa: BLE001
-        ox, oy, cw, ch = 0, 0, w, h
+        return 0, 0, w, h
 
+
+def _client_rgba_rows(data: bytes, w: int, ox: int, oy: int, cw: int, ch: int,
+                     y_from: int, n_rows: int, step: int = 1,
+                     x_off: int = 0, x_len: int = 0) -> bytes:
+    """取客户区 y_from 起的行，转成 RGB 连续缓冲（BGRA -> RGBA）。
+
+    step > 1 时按行抽样——空白判定不需要逐行，抽样足够且便宜得多。
+    x_off/x_len 限定横向区间（0 表示整宽）。
+    """
+    stride = w * 4                      # PrintWindow 按**窗口**宽给的步长
+    off = ox + (x_off or 0)
+    ln = x_len or cw
+    seg = bytearray()
+    for y in range(oy + y_from, min(oy + y_from + n_rows, oy + ch), step):
+        s = y * stride + off * 4
+        e = s + ln * 4
+        if e > len(data):
+            break
+        row = bytearray(data[s:e])
+        row[0::4], row[2::4] = row[2::4], row[0::4]          # BGRA -> RGBA
+        seg += row
+    return bytes(seg)
+
+
+
+def capture_window_top(hwnd: int, rows_frac: float = 0.06
+                       ) -> tuple[int, int, int] | None:
+    """截取窗口**客户区**顶部一条，统计主色调。截不到有效内容返回 None。
+
+    两段式判断（重要，别简化成一段）
+    -------------------------------
+      · **取色**只看顶部一条（要匹配的是界面顶部的观感）
+      · **空白判定**看整个客户区
+
+    为什么不能只拿顶部一条做空白判定：真实界面的顶部 6% 很可能本身
+    就是一条纯色工具栏——那是完全正常的，若据此判"没渲染"就会误杀，
+    标题栏永远上不了色。
+    """
+    data, w, h = _grab_window_bgra(hwnd)
+    if not data or w <= 0 or h <= 0:
+        return None
+
+    ox, oy, cw, ch = _client_region(hwnd, w, h)
     if cw < 8 or ch < 8:
         return None
 
-    stride = w * 4                      # PrintWindow 按**窗口**宽给的步长
-
     def _rgba_rows(y_from: int, n_rows: int, step: int = 1,
                    x_off: int = 0, x_len: int = 0) -> bytes:
-        """取客户区 y_from 起的行，转成 RGB 连续缓冲（BGRA -> RGBA）。
-
-        step > 1 时按行抽样——空白判定不需要逐行，抽样足够且便宜得多。
-        x_off/x_len 限定横向区间（0 表示整宽）。
-        """
-        off = ox + (x_off or 0)
-        ln = x_len or cw
-        seg = bytearray()
-        for y in range(oy + y_from, min(oy + y_from + n_rows, oy + ch), step):
-            s = y * stride + off * 4
-            e = s + ln * 4
-            if e > len(data):
-                break
-            row = bytearray(data[s:e])
-            row[0::4], row[2::4] = row[2::4], row[0::4]      # BGRA -> RGBA
-            seg += row
-        return bytes(seg)
+        return _client_rgba_rows(data, w, ox, oy, cw, ch,
+                                 y_from, n_rows, step, x_off, x_len)
 
     # --- 第一段：整个客户区是否"一片纯色"（= 没渲染出来）---
     # 按行抽样即可：逐行全转在 4K 下要搬 33MB，而"是否空白"只需有代表性

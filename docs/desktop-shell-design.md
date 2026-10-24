@@ -1618,6 +1618,10 @@ Qt 只提供了 `renderProcessTerminated(status, code)` 这个信号，用不用
 通知走托盘气泡（一次一句话），因为自动恢复本身已经完成了恢复，用户只需要
 知道"刚才为什么闪了一下"。
 
+> 2026-10-24 补充：`_recover_page()` 只能治"页面跑偏/渲染进程退出"这类失效；
+> 如果恢复次数用尽仍不行，会升级为**重建 Web 视图**（`_escalate_to_host`）。
+> 背景与"合成表面丢失"那个更隐蔽的失效见 §20。
+
 ### 18.3 内存：先分清"占了多少"和"是不是泄露"
 
 任务管理器里那一个数字会把三块混在一起，而且 **WorkingSet 会被系统裁剪**。
@@ -1729,3 +1733,120 @@ function downloadUrl(url, filename) {
 
 `_on_feature_permission` 现在把每次拒绝都写进 `host.log`（`权限被拒绝：Feature @ origin`）——
 这类"没反应"事后唯一能查的就是日志。
+## 20. Qt 6.11.2 的两个渲染缺陷（2026-10-24）
+
+用户报了两个现象：① 在插件配置弹窗里点开一个下拉框后页面"刷新"，只剩展开的
+下拉框，其余全没了；② 选中文本时闪退。查下来是**两个独立的 QtWebEngine 6.11.2
+缺陷**，都跟我们的业务代码无关，但都必须在桌面壳里处置。
+
+### 20.1 现场一：打开原生 `<select>` 弹层后网页"消失"
+
+用户截图（关键证据）：整窗是加载页的样式——白底、顶部一条 indeterminate 进度条、
+居中一行灰字；左下角还挂着原生 `<select>` 展开项。也就是说 Web 视图**一个像素
+都不再呈现**，把 StackAll 里垫在下面的加载页露了出来；弹层是独立的原生窗口，所以
+它还在。reload 无效，只有把窗口关到托盘再打开（= 合成表面重建）才恢复。
+
+探针（`build/probe_popup_*.py`，与产品同款 StackAll + 加载页层级）结论：
+
+| 条件 | 是否复现 |
+|---|---|
+| 页面经 **http** 加载（产品就是这样） | 复现（点开弹层后 ~0.6 s 内停帧） |
+| 页面用 `setHtml()`（data: URL） | **不复现** |
+| 加载页在 StackAll 里可见、且 indeterminate 进度条**在动画** | 复现 |
+| 加载页换成静止版 / 不放加载页 / 隐藏加载页 | 不复现 |
+| 打开弹层后 JS 心跳 | **正常**（DOM 活着，只是不画） |
+| `raise()` / `setCurrentIndex(1)` 重新叠放 | 无效 |
+| `view.update()`（或 `repaint()`） | **一次即恢复** |
+| 销毁并重建 `QWebEngineView` | 恢复（等价于关到托盘再开） |
+
+⇒ 触发条件是「**原生弹层 + 同窗口里有持续重绘的兄弟控件**」；停帧发生在弹层
+出现时，关闭弹层不会自己好。
+
+补充约束（第二组探针，build/probe-results/SUMMARY-task1.md）：
+
+- 触发概率约 **8–9/10**，不是每次必现——所以单次"没复现"不能当修复证据；
+- 触发面很窄：只有 **<select>** 的弹层窗口（顶层枚举里是 **QQuickWidget**，
+  win32 class 为 Qt6112QWindowPopupDropShadowSaveBits）；<datalist> 的
+  AutofillPopupWidget、纯 Qt QMenu 弹层都**不触发**；
+- 布局：single / StackOne 都正常，只有 **StackAll** 会把加载页透出来
+  （这正是用户看到"加载页还在"的原因）；
+- 修复不是一次性的：**每打开一次弹层都要补一帧**（第二次仍会坏），所以做成
+  事件驱动的 guard，而不是启动时补一次；
+- 恢复动作里 view.update() 单独就够；view.repaint() 也可以；
+  loading_page.hide() 也能"恢复"（但页面还是没在画，只是不再露出加载页，
+  属于掩耳盗铃）；raise() / 重新叠放 / 关闭弹层全部无效。
+
+**修法分三层**（每一层都有探针 A/B 证据）：
+
+1. **根因侧：视图露出来后停掉加载页动画**（`MainWindow._loading_busy(False)`）。
+   加载页在 StackAll 里永远 `show()` 着，`QProgressBar(range 0,0)` 的动画定时器
+   也就永远在跑——既白烧资源，又是这个缺陷的触发条件。视图盖上去之后把 range 定成
+   `0..1`、值 0；需要重新显示加载页（换来源 / 重启服务 / 重新准备环境）再开回来。
+2. **第一道防线：`dsh_devtools.PopupRepaintGuard`**。应用级事件过滤器盯住所有
+   `Qt::Popup` 顶层窗口的 Show / Hide / Close，出现时立刻、+60 ms、+260 ms 各给
+   主视图一次 `update()`。实测 delay=0 那一拍补一帧就能让停帧**根本不发生**。
+3. **兜底：重建视图**。自动恢复（`_may_recover`）用尽 → `_escalate_to_host()` →
+   `MainWindow._reset_webview()` 换掉整个 QWebEngineView（保留 profile/登录态，
+   限流 120 s/2 次）；手动「重新加载页面」也做成**连按第二次直接重建**——软重载
+   治不了合成表面丢失，重建一定治得了。
+
+两个 Qt 陷阱（都写进了回归断言）：
+
+- **`Qt::WindowType` 不是位标志**：`Popup` 的值本身含 `Window` 位（0x9），所以
+  `windowType() & Popup` 对**所有顶层窗口**都为真。必须
+  `(windowType() & WindowType_Mask) == Popup`。
+- **不能用 PrintWindow 测"网页还在不在画"**：`PrintWindow(PW_RENDERFULLCONTENT)`
+  会触发控件重绘（WM_PRINT），等于替我们补了一帧——用它测量会永远"正常"；更不能用
+  它做像素监护（实测正常页面也被读成整片同色）。要看用户看到的像素只能用**屏幕
+  BitBlt**。这也是最终没有上"像素级自动判白"的原因：判据不可靠时，误判比漏判更糟。
+
+### 20.2 现场二：选中文本闪退（`0xc0000005` @ Qt6WebEngineCore+0xd224d3）
+
+两次崩溃 dump（10-20 与 10-24）**逐帧相同、同一份 Qt DLL**：
+
+- 异常：`0xc0000005`，`ExceptionInformation=[0,0]` → **READ @ 0x0**；
+- 线程：`Chrome_InProcGpuThread`（dump 的 ThreadNamesStream 直读）；
+- 位置：`Qt6WebEngineCore.dll+0xd224d3`，`mov rax,[rdi+8]` 取到 NULL 后 `mov rdx,[rax]`；
+- 归属：崩溃函数调用者内嵌 `angle::TrimCache` / `input layout` / `TEXCOORD` 字符串；
+- 真栈（自研 `.pdata` unwind，38 帧）：`Skia Ganesh flush → GrOp 执行 →
+  gl::ProgramPipeline::resolveLink → ANGLE input-layout LRU 缓存 → NULL`。
+
+**上游没有修复**：相关 QTBUG（151080/147154/144259 等）`fixVersions` 全空；
+PySide6 6.12.0 的 WebEngine 仍是 Chromium 140.0.7339.225，崩溃点周围 96 字节机器码
+**逐字节相同**（RVA 只是平移）。⇒ 换 Qt 版本不是修复。
+
+**处置：默认不关 GPU，只在"上次崩过"时自动降级一次。**
+
+第一版曾直接默认 `--disable-gpu`，理由是"让崩溃路径根本不执行"。但这个取舍不对：
+崩溃是**罕见**的（两次都发生在数小时长会话里），而软件渲染的代价是**全体用户、
+全部时间**的性能——同一份 DSH 类页面（200 行列表 + 600×120 canvas）实测 rAF
+**59.6 → 26.6 fps**。硬件加速本来也是 QtWebEngine 的默认，一刀切关掉等于用常态
+性能损失给偶发崩溃买单。
+
+改成"崩溃哨兵 + 一次性兼容模式"：
+
+- 启动时写 `%LOCALAPPDATA%\DSH-Web\webengine-state.json`，**正常退出时删除**；
+- 下次启动若这个文件还在、且时间在 `CRASH_FALLBACK_WINDOW_S`（12 小时）内，
+  说明上次进程没走正常退出路径（原生崩溃/被杀）→ 本次自动加 `--disable-gpu`，
+  托盘气泡提示一句，并指向控制面板；
+- 判定逻辑抽成纯函数 `_decide_hw_accel(pref, marker, now)`：用户显式关掉
+  （`webengine_hw_accel=false` / 面板开关）时永远软件渲染；环境变量
+  `DSH_WEBENGINE_HW_ACCEL` 优先（排障用）；
+- 本次降级运行若正常退出，哨兵删除 → 下次恢复硬件加速；连续崩才会连续降级。
+
+**flags 必须在任何 PySide6 导入之前设置**（Chromium 只读一次；哨兵读取也在这一拍），
+启动时把实际 flags、硬件加速状态与降级原因写一行到 `host.log`，方便下回排障不用猜。
+验收标准是「连续多日不再出现 `0xd224d3`」，而不是一次启动正常。
+
+> 注意：`--disable-gpu` 不是"弹层停帧"的修复——第二组探针里几个 flag 都没能让它
+> 不复现（flag 是否真正生效存疑）。那个问题由 §20.1 的"停动画 + 补帧"解决。
+
+### 20.3 回归与留档
+
+- `tools/gui_selftest.py`：弹层补帧、加载页动画停/恢复、默认硬件加速、崩溃哨兵
+  纯逻辑（无标记/新标记/陈旧标记/显式关闭）、flags 在 PySide6 之前、面板开关、
+  恢复用尽升级重建、手动连按重建；
+  以及 AST 断言"不再调用不存在的 `QWebEnginePage.reload()`"。
+- `dsh_devtools.selftest_checks()`：watchdog 限流 + 用尽后升级重建。
+- 探针与截图留在 `build/probe_popup_*.py` / `build/probe-results/`（不随产品发布），
+  崩溃分析在 `build/probe-results/crash/report.md`。

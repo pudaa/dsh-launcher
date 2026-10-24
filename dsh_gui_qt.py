@@ -15,6 +15,7 @@
 - 停止服务以自己记录的 PID 为准，端口反查仅作兜底
 - 更新只走官方 npm 通道；「加入预览计划」为显式 opt-in，且可一键回归稳定版
 """
+import json
 import os
 import sys
 import time
@@ -51,11 +52,104 @@ def _system_ui_language() -> str:
 # 必须在**任何 PySide6 导入之前**设置：Chromium 在 QtWebEngine 初始化时
 # 一次性读取这组 flags，之后再改就来不及了。
 _UI_LANG = _system_ui_language()
-if _UI_LANG:
-    _flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
-    if "--lang=" not in _flags:
-        os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
-            _flags + " --lang=" + _UI_LANG).strip()
+
+#: 上次运行"没正常退出"的判定窗口（秒）。太小会漏（用户隔天才重开），
+#: 太大会误伤（任务管理器杀进程后长期降级）。12 小时覆盖常见的"崩溃→重开"。
+CRASH_FALLBACK_WINDOW_S = 12 * 3600
+
+
+def _read_webengine_marker():
+    """读崩溃哨兵。文件不在/损坏都当"上次正常退出"。"""
+    try:
+        from dsh_host import config as _c
+        with open(_c.webengine_state_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _write_webengine_marker(hw_accel: bool) -> None:
+    """启动时写下哨兵：正常退出会删掉它，所以下次还能看到它就是崩溃过。"""
+    try:
+        from dsh_host import config as _c
+        with open(_c.webengine_state_path(), "w", encoding="utf-8") as f:
+            json.dump({"started_at": time.time(), "pid": os.getpid(),
+                       "hw_accel": bool(hw_accel)}, f)
+    except OSError:
+        pass
+
+
+def _clear_webengine_marker() -> None:
+    try:
+        from dsh_host import config as _c
+        os.remove(_c.webengine_state_path())
+    except OSError:
+        pass
+
+
+def _crash_marker_recent(marker, now: float) -> bool:
+    try:
+        started = float((marker or {}).get("started_at"))
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return 0 < (now - started) <= CRASH_FALLBACK_WINDOW_S
+
+
+def _decide_hw_accel(pref: bool, marker, now: float) -> tuple[bool, str]:
+    """纯逻辑：用户偏好 + 上次是否异常退出 → (本次是否硬件加速, 降级原因)。
+
+    为什么不默认关 GPU（2026-10-24 的取舍）：
+      Qt 6.11.2 的 GPU 线程确实有一个确定性空指针崩溃（+0xd224d3，上游无修复、
+      6.12.0 同机器码），但它是**罕见**的（两次都在长会话里）。拿全体用户、
+      全部时间的性能（rAF 59.6→26.6 fps）去兜一个罕见崩溃，比例不对。
+      所以：默认硬件加速（跟随惯例）；只有**上一次运行真的没正常退出**时，
+      本次启动自动降级为软件渲染（一次性兼容模式），并在面板留手动开关。
+    """
+    if not pref:
+        return False, "用户设置：软件渲染"
+    if _crash_marker_recent(marker, now):
+        return False, ("上次运行未正常退出（疑似 GPU 崩溃），"
+                       "本次自动降级为软件渲染")
+    return True, ""
+
+
+def _hw_accel_enabled() -> bool:
+    """本次是否走 GPU 渲染。环境变量优先（排障用），否则用导入时的结论。"""
+    env = os.environ.get("DSH_WEBENGINE_HW_ACCEL")
+    if env is not None:
+        return env.strip().lower() in ("1", "true", "yes", "on")
+    return bool(_HW_ACCEL)
+
+
+#: 本次启动为什么降级成软件渲染（空串 = 正常硬件加速）
+_SAFE_MODE_REASON = ""
+_HW_ACCEL = True
+# 模块导入时就要定 flags（Chromium 只读一次），所以这里先读配置 + 崩溃哨兵。
+try:
+    from dsh_host import config as _early_cfg
+    _HW_ACCEL, _SAFE_MODE_REASON = _decide_hw_accel(
+        bool(_early_cfg.get("webengine_hw_accel", True)),
+        _read_webengine_marker(), time.time())
+except Exception:                                          # noqa: BLE001
+    _HW_ACCEL, _SAFE_MODE_REASON = True, ""
+
+_flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+if _UI_LANG and "--lang=" not in _flags:
+    _flags = (_flags + " --lang=" + _UI_LANG).strip()
+if not _hw_accel_enabled() and "--disable-gpu" not in _flags:
+    _flags = (_flags + " --disable-gpu").strip()
+if _flags:
+    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = _flags
+    try:
+        from dsh_host import config as _flag_log_config
+        _why = ("；" + _SAFE_MODE_REASON) if _SAFE_MODE_REASON else ""
+        with open(_flag_log_config.host_log(), "a", encoding="utf-8") as _f:
+            _f.write("%s  WebEngine flags: %s（硬件加速=%s%s）\n"
+                     % (time.strftime("%Y-%m-%d %H:%M:%S"), _flags,
+                        "开" if _hw_accel_enabled() else "关", _why))
+    except Exception:                                      # noqa: BLE001
+        pass
 
 from PySide6.QtCore import (QCoreApplication, QEvent, QStandardPaths, Qt,
                             QThread, Signal, QTimer, QUrl)
@@ -1418,6 +1512,17 @@ MEM_LOG_MAX_BYTES = 2 * 1024 * 1024
 #: **只提示，不自动重载**——自动重载会打断正在跑的对话，代价比省内存大。
 MEM_WEB_WARN_MB = 1200
 
+#: 手动「重新加载页面」连按判定窗口（秒）。窗口内第二次按 = 重建视图：
+#: 软重载治不了"合成表面丢失"（2026-10-24 实测），重建一定治得了。
+MANUAL_RESET_WINDOW_S = 20
+
+#: 页面重建（换掉整个 QWebEngineView）的防循环窗口与次数。
+#: 2026-10-24 现场：页面 DOM 活着但合成表面丢失，reload 无效，只有换视图
+#: 才能恢复。但"重建→还是坏→再重建"会变成每 30 秒重载一次页面，所以给
+#: 上限：窗口内超过次数就停止，明确告知用户重启应用。
+SURFACE_RESET_WINDOW_S = 120
+SURFACE_RESET_LIMIT = 2
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -1449,6 +1554,9 @@ class MainWindow(QMainWindow):
         self._last_titlebar_rgb = None    # 上次上色用的界面色，用于变更比对
         self._mem_timer = None            # 内存采样定时器（每分钟一行日志）
         self._data_worker = None          # 数据目录重活的当前 worker
+        self._surface_resets: list[float] = []   # 视图重建时间戳（防循环）
+        self._reset_pending = False       # 已排队的重建请求（去重）
+        self._manual_reloads: list[float] = []   # 手动重载时间戳（连按判定）
 
         self.stack = QStackedWidget()
         # 关键：**StackAll** —— 所有页都参与排版、且都保持 show 状态，
@@ -1483,6 +1591,14 @@ class MainWindow(QMainWindow):
         # 盯住它，比结尾白 2 秒好得多。（2026-10-20，对照官方桌面端后的优化）
         QTimer.singleShot(80, self._ensure_webview)
         self._build_tray()
+        # 原生弹层（<select> 等）出现/关闭时给 Web 视图补一帧。
+        # 2026-10-24 实测：QtWebEngine 6.11 打开原生弹层后主视图会停帧（透明），
+        # 而 view.update() 一次就恢复——比"重建视图"轻得多，放在第一道防线。
+        self._popup_guard = dsh_devtools.PopupRepaintGuard(
+            lambda: self.view, self)
+        if _SAFE_MODE_REASON:
+            host_log("兼容渲染：" + _SAFE_MODE_REASON)
+            QTimer.singleShot(2500, self, self._notify_safe_mode)
 
         self.starter = None
         self._launch_startup()
@@ -1519,6 +1635,11 @@ class MainWindow(QMainWindow):
         bar.setRange(0, 0)
         bar.setTextVisible(False)
         bar.setFixedHeight(3)
+        # 必须留引用：加载页在 StackAll 里**一直可见**，indeterminate 进度条的
+        # 动画定时器也会一直跑。2026-10-24 实测这不只是白烧 CPU——它还是
+        # 「打开原生 <select> 弹层后 Web 视图停止呈现」的触发条件（把加载页
+        # 换成静止版就不复现）。所以 Web 视图露出来之后必须把它停下来。
+        self.progress = bar
         self.tip = QLabel("正在启动 DSH 服务…")
         self.tip.setObjectName("loadingTip")
         self.tip.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1534,6 +1655,30 @@ class MainWindow(QMainWindow):
 
     def _set_tip(self, text: str):
         self.tip.setText(text)
+
+    def _loading_busy(self, busy: bool) -> None:
+        """加载页动画的开关。
+
+        StackAll 下加载页始终处于 show 状态，所以 indeterminate 进度条
+        （range 0..0）的动画**会一直跑**，即使 Web 视图早就盖在它上面。
+        两个后果：
+          1. 白烧一个定时器（项目纪律：没在用就不占资源）；
+          2. 2026-10-24 实测：这个持续重绘是「打开原生弹层后 Web 视图停止
+             呈现」的触发条件——把加载页换成静止版就复现不出来。
+        所以视图露出来后调 busy=False（定成静止的 0/1 空条），需要再显示
+        加载页时（换来源/重启服务/重新准备环境）调 busy=True 恢复动画。
+        """
+        bar = getattr(self, "progress", None)
+        if bar is None:
+            return
+        try:
+            if busy:
+                bar.setRange(0, 0)
+            else:
+                bar.setRange(0, 1)
+                bar.setValue(0)
+        except RuntimeError:
+            pass
 
     def _ensure_webview(self):
         if self.view is not None:
@@ -1576,6 +1721,8 @@ class MainWindow(QMainWindow):
             view=self.view,
             capture_console=dev_on,
             notify=self._page_notify,
+            # 最后一级恢复：换掉整个 Web 视图（只有界面层能做到）
+            hard_recover=self._reset_webview,
         )
         self.view.setPage(self.page)
         # 右键交还给网页自己处理。
@@ -1594,6 +1741,7 @@ class MainWindow(QMainWindow):
         # 用户会先看到 Web 视图自己的白色/空白底面。
         if self.loading_page is not None:
             self.stack.setCurrentWidget(self.loading_page)
+            self._loading_busy(True)
 
     # ----------------------------------------------------------- 标题栏自适应
 
@@ -1990,7 +2138,7 @@ class MainWindow(QMainWindow):
         self.view.loadFinished.connect(self._on_view_loaded,
                                        Qt.ConnectionType.UniqueConnection)
         self.view.load(QUrl(handle.url))
-        QTimer.singleShot(15000, lambda: self.stack.setCurrentIndex(1))
+        QTimer.singleShot(15000, self, self._force_reveal)
         self._refresh_menu()
         # 版本复验放到后台：启动路径采信了缓存里的版本号，这里补一次真实核对。
         # 对不上（用户在壳之外装了别的版本）时更新显示并提示，但不挡首屏。
@@ -2057,7 +2205,7 @@ class MainWindow(QMainWindow):
             if str(value).strip() == "1" or tries >= 12:      # 12 × 150ms ≈ 1.8s
                 # StackAll 下这一步只是把 Web 视图 raise 到最上层，
                 # 不改变任何一页的可见性/尺寸，所以不会触发重新排版。
-                self.stack.setCurrentIndex(1)
+                self._show_webpage()
             else:
                 QTimer.singleShot(
                     150, lambda: self._reveal_when_rendered(tries + 1))
@@ -2065,7 +2213,16 @@ class MainWindow(QMainWindow):
         try:
             self.page.runJavaScript(self.JS_RENDERED, decided)
         except Exception:                                      # noqa: BLE001
-            self.stack.setCurrentIndex(1)
+            self._show_webpage()
+
+    def _show_webpage(self) -> None:
+        """把 Web 视图露出来，并把加载页的动画停掉（见 _loading_busy）。"""
+        self.stack.setCurrentIndex(1)
+        self._loading_busy(False)
+
+    def _force_reveal(self) -> None:
+        """兜底：等不到前端首绘也切过去——宁可看到白，也不能永远卡加载页。"""
+        self._show_webpage()
 
     # ---------------------------------------------------- 主题跟踪（低频）
     #
@@ -2171,6 +2328,7 @@ class MainWindow(QMainWindow):
             self.act_setup.setEnabled(False)
             self._set_tip("环境已就绪，正在启动…")
             self.stack.setCurrentIndex(0)
+            self._loading_busy(True)
             self._launch_startup()
         else:
             self._set_tip("运行环境尚未就绪。可从托盘菜单「准备运行环境」重试。")
@@ -2180,6 +2338,7 @@ class MainWindow(QMainWindow):
 
     def _prepare_env(self):
         self.stack.setCurrentIndex(0)
+        self._loading_busy(True)
         self._set_tip("正在检查运行环境…")
         self._launch_startup()
 
@@ -2523,6 +2682,19 @@ class MainWindow(QMainWindow):
         else:
             self._info("服务还没就绪，暂时没有可打开的地址。")
 
+    def _notify_safe_mode(self) -> None:
+        """上次异常退出导致本次降级软件渲染：告诉用户一声 + 怎么改回来。"""
+        tray = getattr(self, "tray", None)
+        if tray is not None and tray.isVisible():
+            try:
+                tray.showMessage(
+                    "DSH",
+                    "上次运行异常退出，本次已自动切换到软件渲染（兼容模式）。\n"
+                    "可在控制面板「常规」页改回硬件加速。",
+                    QSystemTrayIcon.MessageIcon.Information, 8000)
+            except Exception:                                  # noqa: BLE001
+                pass
+
     def _page_notify(self, msg: str) -> None:
         """页面监护（渲染进程退出/白屏自动恢复）给用户的一句话。
 
@@ -2761,6 +2933,7 @@ class MainWindow(QMainWindow):
             "prerelease_opt_in": bool(config.get("prerelease_opt_in")),
             "adaptive_titlebar": bool(config.get("adaptive_titlebar")),
             "dev_mode": bool(config.get("dev_mode")),
+            "webengine_hw_accel": bool(config.get("webengine_hw_accel")),
         }.get(name, False)
 
     def _panel_set_flag(self, name: str, value: bool) -> None:
@@ -2770,6 +2943,83 @@ class MainWindow(QMainWindow):
             self._toggle_titlebar(bool(value))
         elif name == "dev_mode":
             self._toggle_dev_mode(bool(value))
+        elif name == "webengine_hw_accel":
+            # Chromium 只读一次 flags（在任何 PySide6 导入之前），所以只能
+            # 落盘 + 提示重启，运行中切换没有意义。
+            config.set(webengine_hw_accel=bool(value))
+            host_log("硬件加速渲染 → %s（重启应用后生效）"
+                     % ("开" if value else "关"))
+
+    # ---------------------------------------------------- 页面重建（自愈）
+
+    def _reset_webview(self, manual: bool = False) -> None:
+        """换掉整个 Web 视图（ShellPage 兜底请求，或用户连按"重新加载"）。
+
+        必须**异步**：ShellPage 的调用点就在那个页对象的定时器槽里，同步
+        把它 deleteLater + 跑 DeferredDelete 等于在自己的调用栈上删自己。
+        排到下一轮事件循环再换。
+        """
+        if self._reset_pending:
+            return
+        self._reset_pending = True
+        QTimer.singleShot(0, self, lambda: self._reset_webview_now(manual))
+
+    def _reset_webview_now(self, manual: bool = False) -> None:
+        """销毁并重建 QWebEngineView / ShellPage，保留 profile 与登录态。
+
+        适用场景（2026-10-24 用户现场）：页面 DOM 正常、JS 心跳正常，但
+        Web 视图不再呈现任何帧——整窗透出下面垫着的加载页，原生 select
+        弹层还残留着；reload 无效，用户把窗口关到托盘再打开才恢复。
+        进程内等价手段就是换一个视图（= 新合成表面），再载回入口地址。
+        """
+        self._reset_pending = False
+        if self.handle is None or self.view is None:
+            return
+        now = time.monotonic()
+        self._surface_resets = [t for t in self._surface_resets
+                                if now - t < SURFACE_RESET_WINDOW_S]
+        # 用户主动连按"重新加载"不受自动重建的限流约束——那是明确意图，
+        # 而且 rate limit 的本意只是防自动循环。
+        if not manual and len(self._surface_resets) >= SURFACE_RESET_LIMIT:
+            # 同一轮异常里别每 45 秒弹一次托盘气泡
+            if now - getattr(self, "_reset_blocked_at", 0.0) > 600:
+                self._reset_blocked_at = now
+                host_log("页面重建：%d 秒内已重建 %d 次，停止自动重建"
+                         % (SURFACE_RESET_WINDOW_S, SURFACE_RESET_LIMIT))
+                self._page_notify("页面渲染持续异常，已暂停自动重建。请重启应用。")
+            return
+        self._surface_resets.append(now)
+        host_log("页面重建：销毁并重建 Web 视图（保留 profile 与登录态）")
+        old = self.view
+        self.view = None
+        self.page = None
+        # 这两个窗口缓存着旧 page，不关掉它们会握着已删对象
+        if getattr(self, "_devwin", None) is not None:
+            self._devwin.close()
+            self._devwin.deleteLater()
+            self._devwin = None
+        if getattr(self, "_inspector", None) is not None:
+            self._inspector.close()
+            self._inspector = None
+        if old is not None:
+            try:
+                self.stack.removeWidget(old)
+                old.deleteLater()
+            except RuntimeError:
+                pass
+        # 让旧视图/旧页面的延迟删除真正执行，别让旧合成表面继续挂着
+        QApplication.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        try:
+            self._ensure_webview()
+            if self.handle is not None and self.view is not None:
+                self.view.loadFinished.connect(
+                    self._on_view_loaded,
+                    Qt.ConnectionType.UniqueConnection)
+                self.view.load(QUrl(self.handle.url))
+        except Exception as e:                                 # noqa: BLE001
+            host_log("页面重建失败：%s: %s" % (type(e).__name__, e))
+            self._page_notify("页面重建失败：%s" % e)
 
     # ---------------------------------------------------- 运行方式与数据目录
 
@@ -2817,6 +3067,7 @@ class MainWindow(QMainWindow):
             return
         self._swapping = True
         self.stack.setCurrentIndex(0)
+        self._loading_busy(True)
         self._set_tip("正在按新配置重启服务…")
         w = ServiceSwapWorker(self.handle, config.service_log())
         self._swap_worker = w
@@ -3026,11 +3277,29 @@ class MainWindow(QMainWindow):
             self._info("服务还没就绪，稍等一下再试。")
             return
         try:
+            now = time.monotonic()
+            self._manual_reloads = [t for t in self._manual_reloads
+                                    if now - t < MANUAL_RESET_WINDOW_S]
+            if self._manual_reloads:
+                # 第二次按：软重载试过了还是不行，直接换视图（一定有效）
+                host_log("手动重新加载：%d 秒内再次触发，改为重建 Web 视图"
+                         % MANUAL_RESET_WINDOW_S)
+                self._reset_webview(manual=True)
+                return
+            self._manual_reloads.append(now)
             self._ensure_webview()
             self.view.load(QUrl(self.handle.url))
-            self.stack.setCurrentIndex(1)
+            self._show_webpage()
             host_log("手动重新加载页面：%s"
                      % str(self.handle.url).split("token=")[0])
+            # 2026-10-24：用户点"重新加载"往往就是因为页面已经白了。原生弹层
+            # 造成的停帧 update() 一次就恢复（实测），先轻后重。
+            try:
+                self.view.update()
+                QTimer.singleShot(300, self.view, self.view.repaint)
+                QTimer.singleShot(1200, self.view, self.view.update)
+            except RuntimeError:
+                pass
         except Exception as e:                                 # noqa: BLE001
             host_log("重新加载失败：%s: %s" % (type(e).__name__, e))
 
@@ -3054,6 +3323,7 @@ class MainWindow(QMainWindow):
         真需要常驻服务的人本来就会用命令行。
         """
         host_log("用户退出，连带停止后台服务")
+        _clear_webengine_marker()
         # 先收尾面板的后台线程。线程在解释器退出时还活着会让 Qt 直接 abort，
         # 而 abort 会丢掉未刷出的日志缓冲——那会让"退出"变成一件莫名其妙的事。
         panel = getattr(self, "_panel", None)
@@ -3180,6 +3450,13 @@ def main() -> int:
         return 0
 
     QLocalServer.removeServer(SINGLETON_ID)
+
+    # 崩溃哨兵（2026-10-24）：启动即写、正常退出再删。下次启动如果还能读到
+    # 它（且在 CRASH_FALLBACK_WINDOW_S 内），说明上次进程没走正常退出路径
+    # （原生崩溃/被杀），本次自动降级为软件渲染一次——见 _decide_hw_accel。
+    _write_webengine_marker(_hw_accel_enabled())
+    import atexit
+    atexit.register(_clear_webengine_marker)
 
     # 全局图标先跟系统主题；MainWindow 取到界面色后会再切一次
     _ic = icon_for(dwm.system_uses_dark())

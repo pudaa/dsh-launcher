@@ -150,6 +150,16 @@ def profile_dir() -> str:
     return d
 
 
+def webengine_state_path() -> str:
+    """上一次运行是否正常退出的哨兵文件（崩溃后的自动降级用）。
+
+    启动时写入、正常退出时删除：下次启动若看到它还**在**（且时间足够新），
+    说明上次进程没走正常退出路径（原生崩溃/被杀），于是本次自动改用软件渲染。
+    放在数据根而不是 DSH_HOME——它属于桌面壳自己的运行状态。
+    """
+    return os.path.join(data_root(), "webengine-state.json")
+
+
 def node_global_dir() -> str:
     """我们私有管理的 DSH 安装位置（首次运行引导装到这里）。
 
@@ -196,6 +206,14 @@ DEFAULTS: dict = {
     # 降低取到的主色饱和度（0=原色，1=全灰）。太饱和会抢视线。
     # 注意是"降饱和"不是"往深灰拉"——后者会把纯白拉成灰色。
     "titlebar_mute": 0.35,
+    # 硬件加速渲染（QtWebEngine 的 GPU 路径）。**默认 True（跟随惯例）**。
+    # 2026-10-24：Qt 6.11.2 的 WebEngine 在 in-process GPU 线程有一个确定性空指针
+    # 崩溃（Qt6WebEngineCore+0xd224d3，两次 dump 同源、上游无修复、6.12.0 同机器码）。
+    # 不做"默认全局关 GPU"——那会拿全体用户的性能为罕见崩溃买单；改成：
+    # 上一次运行**非正常退出**时，本次启动自动降级为软件渲染（见 dsh_gui_qt
+    # 的 _decide_hw_accel / webengine-state.json），用户也可在这里显式设 False
+    # 强制软件渲染。改动**重启生效**（Chromium 只读一次 flags）。
+    "webengine_hw_accel": True,
     # 主题跟踪间隔（毫秒）。0 = 关闭跟踪（只在启动时取一次色）。
     # 跟踪只做"读计算样式"这一轻量动作，不做截图，且**只在颜色真的变了**
     # 才动 DWM；窗口最小化时直接跳过。默认 8 秒是一次性设计权衡。
