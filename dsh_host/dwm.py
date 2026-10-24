@@ -140,6 +140,11 @@ def set_caption_color(widget, rgb: tuple[int, int, int]) -> bool:
 
 
 def set_border_color(widget, rgb: tuple[int, int, int]) -> bool:
+    """设置窗口最外圈那 1px 边框的颜色。
+
+    传什么颜色就画什么颜色，DWM 不做任何调和。**不要直接传标题栏底色**，
+    亮色主题下那等于把边框画成隐形（详见 `border_shade`）。
+    """
     r, g, b = rgb
     return _set_attr(_hwnd(widget), DWMWA_BORDER_COLOR, (b << 16) | (g << 8) | r)
 
@@ -746,3 +751,48 @@ def desaturate(rgb: tuple[int, int, int], ratio: float) -> tuple[int, int, int]:
     g = luminance(rgb)
     grey = (int(round(g)),) * 3
     return blend(rgb, grey, ratio)
+
+
+# ---------------------------------------------------------------- 边框色
+#
+# 边框和标题栏是**两个独立属性**，DWM 不做联动（2026-10-24 实测，build 26100，
+# 探针 build/probe_border_color.py）：只设 DWMWA_CAPTION_COLOR 时，边框像素
+# 纹丝不动，还是系统默认的 #C8C8C8。所以「纯白边框」是本项目自己画上去的
+# （旧代码 `set_border_color(widget, bg)`），不是系统行为，也就不必迁就它。
+
+#: 边框相对标题栏底色的「同族偏移」强度（方向见 `border_shade`）。
+#:
+#: 取值依据（build/probe_border_strength.py 实测，1px 线对背景的 WCAG 对比度）：
+#:   亮色 白底：12% → 1.32 ｜ 18% → 1.53 ｜ 22% → 1.69 ｜ 系统默认 → 1.84
+#:   深色 #1B1B1D 底：12% → 1.76 ｜ 18% → 2.13 ｜ 22% → 2.45 ｜ 系统默认 → 9.35
+#: 22% 在亮色下最接近系统默认的观感，深色下又不发亮，故取 22%。
+BORDER_TINT_RATIO = 0.22
+
+
+def border_shade(bg: tuple[int, int, int],
+                 ratio: float = BORDER_TINT_RATIO) -> tuple[int, int, int]:
+    """由标题栏底色推一个「同族但看得见」的边框色。
+
+    为什么要定向，而不是一律压暗
+    ----------------------------
+    边框靠"与背后那个面"的色差被看见，不是靠"比标题栏深"。
+    深色标题栏一律压暗，等于朝深色桌面靠拢：`#242A38` 压暗 12% 得
+    `#202531`，与 `#1B1B1D` 的桌面几乎同色（对比度 1.20）—— 越修越看不见。
+    所以方向必须由亮度决定：**亮底压暗、暗底提亮**。
+
+    为什么不用 DWMWA_COLOR_DEFAULT（干脆交还系统）
+    ---------------------------------------------
+    两个理由，都是实测/文档里明写的：
+      1. 系统默认边框的颜色跟随**系统**应用主题，不跟窗口自己的暗色模式。
+         实测深色标题栏下它照样画 #C8C8C8，对深底对比度 9.35，像一圈发光
+         的描边，比"看不见"更难看。
+      2. 它是一抹中性灰，彩色标题栏旁边就是当初要躲的「异色线」。
+         同族偏移则始终与标题栏同一色相，只是明度差一点。
+
+    附带说明：换成显式颜色后，DWM 不再按窗口激活状态自动换边框色
+    （官方文档写明 border color 的 state 变化由 app 自己负责）。
+    本项目的标题栏底色本身就跟着界面走、不区分激活态，保持一致即可。
+    """
+    ratio = max(0.0, min(1.0, ratio))
+    far = (0, 0, 0) if luminance(bg) >= 128 else (255, 255, 255)
+    return blend(bg, far, ratio)

@@ -807,6 +807,60 @@ def titlebar_checks() -> list[str]:
     if not ok:
         failures.append("desaturate 边界")
 
+    # 6c-2. **边框色必须同族但不隐形**（2026-10-24，老大反馈亮色下边框纯白）
+    #       旧实现 set_border_color(self, bg)：界面白 → 边框白 → 盖在纯白应用上
+    #       完全看不出边界（对比度 1.00）。修法是亮底压暗、暗底提亮。
+    WHITE_BG, DARK_BG2 = (255, 255, 255), (36, 42, 56)
+    w_edge = dwm.border_shade(WHITE_BG)
+    d_edge = dwm.border_shade(DARK_BG2)
+    # 方向：亮底必须更暗，暗底必须更亮
+    ok_dir = (dwm.luminance(w_edge) < dwm.luminance(WHITE_BG) - 10
+              and dwm.luminance(d_edge) > dwm.luminance(DARK_BG2) + 10)
+    print(f"  [{'OK  ' if ok_dir else 'FAIL'}] 边框定向正确（亮底压暗 / 暗底提亮）")
+    if not ok_dir:
+        failures.append("边框定向")
+        print(f"        白底 -> {dwm.to_hex(w_edge)}（应更暗）；"
+              f"深底 -> {dwm.to_hex(d_edge)}（应更亮）")
+
+    # 可见性：亮底对纯白、深底对深色桌面都要超过阈值
+    #   实测基准（build/probe_border_strength.png）：白底 12%=1.32 / 22%=1.69 /
+    #   系统默认 1.84；深底(#1B1B1D) 12%=1.76 / 22%=2.45 / 系统默认 9.35
+    w_cr = dwm.contrast_ratio(w_edge, WHITE_BG)
+    d_cr = dwm.contrast_ratio(d_edge, (0x1B, 0x1B, 0x1D))
+    ok_vis = w_cr >= 1.45 and d_cr >= 1.9
+    print(f"  [{'OK  ' if ok_vis else 'FAIL'}] 边框在明暗两种底色上都看得见"
+          f"（白底 {w_cr:.2f} / 深底 {d_cr:.2f}）")
+    if not ok_vis:
+        failures.append("边框可见性")
+        print(f"        白底 {dwm.to_hex(w_edge)} 对比度 {w_cr:.2f}（需 >=1.45）；"
+              f"深底 {dwm.to_hex(d_edge)} 对比度 {d_cr:.2f}（需 >=1.9）")
+
+    # 同族：边框与底色的色相不能跑偏（通道顺序不变、饱和度不突变）
+    ok_fam = (dwm.saturation(d_edge) <= dwm.saturation(DARK_BG2) + 0.08)
+    print(f"  [{'OK  ' if ok_fam else 'FAIL'}] 边框仍是同族色（不引入异色相）")
+    if not ok_fam:
+        failures.append("边框异色")
+        print(f"        深底 {dwm.to_hex(DARK_BG2)} -> 边框 {dwm.to_hex(d_edge)}")
+
+    # 比例边界
+    ok_r = (dwm.border_shade((200, 200, 200), 0) == (200, 200, 200)
+            and dwm.border_shade((200, 200, 200), -1) == (200, 200, 200)
+            and dwm.border_shade((200, 200, 200), 5) == (0, 0, 0))
+    print(f"  [{'OK  ' if ok_r else 'FAIL'}] 边框偏移比例越界被 clamp")
+    if not ok_r:
+        failures.append("边框比例 clamp")
+
+    # 回归钉子：_apply_titlebar 不许再把底色直接当边框色
+    import inspect as _insp
+    _tb_src = _insp.getsource(g.MainWindow._apply_titlebar)
+    _flat = _tb_src.replace(" ", "")
+    ok_src = "border_shade" in _tb_src and "set_border_color(self,bg)" not in _flat
+    print(f"  [{'OK  ' if ok_src else 'FAIL'}] 上色时边框走 border_shade"
+          f"（不再直接等于标题栏底色）")
+    if not ok_src:
+        failures.append("边框回归")
+        print("        仍在用 set_border_color(self, bg)，亮色下边框会隐形")
+
     # 6d. 主题跟踪：间隔配置与变更容差
     watch_ms = config.DEFAULTS.get("theme_watch_ms")
     ok = isinstance(watch_ms, int) and watch_ms >= 0

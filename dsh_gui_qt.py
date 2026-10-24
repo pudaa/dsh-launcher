@@ -1748,10 +1748,19 @@ class MainWindow(QMainWindow):
     def _apply_titlebar(self, rgb):
         """把取到的主色上到标题栏。
 
-        三个必须一起设的属性，少一个就会出现违和的细节：
+        四个属性一起设，少一个就会出现违和的细节：
           CAPTION_COLOR  底色
           TEXT_COLOR     标题文字色——不设的话浅底上会白字（读不了）
+          BORDER_COLOR   最外圈 1px 边框，见下面「边框」一节
           DARK_MODE      影响系统绘制的关闭按钮/边框高光
+
+        边框**不能直接给底色**（2026-10-24 修）
+        --------------------------------------
+        早先是把标题栏底色原样传给边框，想让边框和标题栏融为一体。
+        但界面本身是白的，取色结果就是 `#ffffff`，边框跟着变纯白 —— 盖在
+        另一个纯白应用上时窗口边界彻底消失（实测对比度 1.00，即完全同色）。
+        改成走 `dwm.border_shade()`：同族、只差一点明度，亮底压暗、暗底提亮。
+        依据与实测数据见该函数的 docstring。
         """
         if not dwm.available() or rgb is None:
             return
@@ -1762,11 +1771,12 @@ class MainWindow(QMainWindow):
         bg = dwm.desaturate(rgb, mute) if mute else rgb
         fg = dwm.contrast_text(bg)
         dark = dwm.is_dark(bg)
+        edge = dwm.border_shade(bg)
         self._last_titlebar_rgb = rgb
 
         ok = dwm.set_caption_color(self, bg)
         dwm.set_text_color(self, fg)
-        dwm.set_border_color(self, bg)
+        dwm.set_border_color(self, edge)
         dwm.set_dark_mode(self, dark)
         # 图标要跟着底色走：深色标题栏配白图标，否则黑图标看不见。
         # 用 try 包住——图标设置失败绝不能影响上色这个主功能。
@@ -1776,8 +1786,9 @@ class MainWindow(QMainWindow):
             host_log("切换主题图标失败（不影响上色）：%s: %s"
                      % (type(e).__name__, e))
         if ok:
-            host_log("标题栏上色：底色 %s（取自界面 %s）文字 %s"
-                     % (dwm.to_hex(bg), dwm.to_hex(rgb), dwm.to_hex(fg)))
+            host_log("标题栏上色：底色 %s 边框 %s（取自界面 %s）文字 %s"
+                     % (dwm.to_hex(bg), dwm.to_hex(edge),
+                        dwm.to_hex(rgb), dwm.to_hex(fg)))
 
         # 这个 `dark` 就是"界面当前是深是浅"的既有判定结果，别处（控制面板）直接复用，
         # 不要在面板里再判一次——两处判断迟早会不一致。同时记住，下次启动能直接用。
