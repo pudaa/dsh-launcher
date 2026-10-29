@@ -9,7 +9,9 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+.venv-*/
 venv/
+pip-unpack-*/
 
 # ---------------------------------------------------------------- 运行期数据
 # 桌面壳真实数据在 %LOCALAPPDATA%\DSH-Web\，不进仓库；
@@ -21,6 +23,11 @@ webview-data/
 # ---------------------------------------------------------------- 本地探针
 nuitka-crash-report.xml
 speedtest.txt
+# 自测残留（contract/gui/datatask 跑完可能留下临时根，失败时故意保留供排查）
+.tmp-selftest/
+dl-selftest-*/
+dsh-datatask-*/
+build/probe-results/
 
 # ---------------------------------------------------------------- 工作区记忆
 # 含本机环境细节（路径 / 安装位置），不作为项目产物发布

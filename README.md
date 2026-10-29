@@ -200,6 +200,7 @@ python tools/gui_selftest.py
 - **只支持 Windows。** 服务生命周期管理用了 `DETACHED_PROCESS`、winget、注册表读 PATH。
 - **应用被强杀时服务会一起终止。** `DETACHED_PROCESS` 只脱离控制台，不脱离 Job Object。正常关窗退出则服务存活。
 - **回滚不保证数据格式可逆。** 自动回滚保护的是"能启动"，不是"会话可读"。旧版本可能打不开新版本写出的会话记录 —— 记录不会被删除，只是旧版本读不了。
+- **Qt 6.11.2 的 WebEngine 有一个已知的 GPU 线程崩溃（QTBUG-142165）**：长会话里可能整个桌面壳静默消失（web 服务仍存活）。上游已修复但尚未随任何可安装版本发布，判断某版本是否已含修复用 `tools/webengine_fix_check.py`。完整判据、已否掉的规避手段和工具用法见 [`docs/webengine-angle-crash.md`](docs/webengine-angle-crash.md)。
 
 ## 许可
 

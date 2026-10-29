@@ -1839,40 +1839,59 @@ function downloadUrl(url, filename) {
 - 真栈（自研 `.pdata` unwind，38 帧）：`Skia Ganesh flush → GrOp 执行 →
   gl::ProgramPipeline::resolveLink → ANGLE input-layout LRU 缓存 → NULL`。
 
-**上游没有修复**：相关 QTBUG（151080/147154/144259 等）`fixVersions` 全空；
-PySide6 6.12.0 的 WebEngine 仍是 Chromium 140.0.7339.225，崩溃点周围 96 字节机器码
-**逐字节相同**（RVA 只是平移）。⇒ 换 Qt 版本不是修复。
+**上游已定位根因并修复，但修复还没进任何一个能装到手的版本。**
+（2026-10-25 更新；此前"上游没有修复"的判断作废）
 
-**处置：默认不关 GPU，只在"上次崩过"时自动降级一次。**
+- **根因**（QTBUG-142165，Qt WebEngine 维护者 Vladimir Belyavsky 的分析）：
+  ANGLE D3D11 的 `rx::PackedAttributeLayout` 带**未初始化的填充字节**，而它既是
+  `InputLayoutCache` 的 key、又整块参与哈希计算 → 同一个布局算出不同 hash →
+  缓存渐进损坏 → 查表命中一个**已被析构**的 `d3d11::InputLayout` → 在
+  `Resource11Base::getSerial()` 读 NULL。这与本报告用自研 `.pdata` unwind 得到的
+  "ANGLE input-layout LRU 缓存 → NULL" 描述的是同一件事，两份取证互相印证。
+  注意它是**累积型**缺陷：缓存要坏到一定程度才命中，所以总在长会话里发作。
+- **上游修复**：ANGLE `bbf320aa3` "Ensure PackedAttributeLayout is a packed struct"
+  （chromium:565740567）+ `48a16bd63`（InputLayoutCache key）。Qt 侧三个 backport
+  （`6f1bf838` / `a740890d` / `6d308e34`）于 **2026-10-08 17:56 UTC** 合入
+  `qtwebengine-chromium` 的 `140-based` 分支。
+- **当前所有可安装版本都不含它**：PySide6 6.12.0 → WebEngine `6.12.0.140`，
+  其 `Qt6WebEngineCore.dll` 的 PE 构建时间是 **2026-09-27 12:38 UTC**，比修复
+  合入早 11 天；崩溃点周围 96 字节机器码与 6.11.2 **逐字节相同**（SHA1 `392a2ad8…`）。
+  ⇒ 现在升 6.12.0 是白升：拿不到修复，还要吃 WebEngine 拆包（`PySide6_WebEngine`
+  独立 wheel）带来的打包风险。**别升。**
+- **时间表**（Qt 官方渠道）：6.11.3 是 6.11 收尾版，原定 10-20、至 10-25 仍未发布；
+  PySide6 `6.12.0.1` "下周"（10-22 开发笔记）、`6.12.1` 定 11-17。
+  判断某个版本值不值得升，**只看两件事**：DLL 构建时间晚于 2026-10-08，
+  且崩溃点机器码变了。版本号本身不说明任何问题。
 
-第一版曾直接默认 `--disable-gpu`，理由是"让崩溃路径根本不执行"。但这个取舍不对：
-崩溃是**罕见**的（两次都发生在数小时长会话里），而软件渲染的代价是**全体用户、
-全部时间**的性能——同一份 DSH 类页面（200 行列表 + 600×120 canvas）实测 rAF
-**59.6 → 26.6 fps**。硬件加速本来也是 QtWebEngine 的默认，一刀切关掉等于用常态
-性能损失给偶发崩溃买单。
+**处置：不做任何自动降级，硬件加速完全由用户设置决定。**（2026-10-25 定案）
 
-改成"崩溃哨兵 + 一次性兼容模式"：
+2026-10-24 曾上线"崩溃哨兵 + 一次性兼容模式"（启动写 marker、正常退出删、
+下次读到就加 `--disable-gpu` 并弹托盘提示）。一天后撤掉。撤掉的理由不是它有
+缺陷，而是它方向就错了：
 
-- 启动时写 `%LOCALAPPDATA%\DSH-Web\webengine-state.json`，**正常退出时删除**；
-- 下次启动若这个文件还在、且时间在 `CRASH_FALLBACK_WINDOW_S`（12 小时）内，
-  说明上次进程没走正常退出路径（原生崩溃/被杀）→ 本次自动加 `--disable-gpu`，
-  托盘气泡提示一句，并指向控制面板；
-- 判定逻辑抽成纯函数 `_decide_hw_accel(pref, marker, now)`：用户显式关掉
-  （`webengine_hw_accel=false` / 面板开关）时永远软件渲染；环境变量
-  `DSH_WEBENGINE_HW_ACCEL` 优先（排障用）；
-- 本次降级运行若正常退出，哨兵删除 → 下次恢复硬件加速；连续崩才会连续降级。
+1. **降级是概率缓解，不是修复。** 而且并不彻底——10-24 14:58 那次崩溃就发生在
+   `--disable-gpu` 状态下（走的是另一条 `Qt6Core+0x2623cc` 路径）。拿一个不确定
+   有效的降级去换"看起来已经处理过了"，是用动作冒充结论。
+2. **一致性优先于"体贴"。** 用户勾了硬件加速，程序就不该背着他改配置。自动降级
+   和用户自己手动关掉，面对的是同一个"关掉之后仍可能崩"的事实，区别只在于把
+   这个落差藏起来。自动拉起、自动降级这类补救动作，改变不了问题已经发生过。
 
-**flags 必须在任何 PySide6 导入之前设置**（Chromium 只读一次；哨兵读取也在这一拍），
-启动时把实际 flags、硬件加速状态与降级原因写一行到 `host.log`，方便下回排障不用猜。
-验收标准是「连续多日不再出现 `0xd224d3`」，而不是一次启动正常。
+保留的只有用户自己的开关：`webengine_hw_accel`（settings.json / 面板「常规」页），
+以及排障用的环境变量 `DSH_WEBENGINE_HW_ACCEL`。旧版残留的
+`webengine-state.json` 由 `config.purge_legacy_webengine_state()` 启动时清掉，
+免得一个再没人读的文件以后误导排查。
+
+**flags 必须在任何 PySide6 导入之前设置**（Chromium 只读一次），启动时把实际
+flags 与硬件加速状态写一行到 `host.log`，方便下回排障不用猜。
 
 > 注意：`--disable-gpu` 不是"弹层停帧"的修复——第二组探针里几个 flag 都没能让它
 > 不复现（flag 是否真正生效存疑）。那个问题由 §20.1 的"停动画 + 补帧"解决。
 
 ### 20.3 回归与留档
 
-- `tools/gui_selftest.py`：弹层补帧、加载页动画停/恢复、默认硬件加速、崩溃哨兵
-  纯逻辑（无标记/新标记/陈旧标记/显式关闭）、flags 在 PySide6 之前、面板开关、
+- `tools/gui_selftest.py`：弹层补帧、加载页动画停/恢复、默认硬件加速、
+  **无自动降级**（哨兵符号必须不存在、旧 marker 会被清理、文案不再承诺降级）、
+  flags 在 PySide6 之前、面板开关、
   恢复用尽升级重建、手动连按重建；
   以及 AST 断言"不再调用不存在的 `QWebEnginePage.reload()`"。
 - `dsh_devtools.selftest_checks()`：watchdog 限流 + 用尽后升级重建。

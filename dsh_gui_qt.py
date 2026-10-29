@@ -53,67 +53,6 @@ def _system_ui_language() -> str:
 # 一次性读取这组 flags，之后再改就来不及了。
 _UI_LANG = _system_ui_language()
 
-#: 上次运行"没正常退出"的判定窗口（秒）。太小会漏（用户隔天才重开），
-#: 太大会误伤（任务管理器杀进程后长期降级）。12 小时覆盖常见的"崩溃→重开"。
-CRASH_FALLBACK_WINDOW_S = 12 * 3600
-
-
-def _read_webengine_marker():
-    """读崩溃哨兵。文件不在/损坏都当"上次正常退出"。"""
-    try:
-        from dsh_host import config as _c
-        with open(_c.webengine_state_path(), encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else None
-    except (OSError, ValueError):
-        return None
-
-
-def _write_webengine_marker(hw_accel: bool) -> None:
-    """启动时写下哨兵：正常退出会删掉它，所以下次还能看到它就是崩溃过。"""
-    try:
-        from dsh_host import config as _c
-        with open(_c.webengine_state_path(), "w", encoding="utf-8") as f:
-            json.dump({"started_at": time.time(), "pid": os.getpid(),
-                       "hw_accel": bool(hw_accel)}, f)
-    except OSError:
-        pass
-
-
-def _clear_webengine_marker() -> None:
-    try:
-        from dsh_host import config as _c
-        os.remove(_c.webengine_state_path())
-    except OSError:
-        pass
-
-
-def _crash_marker_recent(marker, now: float) -> bool:
-    try:
-        started = float((marker or {}).get("started_at"))
-    except (TypeError, ValueError, AttributeError):
-        return False
-    return 0 < (now - started) <= CRASH_FALLBACK_WINDOW_S
-
-
-def _decide_hw_accel(pref: bool, marker, now: float) -> tuple[bool, str]:
-    """纯逻辑：用户偏好 + 上次是否异常退出 → (本次是否硬件加速, 降级原因)。
-
-    为什么不默认关 GPU（2026-10-24 的取舍）：
-      Qt 6.11.2 的 GPU 线程确实有一个确定性空指针崩溃（+0xd224d3，上游无修复、
-      6.12.0 同机器码），但它是**罕见**的（两次都在长会话里）。拿全体用户、
-      全部时间的性能（rAF 59.6→26.6 fps）去兜一个罕见崩溃，比例不对。
-      所以：默认硬件加速（跟随惯例）；只有**上一次运行真的没正常退出**时，
-      本次启动自动降级为软件渲染（一次性兼容模式），并在面板留手动开关。
-    """
-    if not pref:
-        return False, "用户设置：软件渲染"
-    if _crash_marker_recent(marker, now):
-        return False, ("上次运行未正常退出（疑似 GPU 崩溃），"
-                       "本次自动降级为软件渲染")
-    return True, ""
-
-
 def _hw_accel_enabled() -> bool:
     """本次是否走 GPU 渲染。环境变量优先（排障用），否则用导入时的结论。"""
     env = os.environ.get("DSH_WEBENGINE_HW_ACCEL")
@@ -122,17 +61,23 @@ def _hw_accel_enabled() -> bool:
     return bool(_HW_ACCEL)
 
 
-#: 本次启动为什么降级成软件渲染（空串 = 正常硬件加速）
-_SAFE_MODE_REASON = ""
+#: 本次启动是否走硬件加速。**唯一来源是用户设置**，没有任何自动干预。
+#:
+#: 2026-10-24 曾做过"崩溃哨兵"：上次非正常退出 → 本次自动降级为软件渲染一次。
+#: 2026-10-25 撤掉，不是因为它有 bug，而是因为它错在方向：
+#:   1) 降级是概率缓解，不是修复。QTBUG-142165 已定位根因（ANGLE D3D11 的
+#:      PackedAttributeLayout 填充字节未初始化，污染 InputLayoutCache），
+#:      但仍要等含修复的 WebEngine 构建。降级期间照样崩过（10-24 14:58）。
+#:   2) 一致性：用户选了硬件加速，就不该背着他改配置。自动降级和用户手动关
+#:      面对的是同一个"降级后仍可能崩"的事实，区别只在于把落差藏起来。
+#:      所以这里只读一个布尔：用户开就是开，用户关就是关，面板一个开关说完。
 _HW_ACCEL = True
-# 模块导入时就要定 flags（Chromium 只读一次），所以这里先读配置 + 崩溃哨兵。
+# 模块导入时就要定 flags（Chromium 只读一次），所以这里先读用户设置。
 try:
     from dsh_host import config as _early_cfg
-    _HW_ACCEL, _SAFE_MODE_REASON = _decide_hw_accel(
-        bool(_early_cfg.get("webengine_hw_accel", True)),
-        _read_webengine_marker(), time.time())
+    _HW_ACCEL = bool(_early_cfg.get("webengine_hw_accel", True))
 except Exception:                                          # noqa: BLE001
-    _HW_ACCEL, _SAFE_MODE_REASON = True, ""
+    _HW_ACCEL = True
 
 _flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
 if _UI_LANG and "--lang=" not in _flags:
@@ -143,11 +88,10 @@ if _flags:
     os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = _flags
     try:
         from dsh_host import config as _flag_log_config
-        _why = ("；" + _SAFE_MODE_REASON) if _SAFE_MODE_REASON else ""
         with open(_flag_log_config.host_log(), "a", encoding="utf-8") as _f:
-            _f.write("%s  WebEngine flags: %s（硬件加速=%s%s）\n"
+            _f.write("%s  WebEngine flags: %s（硬件加速=%s）\n"
                      % (time.strftime("%Y-%m-%d %H:%M:%S"), _flags,
-                        "开" if _hw_accel_enabled() else "关", _why))
+                        "开" if _hw_accel_enabled() else "关"))
     except Exception:                                      # noqa: BLE001
         pass
 
@@ -1596,9 +1540,6 @@ class MainWindow(QMainWindow):
         # 而 view.update() 一次就恢复——比"重建视图"轻得多，放在第一道防线。
         self._popup_guard = dsh_devtools.PopupRepaintGuard(
             lambda: self.view, self)
-        if _SAFE_MODE_REASON:
-            host_log("兼容渲染：" + _SAFE_MODE_REASON)
-            QTimer.singleShot(2500, self, self._notify_safe_mode)
 
         self.starter = None
         self._launch_startup()
@@ -2693,19 +2634,6 @@ class MainWindow(QMainWindow):
         else:
             self._info("服务还没就绪，暂时没有可打开的地址。")
 
-    def _notify_safe_mode(self) -> None:
-        """上次异常退出导致本次降级软件渲染：告诉用户一声 + 怎么改回来。"""
-        tray = getattr(self, "tray", None)
-        if tray is not None and tray.isVisible():
-            try:
-                tray.showMessage(
-                    "DSH",
-                    "上次运行异常退出，本次已自动切换到软件渲染（兼容模式）。\n"
-                    "可在控制面板「常规」页改回硬件加速。",
-                    QSystemTrayIcon.MessageIcon.Information, 8000)
-            except Exception:                                  # noqa: BLE001
-                pass
-
     def _page_notify(self, msg: str) -> None:
         """页面监护（渲染进程退出/白屏自动恢复）给用户的一句话。
 
@@ -3334,7 +3262,6 @@ class MainWindow(QMainWindow):
         真需要常驻服务的人本来就会用命令行。
         """
         host_log("用户退出，连带停止后台服务")
-        _clear_webengine_marker()
         # 先收尾面板的后台线程。线程在解释器退出时还活着会让 Qt 直接 abort，
         # 而 abort 会丢掉未刷出的日志缓冲——那会让"退出"变成一件莫名其妙的事。
         panel = getattr(self, "_panel", None)
@@ -3462,12 +3389,11 @@ def main() -> int:
 
     QLocalServer.removeServer(SINGLETON_ID)
 
-    # 崩溃哨兵（2026-10-24）：启动即写、正常退出再删。下次启动如果还能读到
-    # 它（且在 CRASH_FALLBACK_WINDOW_S 内），说明上次进程没走正常退出路径
-    # （原生崩溃/被杀），本次自动降级为软件渲染一次——见 _decide_hw_accel。
-    _write_webengine_marker(_hw_accel_enabled())
-    import atexit
-    atexit.register(_clear_webengine_marker)
+    # 2026-10-25：这里原本写崩溃哨兵（启动写、退出删、下次读到就降级）。
+    # 已随"不做自动降级"一起撤掉——见文件顶部 _HW_ACCEL 处的决策说明。
+    # 旧版本留下的 webengine-state.json 在 config.purge_legacy_webengine_state()
+    # 里顺手清掉，避免下次误以为还有人在读它。
+    config.purge_legacy_webengine_state()
 
     # 全局图标先跟系统主题；MainWindow 取到界面色后会再切一次
     _ic = icon_for(dwm.system_uses_dark())

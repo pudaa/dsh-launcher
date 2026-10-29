@@ -151,13 +151,23 @@ def profile_dir() -> str:
 
 
 def webengine_state_path() -> str:
-    """上一次运行是否正常退出的哨兵文件（崩溃后的自动降级用）。
+    """**旧版**崩溃哨兵的路径（2026-10-24 引入，2026-10-25 撤掉）。
 
-    启动时写入、正常退出时删除：下次启动若看到它还**在**（且时间足够新），
-    说明上次进程没走正常退出路径（原生崩溃/被杀），于是本次自动改用软件渲染。
-    放在数据根而不是 DSH_HOME——它属于桌面壳自己的运行状态。
+    哨兵机制已移除——理由见 dsh_gui_qt.py 里 `_HW_ACCEL` 上方的说明：
+    自动降级是概率缓解而非修复，且与"用户自己选了硬件加速"这个前提冲突。
+    保留这个路径定义只为一件事：清理用户机器上残留的旧文件。一个再没人读的
+    json 留在数据目录里，下次排查时会被当成有效状态，误导人。
+    新增代码不应再读写它。
     """
     return os.path.join(data_root(), "webengine-state.json")
+
+
+def purge_legacy_webengine_state() -> None:
+    """删掉旧版崩溃哨兵。静默失败：它是垃圾，清不掉不影响启动。"""
+    try:
+        os.remove(webengine_state_path())
+    except OSError:
+        pass
 
 
 def node_global_dir() -> str:
@@ -207,12 +217,14 @@ DEFAULTS: dict = {
     # 注意是"降饱和"不是"往深灰拉"——后者会把纯白拉成灰色。
     "titlebar_mute": 0.35,
     # 硬件加速渲染（QtWebEngine 的 GPU 路径）。**默认 True（跟随惯例）**。
-    # 2026-10-24：Qt 6.11.2 的 WebEngine 在 in-process GPU 线程有一个确定性空指针
-    # 崩溃（Qt6WebEngineCore+0xd224d3，两次 dump 同源、上游无修复、6.12.0 同机器码）。
-    # 不做"默认全局关 GPU"——那会拿全体用户的性能为罕见崩溃买单；改成：
-    # 上一次运行**非正常退出**时，本次启动自动降级为软件渲染（见 dsh_gui_qt
-    # 的 _decide_hw_accel / webengine-state.json），用户也可在这里显式设 False
-    # 强制软件渲染。改动**重启生效**（Chromium 只读一次 flags）。
+    # 2026-10-25 定案：这个布尔是硬加速的**唯一来源**，不做任何自动降级。
+    # 背景：Qt 6.11.2 的 WebEngine 在 in-process GPU 线程有一个确定性空指针崩溃
+    # （Qt6WebEngineCore+0xd224d3）。根因已于 QTBUG-142165 定位为 ANGLE D3D11 的
+    # PackedAttributeLayout 填充字节未初始化（污染 InputLayoutCache，查到已析构的
+    # InputLayout），上游已修、Qt 尚待发布含修复的构建。
+    # 在修复到达之前：既不默认关 GPU（拿全体性能兜罕见崩溃），也不在崩溃后
+    # 偷偷降级（掩盖而非解决，且降级期间照样崩过）。用户开就是开、关就是关。
+    # 改动**重启生效**（Chromium 只读一次 flags）。
     "webengine_hw_accel": True,
     # 主题跟踪间隔（毫秒）。0 = 关闭跟踪（只在启动时取一次色）。
     # 跟踪只做"读计算样式"这一轻量动作，不做截图，且**只在颜色真的变了**

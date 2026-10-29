@@ -1491,33 +1491,41 @@ def health_checks() -> list:
 
     # ⑨b 渲染后端（2026-10-24 闪退定案）
     # 两次 dump 逐帧相同：Chrome_InProcGpuThread 里 Qt6WebEngineCore+0xd224d3，
-    # ANGLE input-layout 缓存空指针。上游无修复、6.12.0 同一段机器码逐字节相同，
-    # 所以默认改软件渲染；用户可在控制面板显式开回硬件加速（重启生效）。
+    # ANGLE input-layout 缓存空指针（QTBUG-142165）。2026-10-25 定案：
+    # 不做任何自动降级——用户设置是唯一来源。这里把"没有偷偷改配置"钉死，
+    # 防止以后有人觉得"崩溃后自动关 GPU 很贴心"又把它加回来。
     config_src = read(os.path.join("dsh_host", "config.py"))
     check("默认硬件加速（跟随惯例，不拿全体性能兜底）",
           '"webengine_hw_accel": True' in config_src)
     check("可显式关闭：面板 / settings.json / 环境变量",
           "webengine_hw_accel" in config_src
           and "DSH_WEBENGINE_HW_ACCEL" in gui
-          and "def _decide_hw_accel(" in gui)
-    # 崩溃哨兵的纯逻辑（2026-10-24）：默认硬件加速；只有"上次没正常退出"
-    # 才自动降级一次。这里不依赖文件系统，直接喂三种 marker。
-    _now = 1_000_000.0
-    check("崩溃哨兵：默认走硬件加速",
-          g._decide_hw_accel(True, None, _now)[0] is True)
-    check("崩溃哨兵：上次异常退出 → 本次软件渲染",
-          g._decide_hw_accel(True, {"started_at": _now - 600}, _now)[0] is False)
-    check("崩溃哨兵：陈旧标记不触发降级",
-          g._decide_hw_accel(True, {"started_at": _now - 3 * 86400}, _now)[0]
-          is True)
-    check("崩溃哨兵：用户显式关闭时永远软件渲染",
-          g._decide_hw_accel(False, None, _now)[0] is False)
-    check("哨兵：启动写、正常退出删（atexit 兜底）",
-          "def _write_webengine_marker(" in gui
-          and "atexit.register(_clear_webengine_marker)" in gui
-          and "_clear_webengine_marker()" in gui)
-    check("降级时托盘提示用户（并指向面板）",
-          "def _notify_safe_mode(" in gui and "兼容模式" in gui)
+          and "def _hw_accel_enabled(" in gui)
+    check("无崩溃哨兵：不再自动降级",
+          "CRASH_FALLBACK_WINDOW_S" not in gui
+          and "_write_webengine_marker" not in gui
+          and "_read_webengine_marker" not in gui
+          and "_clear_webengine_marker" not in gui)
+    check("无静默降级提示（不出现「兼容模式」）",
+          "_notify_safe_mode" not in gui and "兼容模式" not in gui)
+    check("旧哨兵文件会被清理",
+          "def purge_legacy_webengine_state(" in config_src
+          and "purge_legacy_webengine_state()" in gui)
+    check("硬件加速文案不再承诺自动降级",
+          "程序不会自己" in panel)
+    # 版本约束与接手材料（2026-10-25）：6.12 起 WebEngine 拆成独立 wheel 且不含
+    # 该崩溃的修复，requirements 的上界是拦住 pip 自动跨过去的唯一屏障；
+    # 经验文档 + 校验脚本是"下一个 agent 能接手"的前提，别让它们被顺手删掉。
+    req = read("requirements.txt")
+    check("requirements 锁住 PySide6 上界（6.12 拆包且不含修复）",
+          "<6.12" in req)
+    check("崩溃经验文档与校验工具都在",
+          os.path.isfile(os.path.join("docs", "webengine-angle-crash.md"))
+          and os.path.isfile(os.path.join("tools", "webengine_fix_check.py"))
+          and os.path.isfile(os.path.join("tools", "probe_angle_backend.py")))
+    _fx = read(os.path.join("tools", "webengine_fix_check.py"))
+    check("校验脚本的判据是机器码指纹 + 构建时间（不靠版本号猜）",
+          "BASELINE_96" in _fx and "FIX_MERGED_UTC" in _fx)
     try:
         _flags_at = gui.index("QTWEBENGINE_CHROMIUM_FLAGS")
         _pyside_at = gui.index("from PySide6.QtCore")

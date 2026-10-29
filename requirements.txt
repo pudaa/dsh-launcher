@@ -1,6 +1,18 @@
-# 必须 >=6.11.2：QtWebEngine 内核 = Chromium 140。
-# 低版本（6.9.x=130 / 6.10.x=134）会让 DSH 前端的文件预览失效
-# （报「文件资源服务不可用」），详见 docs/file-preview-unavailable-triage.md
-PySide6>=6.11.2
+# 必须 >=6.11.3：含 QTBUG-142165（ANGLE InputLayoutCache 空指针崩溃）的官方修复。
+#   6.11.2 及更早不含——崩溃点 96 字节机器码与 6.11.2 逐字节相同；
+#   6.11.3 的 Qt6WebEngineCore.dll 构建于 2026-10-21 01:32 UTC（晚于三个 backport
+#   合入 140-based 的 2026-10-08 17:56），且该机器码已消失。Chromium 也从
+#   .225 进到 140.0.7339.264。判定命令：
+#     python tools/webengine_fix_check.py --wheel <pyside6_addons-6.11.3-*.whl>
+#   退出码 0 = 已含修复。取证全文见 docs/webengine-angle-crash.md。
+#   更低版本（6.9.x=130 / 6.10.x=134）还会让 DSH 前端的文件预览失效
+#   （报「文件资源服务不可用」），详见 docs/file-preview-unavailable-triage.md
+#
+# 必须 <6.12（2026-10-25 加上界）：
+#   6.12 起 WebEngine 拆成独立包（PySide6_WebEngine==6.12.0.140，Addons 从 160 MB
+#   缩到 38.6 MB 就是因为它搬走了）。而 6.12.0.140 的 Qt6WebEngineCore.dll 的
+#   PE 构建时间是 2026-09-27，**不含**该修复；`6.12.0.1` 至 2026-10-29 仍未发布。
+#   升上去 = 白升 + 打包链路要跟着换双 wheel。等 6.12 线出了含修复的版本再动。
+PySide6>=6.11.3,<6.12
 # 打包用（开发运行可不装）
 # Nuitka>=4.2.1
