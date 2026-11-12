@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="docs/images/banner.jpg" alt="鲸坞" width="100%">
-</p>
-
 <h1 align="center">鲸坞</h1>
 
 <p align="center">
@@ -16,7 +12,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/images/panel-overview.png" alt="控制面板 · 概览" width="820">
+  <img src="docs/images/panel-overview.png" alt="控制面板 · 概览" width="860">
 </p>
 
 ## 它解决什么问题
@@ -121,7 +117,7 @@ GitHub Actions 会运行自测、构建 exe、创建 Release。工作流校验 t
 ## 界面
 
 <p align="center">
-  <img src="docs/images/panel-runmode.png" alt="控制面板 · 运行方式" width="820">
+  <img src="docs/images/panel-runmode.png" alt="控制面板 · 运行方式" width="860">
 </p>
 
 控制面板与主窗口共用同一套配色来源：标题栏从界面取色后推导明暗，面板据此切换。所有说明性内容收在标题右侧的 ⓘ 中，正文只保留结论。
