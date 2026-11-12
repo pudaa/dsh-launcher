@@ -52,7 +52,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup,
 
 import dsh_console
 from dsh_host import config, procmem
-from dsh_host.version import HOST_VERSION
+from dsh_host.version import HOST_NAME, HOST_VERSION
 from dsh_panel import FONT, palette
 
 MAX_CONSOLE = 2000
@@ -2103,7 +2103,7 @@ class DevWindow(QWidget):
         errs = [e for e in self.recorder.since_console(0)
                 if e.level == "error"][-30:]
         lines = [
-            "桌面壳 v%s" % HOST_VERSION,
+            "%s v%s" % (HOST_NAME, HOST_VERSION),
             "页面地址：%s" % redact(self.lbl_url.text()),
             "视口：%s" % self.env_rows["viewport"].text(),
             "设备像素比：%s" % self.env_rows["dpr"].text(),

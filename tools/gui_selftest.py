@@ -190,10 +190,14 @@ def menu_structure_checks(win) -> list[str]:
     if not ok:
         failures.append("残留停止服务菜单项")
 
-    # 2. DSH 更新与桌面壳更新必须分别有明确标识
+    # 2. 产品自身的更新与 DSH 更新必须分别有明确标识。
+    #    2026-11-12 改名（桌面壳 → 鲸坞）时这条差点静默失效：旧写法只认
+    #    "桌面壳" / "Launcher" 两个字样，改名后菜单里两样都没有，断言会一直报错。
+    #    改成从 HOST_NAME 取名字，以后再改名这里自动跟着走。
+    from dsh_host.version import HOST_NAME
     ok = any("DSH" in t and "更新" in t for t in texts) and \
-        any(("桌面壳" in t or "Launcher" in t) and "更新" in t for t in texts)
-    print(f"  [{'OK  ' if ok else 'FAIL'}] DSH 更新与桌面壳更新分开呈现")
+        any(HOST_NAME in t and "更新" in t for t in texts)
+    print(f"  [{'OK  ' if ok else 'FAIL'}] DSH 更新与产品自身更新分开呈现")
     if not ok:
         failures.append("两类更新未区分")
         print("        实际菜单:", texts)

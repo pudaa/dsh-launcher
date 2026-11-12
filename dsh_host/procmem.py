@@ -101,9 +101,15 @@ def mem_of_pid(pid: int) -> tuple[float, float] | None:
         k32.CloseHandle(h)
 
 
-def _descendants(root_pid: int) -> dict[int, int]:
-    """root_pid 的所有后代 → {pid: 父 pid}。"""
-    procs = _processes()
+def _descendants(root_pid: int, procs: list | None = None) -> dict[int, int]:
+    """root_pid 的所有后代 → {pid: 父 pid}。
+
+    `procs` 允许调用方把自己已经取到的进程表传进来——一次
+    `CreateToolhelp32Snapshot` 在大机器上要十几毫秒，`snapshot()` 里
+    原本为了拿名字又单独遍历了一遍，白花一倍的采集时间（2026-11-12，
+    面板要每 2 秒采一次，这笔开销才显出来）。
+    """
+    procs = _processes() if procs is None else procs
     children: dict[int, list[int]] = {}
     names: dict[int, str] = {}
     for pid, ppid, name in procs:
@@ -131,9 +137,11 @@ def snapshot(root_pid: int | None = None) -> dict:
     `root_pid` 缺省为当前进程。
     """
     root_pid = root_pid or os.getpid()
-    kids = _descendants(root_pid)
-    # 名字只取一次：`_processes()` 是一次快照遍历，别在每行里重复调它
-    names = {p: n for p, _pp, n in _processes()}
+    # 进程表只取一次：`_descendants()` 需要父子关系，下面还需要名字。
+    # 以前这两件事各遍历一次，等于把最贵的一步做了两遍。
+    procs = _processes()
+    kids = _descendants(root_pid, procs)
+    names = {p: n for p, _pp, n in procs}
     rows = []
     groups = {}
     for pid in kids:

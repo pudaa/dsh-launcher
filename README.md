@@ -1,12 +1,16 @@
-# DSH Launcher
+# 鲸坞
 
-给 [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) 套的 Windows 桌面壳。
+[DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) 的 Windows 桌面客户端。
 
 一个 exe 搞定：双击打开就是原生窗口里的 DSH Web UI，不用敲命令、不用管端口和令牌。
 
+> 名字取"鲸"（DeepSeek 的符号）+"坞"（停泊、检修、补给的地方）——它管的正是
+> 版本锁、回滚、数据迁移这些"进坞维护"的活。可执行文件名仍是 `DSH-Web.exe`，
+> 因为自动更新要按同名资产去 Release 找新版本，改名会让老版本升不上来。
+
 ## 它解决什么问题
 
-DSH 官方只发 CLI。要用 Web UI 得自己开终端跑 `dsh web`，从输出里复制带 token 的长 URL 粘进浏览器；关掉终端服务就没了，重开又要来一遍。这个壳把这些事收进一个窗口：
+DSH 官方只发 CLI。要用 Web UI 得自己开终端跑 `dsh web`，从输出里复制带 token 的长 URL 粘进浏览器；关掉终端服务就没了，重开又要来一遍。鲸坞把这些事收进一个窗口：
 
 - **不用记命令** —— 双击启动，服务自动拉起
 - **不用复制 token** —— URL 自动从服务输出解析，直接加载
@@ -25,11 +29,11 @@ DSH 官方只发 CLI。要用 Web UI 得自己开终端跑 `dsh web`，从输出
 | 首次运行引导 | 缺 Node 走 winget 官方渠道安装；DSH 装到私有 prefix，不动全局环境 |
 | DSH 更新 | 走官方 npm 通道，跟随稳定 / 候选 / 尝鲜三条版本线，支持一键回归稳定版 |
 | 通道透明 | 「已是最新」也会报出预览通道上有没有更高版本，不会只说一句"已是最新" |
-| 控制面板 | 自绘面板（无边框 880x600、圆角）：概览 / 本机部署 / 连接 / 状态检测 / 关于 |
+| 控制面板 | 自绘面板（无边框 880x600、圆角）：概览 / 运行方式 / 本机部署 / 常规 / 状态检测 / 关于 |
 | 外链处理 | 异源链接交给系统默认浏览器（顺带省下渲染开销），同源留在窗口内；`target="_blank"` 不会再"点了没反应" |
 | 开发者模式 | 面板里开启后打开 **Chromium 自带的开发者工具**（Elements / Console / Network / Sources，与 Chrome 一致），关窗即释放；顶部可切到**终端页**，查看打包后本来看不到的进程输出（可整段复制、着色、搜索、暂停跟随） |
 | 配色跟随 | 明暗两套配色取自 DSH 官方前端的语义令牌，跟随界面主题自动切换 |
-| 桌面壳更新 | 从 GitHub Release 拉取新版本，自动替换自身并重启 |
+| 鲸坞更新 | 从 GitHub Release 拉取新版本，自动替换自身并重启 |
 | 数据安全 | 更新前后统计 DSH_HOME 指纹，记录异常减少 |
 | 应用内反馈 | 手动操作的结果都落在窗口里，不依赖系统通知 |
 
@@ -40,10 +44,10 @@ DSH 官方只发 CLI。要用 Web UI 得自己开终端跑 `dsh web`，从输出
 控制面板…
 ────────────────
 检查 DSH 更新…
-检查桌面壳更新…
+检查鲸坞更新…
 ────────────────
 打开日志目录
-关于 DSH Launcher
+关于鲸坞
 ────────────────
 退出
 ```
@@ -53,7 +57,7 @@ DSH 官方只发 CLI。要用 Web UI 得自己开终端跑 `dsh web`，从输出
 都在控制面板里——那里有地方写清楚它们意味着什么。
 
 两组更新刻意分开：**DSH 更新**换的是 DSH 程序（走 npm），
-**桌面壳更新**换的是正在运行的 exe（走 GitHub Release）。
+**鲸坞更新**换的是正在运行的 exe（走 GitHub Release）。
 两者可以独立进行，互不影响。
 
 「退出」会连带停止后台服务 —— 想留服务的话，把窗口关掉（最小化到托盘）而不是退出。
@@ -116,7 +120,7 @@ GitHub Actions 会自动跑自测、构建 exe、创建 Release。
                    │ 只调 dsh_host 的公开函数
 ┌──────────────────▼──────────────────────────┐
 │  L2  dsh_host/updater.py     DSH 更新事务    │
-│      dsh_host/selfupdate.py  桌面壳自更新    │
+│      dsh_host/selfupdate.py  鲸坞自更新    │
 │      dsh_host/provision.py   环境供给        │
 └──────────────────┬──────────────────────────┘
                    │
@@ -143,11 +147,11 @@ GitHub Actions 会自动跑自测、构建 exe、创建 Release。
 | 文件 | 职责 |
 |---|---|
 | `dsh_host/config.py` | **所有路径的唯一权威定义处**。其余模块 import，禁止自行拼 `LOCALAPPDATA` |
-| `dsh_host/version.py` | **桌面壳版本号的唯一定义处**。发布脚本与界面都从这里读 |
+| `dsh_host/version.py` | **鲸坞版本号的唯一定义处**。发布脚本与界面都从这里读 |
 | `dsh_host/contract.py` | L0 契约层。DSH 安装探测、服务启动、就绪等待、URL 解析、环境自检、数据指纹 |
 | `dsh_host/compat.py` | L1 版本适配表。按 `major.minor.patch` 代数比较（DSH 所有 release 都是预发布，严格 semver 序会匹配不到） |
 | `dsh_host/updater.py` | L2 DSH 更新事务。停服 → 取指纹 → 安装 → 校验 → 比对指纹 → 重启，失败自动回滚 |
-| `dsh_host/selfupdate.py` | L2 桌面壳自更新。从 GitHub Release 下载、校验、生成替换脚本 |
+| `dsh_host/selfupdate.py` | L2 鲸坞自更新。从 GitHub Release 下载、校验、生成替换脚本 |
 | `dsh_host/provision.py` | L2 首次运行环境供给。winget 装 Node、私有 prefix 装 DSH |
 | `dsh_devtools.py` | 网页层策略与观测。外链出口判定、控制台/网络记录、原生开发者窗口、Chromium DevTools 宿主 |
 | `dsh_theme.py` | DSH 官方美术在 Qt 侧的转译层。字号/圆角/间距/动效、菜单与对话框样式、`MessageDialog` |
@@ -159,7 +163,7 @@ GitHub Actions 会自动跑自测、构建 exe、创建 Release。
 运行时数据分两处，互不干扰：
 
 ```
-%LOCALAPPDATA%\DSH-Web\              桌面壳数据根（配置与登录态）
+%LOCALAPPDATA%\DSH-Web\              鲸坞数据根（配置与登录态）
     settings.json / compat.json / install.json / service.json
     logs\{dsh-web.log, host.log}
     profile\                         QtWebEngine 登录态
@@ -170,7 +174,7 @@ GitHub Actions 会自动跑自测、构建 exe、创建 Release。
 
 拆开的原因：以前这两者是同一个目录，清缓存（排障标准动作）会连带丢掉登录态和配置。现在删 `DSH-Web-runtime\` 永远安全，删 `DSH-Web\` 才会丢配置。
 
-**桌面壳自有数据永不写进 `DSH_HOME`。** `DSH_HOME` 是 DSH 的地盘，我们只读不写（唯一例外是清理陈旧的 `.credentials.yaml.lock`）。
+**鲸坞自有数据永不写进 `DSH_HOME`。** `DSH_HOME` 是 DSH 的地盘，我们只读不写（唯一例外是清理陈旧的 `.credentials.yaml.lock`）。
 
 ## 开发
 
@@ -192,7 +196,7 @@ python tools/gui_selftest.py
 
 `%LOCALAPPDATA%\DSH-Web\logs\`：
 
-- `host.log` —— 桌面壳自身的操作记录（启动、检查更新、安装、回滚）
+- `host.log` —— 鲸坞自身的操作记录（启动、检查更新、安装、回滚）
 - `dsh-web.log` —— DSH 服务进程的原始输出
 
 ## 已知限制
@@ -200,7 +204,7 @@ python tools/gui_selftest.py
 - **只支持 Windows。** 服务生命周期管理用了 `DETACHED_PROCESS`、winget、注册表读 PATH。
 - **应用被强杀时服务会一起终止。** `DETACHED_PROCESS` 只脱离控制台，不脱离 Job Object。正常关窗退出则服务存活。
 - **回滚不保证数据格式可逆。** 自动回滚保护的是"能启动"，不是"会话可读"。旧版本可能打不开新版本写出的会话记录 —— 记录不会被删除，只是旧版本读不了。
-- **Qt 6.11.2 的 WebEngine 有一个已知的 GPU 线程崩溃（QTBUG-142165）**：长会话里可能整个桌面壳静默消失（web 服务仍存活）。上游已修复但尚未随任何可安装版本发布，判断某版本是否已含修复用 `tools/webengine_fix_check.py`。完整判据、已否掉的规避手段和工具用法见 [`docs/webengine-angle-crash.md`](docs/webengine-angle-crash.md)。
+- **Qt 6.11.2 的 WebEngine 有一个已知的 GPU 线程崩溃（QTBUG-142165）**：长会话里可能整个鲸坞静默消失（web 服务仍存活）。上游已修复但尚未随任何可安装版本发布，判断某版本是否已含修复用 `tools/webengine_fix_check.py`。完整判据、已否掉的规避手段和工具用法见 [`docs/webengine-angle-crash.md`](docs/webengine-angle-crash.md)。
 
 ## 许可
 

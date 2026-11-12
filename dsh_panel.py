@@ -38,6 +38,7 @@ DWM 圆角是窗口管理器合成的，`PrintWindow` 抓不到、屏幕抓图�
 from __future__ import annotations
 
 import os
+import threading
 import time
 from string import Template
 
@@ -46,14 +47,16 @@ from PySide6.QtCore import (QAbstractAnimation, QEvent, Property, QEasingCurve,
                             QThread, QTimer, QUrl, Signal)
 from PySide6.QtGui import (QColor, QDesktopServices, QGuiApplication, QPainter,
                            QPainterPath, QPen)
-from PySide6.QtWidgets import (QFrame, QGraphicsOpacityEffect, QHBoxLayout,
-                               QLabel, QPushButton, QScrollArea, QSizePolicy,
-                               QStackedWidget, QToolButton, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QComboBox, QDialog, QFrame,
+                               QGraphicsOpacityEffect, QHBoxLayout, QLabel,
+                               QLineEdit, QPushButton, QScrollArea,
+                               QSizePolicy, QStackedWidget, QToolButton,
+                               QVBoxLayout, QWidget)
 
 import dsh_icons as icons
-from dsh_host import (compat, config, contract, dwm, netenv, provision,
-                      storage, updater)
-from dsh_host.version import HOST_REPO, HOST_VERSION
+from dsh_host import (compat, config, contract, dwm, netenv, procmem, provision,
+                      remote, storage, updater)
+from dsh_host.version import HOST_NAME, HOST_REPO, HOST_VERSION
 
 FONT = '"Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", sans-serif'
 
@@ -80,6 +83,27 @@ STATE_ICON = {
     STATE_WARN: "triangle-alert",
     STATE_UNKNOWN: "circle-dashed",
 }
+
+#: 整树内存的采样间隔（毫秒）。2 秒足够看出"涨了没有"，而一次采样要
+#: 遍历全机进程表（实测 16 ms），放在界面线程里会掉帧，所以走后台线程。
+MEM_SAMPLE_MS = 2000
+
+
+def human_mem(mb: float) -> str:
+    """MB 数值 → 界面显示值。
+
+    超过 1 GB 换单位：1645 MB 这种读数在界面上没有意义，
+    而精确到 0.1 GB（1.6 GB）足够判断"是不是又涨了"。
+    """
+    try:
+        v = float(mb)
+    except (TypeError, ValueError):
+        return "—"
+    if v <= 0:
+        return "0 MB"
+    if v >= 1024:
+        return "%.1f GB" % (v / 1024.0)
+    return "%.0f MB" % v
 
 
 def _css(v: str) -> str:
@@ -194,6 +218,8 @@ QLabel#h2          { color: $text; font-family: $font; font-size: 14px; font-wei
 QLabel#body        { color: $dim;  font-family: $font; font-size: 13px; }
 QLabel#kv_k        { color: $dim;  font-family: $font; font-size: 13px; }
 QLabel#kv_v        { color: $text; font-family: $font; font-size: 13px; }
+/* 只加字重、不改尺寸：合计要突出，但不能破坏与分项的同一条左对齐线 */
+QLabel#kv_v_strong { color: $text; font-family: $font; font-size: 13px; font-weight: 600; }
 
 QToolButton#winBtn { border: none; background: transparent; border-radius: 0px; }
 QToolButton#winBtn:hover { background: $hover; }
@@ -587,6 +613,219 @@ class ToggleRow(QWidget):
 
 # ------------------------------------------------------------------ 检测
 
+class RemoteHostRow(QWidget):
+    """一台远程主机：名称、地址、一个动作按钮。
+
+    状态只有三种，而且**由主窗口推过来**（`set_state`），面板不自己去探测——
+    连接是主窗口的事，面板只负责显示和发指令。
+    """
+
+    def __init__(self, host, pal: dict, on_toggle, on_edit, parent=None):
+        super().__init__(parent)
+        self.host = host
+        self.pal = pal
+        self._on_toggle = on_toggle
+
+        self.name_lbl = QLabel(host.name)
+        # 固定名字列宽，让地址从同一条竖线开始——两张表拼在一起的观感，
+        # 和内存卡那次"数字一左一右"是同一类问题（2026-11-12）。
+        self.name_lbl.setMinimumWidth(110)
+        self.addr_lbl = QLabel(host.display_address)
+        self.addr_lbl.setStyleSheet(Template(
+            "color: $dim; font-family: $font; font-size: 12px;"
+        ).substitute(dim=pal["dim"], font=FONT))
+
+        self.btn = QPushButton("连接")
+        self.btn.setObjectName("action")
+        # 固定宽度：文案在"连接 / 连接中… / 断开"之间切换，用最小宽度会让
+        # 每个状态下的按钮宽度都不一样，一列按钮左边缘参差（2026-11-12 截图核对）。
+        self.btn.setFixedWidth(84)
+        self.btn.clicked.connect(lambda: self._on_toggle(self.host))
+
+        edit = QToolButton()
+        edit.setObjectName("winBtn")
+        # 图标库里没有铅笔，用齿轮：点开的就是这台主机的设置对话框，
+        # 语义反而更准。`pencil` 不存在时会画出一个空白方块（已实测）。
+        edit.setIcon(icons.qicon("settings", pal["dim"], 14))
+        edit.setToolTip("编辑这台主机")
+        edit.clicked.connect(lambda: on_edit(self.host))
+
+        lay = QHBoxLayout(self)
+        # 左右 16 与卡片内其它行对齐（KeyValueRow 也是 16）
+        lay.setContentsMargins(16, 2, 16, 2)
+        lay.setSpacing(8)
+        lay.addWidget(self.name_lbl)
+        lay.addWidget(self.addr_lbl, 1)
+        lay.addWidget(edit)
+        lay.addWidget(self.btn)
+        self.setFixedHeight(40)
+
+    def set_state(self, state: dict) -> None:
+        """`state` 由主窗口给：connected / connecting / None。"""
+        conn = bool(state.get("connected"))
+        stage = state.get("stage") or ""
+        if conn:
+            self.btn.setText("断开")
+            self.btn.setEnabled(True)
+        elif stage:
+            self.btn.setText("连接中…")
+            self.btn.setEnabled(False)
+        else:
+            self.btn.setText("连接")
+            self.btn.setEnabled(True)
+
+    def set_palette_colors(self, pal: dict) -> None:
+        self.pal = pal
+        self.addr_lbl.setStyleSheet(Template(
+            "color: $dim; font-family: $font; font-size: 12px;"
+        ).substitute(dim=pal["dim"], font=FONT))
+
+
+class RemoteHostDialog(QDialog):
+    """添加/编辑一台远程主机。
+
+    只收"连哪儿、怎么起服务、断开后留不留"。**不收密码**——认证交给系统 SSH
+    （密钥 / agent / `~/.ssh/config`），我们不把凭据落到自己的配置文件里。
+    """
+
+    def __init__(self, pal: dict, host=None, aliases=None, parent=None):
+        super().__init__(parent)
+        self.pal = pal
+        self.result_host = None
+        self._origin = host
+        self.setWindowTitle("编辑远程主机" if host else "添加远程主机")
+        self.setMinimumWidth(460)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 14)
+        layout.setSpacing(10)
+
+        def field(label: str, value: str, hint: str = "") -> QLineEdit:
+            cap = QLabel(label)
+            cap.setStyleSheet(Template(
+                "color: $dim; font-family: $font; font-size: 12px;"
+            ).substitute(dim=pal["dim"], font=FONT))
+            layout.addWidget(cap)
+            edit = QLineEdit(value)
+            edit.setPlaceholderText(hint)
+            layout.addWidget(edit)
+            return edit
+
+        self.ed_name = field("名称（可留空）", host.name if host else "",
+                             "比如「家的服务器」")
+        self.ed_host = field("地址", host.host if host else "",
+                             "主机名、IP，或 ~/.ssh/config 里的别名")
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        col_user = QVBoxLayout()
+        col_user.setSpacing(4)
+        cap = QLabel("用户（可留空）")
+        cap.setStyleSheet(Template("color: $dim; font-family: $font; font-size: 12px;")
+                          .substitute(dim=pal["dim"], font=FONT))
+        col_user.addWidget(cap)
+        self.ed_user = QLineEdit(host.user if host else "")
+        self.ed_user.setPlaceholderText("留空则用 ssh 配置里的")
+        col_user.addWidget(self.ed_user)
+        col_port = QVBoxLayout()
+        col_port.setSpacing(4)
+        cap2 = QLabel("端口")
+        cap2.setStyleSheet(Template("color: $dim; font-family: $font; font-size: 12px;")
+                           .substitute(dim=pal["dim"], font=FONT))
+        col_port.addWidget(cap2)
+        self.ed_port = QLineEdit(str(host.port if host else 22))
+        self.ed_port.setFixedWidth(80)
+        col_port.addWidget(self.ed_port)
+        row.addLayout(col_user, 1)
+        row.addLayout(col_port)
+        layout.addLayout(row)
+
+        self.ed_cmd = field("远端启动命令", host.launch_command if host else "dsh web",
+                            "dsh web")
+        hint = QLabel("会自动追加 --host 127.0.0.1 --port 0 --no-open，"
+                      "所以命令必须原样接受这三个参数。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(Template("color: $muted; font-family: $font; font-size: 11px;")
+                           .substitute(muted=pal["muted"], font=FONT))
+        layout.addWidget(hint)
+
+        cap3 = QLabel("断开后远端服务")
+        cap3.setStyleSheet(Template("color: $dim; font-family: $font; font-size: 12px;")
+                           .substitute(dim=pal["dim"], font=FONT))
+        layout.addWidget(cap3)
+        self.cb_keep = QComboBox()
+        for text, value in (("每次询问", remote.KEEP_ASK),
+                            ("保留（服务器上跑长任务）", remote.KEEP_KEEP),
+                            ("停止（临时连一下就断开）", remote.KEEP_STOP)):
+            self.cb_keep.addItem(text, value)
+        cur = host.keep_service if host else remote.KEEP_ASK
+        self.cb_keep.setCurrentIndex(max(0, self.cb_keep.findData(cur)))
+        layout.addWidget(self.cb_keep)
+
+        aliases = [a for a in (aliases or []) if a]
+        if aliases:
+            self.cb_alias = QComboBox()
+            self.cb_alias.addItem("从 ~/.ssh/config 选一台…", "")
+            for a in aliases:
+                self.cb_alias.addItem(a, a)
+            self.cb_alias.currentIndexChanged.connect(self._pick_alias)
+            layout.addWidget(self.cb_alias)
+        else:
+            self.cb_alias = None
+
+        self.lbl_err = QLabel("")
+        self.lbl_err.setWordWrap(True)
+        self.lbl_err.setStyleSheet(Template("color: $bad; font-family: $font; font-size: 12px;")
+                                   .substitute(bad=pal["bad"], font=FONT))
+        layout.addWidget(self.lbl_err)
+
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        cancel = QPushButton("取消")
+        cancel.setObjectName("action")
+        cancel.clicked.connect(self.reject)
+        ok = QPushButton("保存")
+        ok.setObjectName("primary")
+        ok.clicked.connect(self._save)
+        btns.addWidget(cancel)
+        btns.addWidget(ok)
+        layout.addLayout(btns)
+
+        # dsh_theme 反过来 import 了本模块（它要用 FONT 和 palette），
+        # 所以这里只能延迟导入——模块级导入会成环。
+        from dsh_theme import style_dialog
+        style_dialog(self, pal)
+
+    def _pick_alias(self, index: int) -> None:
+        alias = self.cb_alias.itemData(index) if self.cb_alias else ""
+        if alias:
+            self.ed_host.setText(alias)
+            if not self.ed_name.text().strip():
+                self.ed_name.setText(alias)
+
+    def _save(self) -> None:
+        host = remote.SshHost(
+            id=self._origin.id if self._origin else "",
+            name=self.ed_name.text().strip(),
+            host=self.ed_host.text().strip(),
+            user=self.ed_user.text().strip(),
+            port=self._port_value(),
+            launch_command=self.ed_cmd.text().strip() or "dsh web",
+            keep_service=self.cb_keep.currentData())
+        try:
+            host.validate()
+        except remote.RemoteError as e:
+            self.lbl_err.setText(str(e))
+            return
+        self.result_host = host
+        self.accept()
+
+    def _port_value(self) -> int:
+        try:
+            return int(self.ed_port.text().strip() or 22)
+        except ValueError:
+            return 22
+
+
 class CheckResult:
     """一项检测的结论。`state` 只用 STATE_* 四个值。"""
 
@@ -749,6 +988,50 @@ class UsageWorker(QThread):
             self.done.emit({"error": "%s: %s" % (type(e).__name__, e)})
 
 
+class MemWorker(QThread):
+    """常驻的整树内存采样线程。
+
+    为什么不放界面线程（2026-11-12）
+    -------------------------------
+    `procmem.snapshot()` 要遍历全机进程表再逐个取内存，**实测 16 ms**——
+    正好是一帧的时间。面板里每 2 秒付一次这种代价，滚动或淡入动画撞上就顿一下；
+    而这块数据的用途是"盯着看有没有涨"，晚 2 秒到毫无影响。
+
+    采样间隔用 `Event.wait()` 而不是 `time.sleep()`：停止时能立刻醒来，
+    不然退出面板要等最多一个间隔（Qt 里线程晚退就是 abort，见 shutdown 的注释）。
+    """
+    sample = Signal(object)
+
+    def __init__(self, interval_ms: int = MEM_SAMPLE_MS, parent=None):
+        super().__init__(parent)
+        self._interval = max(500, int(interval_ms)) / 1000.0
+        self._halt = threading.Event()
+        self._halt.set()          # 未 start 前视为"已停"
+
+    def run(self):
+        while not self._halt.is_set():
+            try:
+                snap = procmem.snapshot()
+            except Exception:                                    # noqa: BLE001
+                snap = None      # 采不到就当这一轮没有，不要连累界面
+            if self._halt.is_set():
+                break
+            if snap is not None:
+                self.sample.emit(snap)
+            self._halt.wait(self._interval)
+
+    def start_sampling(self) -> None:
+        if self.isRunning():
+            return
+        self._halt.clear()
+        self.start()
+
+    def stop_sampling(self, timeout_ms: int = 3000) -> bool:
+        """停并等它真的退出。返回是否在超时内结束。"""
+        self._halt.set()
+        return self.wait(timeout_ms)
+
+
 # ------------------------------------------------------------------ 主机接口
 
 class PanelHost:
@@ -761,7 +1044,9 @@ class PanelHost:
     def __init__(self, install=None, handle=None, host_release=None,
                  theme=None, open_path=None, open_web=None, log_dir=None,
                  flag=None, set_flag=None, action=None, data_dir=None,
-                 usage=None):
+                 usage=None, remote_hosts=None, remote_save=None,
+                 remote_connect=None, remote_disconnect=None,
+                 remote_state=None):
         self._install = install
         self._handle = handle
         self._release = host_release
@@ -778,6 +1063,15 @@ class PanelHost:
         self._flag = flag or (lambda name: False)
         self._set_flag = set_flag or (lambda name, value: None)
         self.action = action or (lambda name: None)
+        #: 远程主机（2026-11-12）。读写默认直接走 `dsh_host.remote`，
+        #: 连接/断开必须注入——那是主窗口的活，面板不该自己去起 SSH 隧道。
+        #: 自测时全部注入假的，于是这块 UI 能在没有 SSH 的机器上跑。
+        self.remote_hosts = remote_hosts or remote.load_hosts
+        self.remote_save = remote_save or remote.save_hosts
+        self.remote_connect = remote_connect or (lambda host: None)
+        self.remote_disconnect = remote_disconnect or (lambda: None)
+        #: {"host_id":…, "stage":…, "connected":bool, "error":…}
+        self.remote_state = remote_state or (lambda: {})
 
     def install(self):
         return self._install() if callable(self._install) else self._install
@@ -1005,6 +1299,13 @@ class BasePage(QWidget):
             self.build()
             self._fit_buttons()
 
+    def on_hide(self) -> None:
+        """页面被切走或面板收起时调用。有周期任务的页面覆盖它。
+
+        默认什么都不做——只有真正在后台持续花钱的页面才需要停，
+        比如概览页的内存采样线程。
+        """
+
     def _fit_buttons(self) -> None:
         """给按钮一个可靠的下限尺寸。
 
@@ -1049,7 +1350,7 @@ class OverviewPage(BasePage):
         self.layout_.addWidget(_label("概览", "h1"))
 
         inst = self.host.install()
-        self.kv_shell = KeyValueRow("桌面壳版本", HOST_VERSION, self.pal)
+        self.kv_shell = KeyValueRow(f"{HOST_NAME}版本", HOST_VERSION, self.pal)
         self.kv_dsh = KeyValueRow("DSH 版本",
                                   inst.version if inst else "未检测", self.pal)
         self.kv_src = KeyValueRow("DSH 来源", inst.source if inst else "—", self.pal)
@@ -1058,6 +1359,8 @@ class OverviewPage(BasePage):
         for w in (self.kv_shell, self.kv_dsh, self.kv_src, self.kv_svc):
             c1.add(w)
         self.layout_.addWidget(c1)
+
+        self.layout_.addWidget(self._build_mem_card())
 
         # 只留一个主动作。更新、外观、开发者、数据目录都搬去了「常规」——
         # 以前这些全堆在概览里，用户想看个端口都得先划过一屏设置（2026-10-20 重排）。
@@ -1077,6 +1380,83 @@ class OverviewPage(BasePage):
 
         self.layout_.addStretch(1)
         self.refresh()
+
+    # ---- 内存占用（2026-11-12）----
+    #
+    # 老大在任务管理器里数内存时被迫"到处找再相加"：壳、QtWebEngineProcess、
+    # node 的映像名各不相同，任务管理器按映像名分行；而全机的 node.exe 还混着
+    # 别的产品。这里按**进程树**归拢成三块（壳 / 网页 / 服务），和 mem.log
+    # 用的是同一套口径，省得界面和日志各说一套。
+    #
+    # 只显示**私有内存**：工作集会被系统随时裁剪（最小化就掉到十几 MB），
+    # 拿它加总既不准，也会让人误判"内存被释放了"。
+
+    def _build_mem_card(self) -> Card:
+        card = Card("内存占用", self.pal)
+
+        # 合计单独一行，但**必须和下面三块走同一条左对齐线**。
+        # 第一版把合计做成右对齐的大字，结果数字一左一右，
+        # 看起来像两张表拼在一起（2026-11-12 截图核对当场改掉）。
+        # 层次靠字重而不是靠位置：合计加粗，位置与分项一致。
+        self.kv_mem_total = KeyValueRow("合计", "—", self.pal)
+        self.kv_mem_total.v.setObjectName("kv_v_strong")
+        self.kv_mem_total.v.style().unpolish(self.kv_mem_total.v)
+        self.kv_mem_total.v.style().polish(self.kv_mem_total.v)
+        card.add(self.kv_mem_total)
+
+        self.mem_rows: dict[str, KeyValueRow] = {}
+        for key, title in (("host", "主进程"), ("webengine", "网页"),
+                           ("node", "后台服务")):
+            r = KeyValueRow(title, "—", self.pal)
+            self.mem_rows[key] = r
+            card.add(r)
+        # 「其他」平时是 0，只在真有不归类的子进程时才出现，免得常年挂一行 0 MB
+        self.mem_row_other = KeyValueRow("其他", "—", self.pal)
+        self.mem_row_other.setVisible(False)
+        card.add(self.mem_row_other)
+
+        # 说明压成一行：概览页固定 600 高，多一行就把下面的「进入工作」挤出首屏，
+        # 而那句提示又必须留在界面上（工作集和私有内存混淆是真实发生过的误判）。
+        card.add_text("私有内存＝真实占用；任务管理器那列是工作集，最小化会缩水。")
+        self._mem_worker = None
+        return card
+
+    def _start_mem(self) -> None:
+        w = getattr(self, "_mem_worker", None)
+        if w is None:
+            w = MemWorker(parent=self)
+            w.sample.connect(self._apply_mem)
+            self._mem_worker = w
+        w.start_sampling()
+
+    def _stop_mem(self, timeout_ms: int = 3000) -> bool:
+        w = getattr(self, "_mem_worker", None)
+        if w is None or not w.isRunning():
+            return True
+        return w.stop_sampling(timeout_ms)
+
+    def _apply_mem(self, snap: dict) -> None:
+        groups = snap.get("groups") or {}
+        total = snap.get("total_private", 0.0)
+        count = 1 + len(snap.get("rows") or [])
+        self.kv_mem_total.set("%s　·　%d 个进程" % (human_mem(total), count))
+        for key, row in self.mem_rows.items():
+            g = groups.get(key) or {"private": 0.0, "count": 0}
+            n = int(g.get("count") or 0)
+            # 没进程时写 "0 MB" 而不是破折号：em dash 在这个字号下只有十几像素，
+            # 缩略看跟空白没区别，会被当成"这行没渲染出来"（2026-11-12 亲眼看错一次）。
+            if n <= 0:
+                row.set("0 MB")
+            elif n > 1:
+                row.set("%s　·　%d 个进程" % (human_mem(g.get("private") or 0), n))
+            else:
+                row.set(human_mem(g.get("private") or 0))
+        other = groups.get("other") or {"private": 0.0, "count": 0}
+        n_other = int(other.get("count") or 0)
+        self.mem_row_other.setVisible(n_other > 0)
+        if n_other > 0:
+            self.mem_row_other.set("%s　·　%d 个进程"
+                                   % (human_mem(other.get("private") or 0), n_other))
 
     def refresh(self) -> None:
         inst = self.host.install()
@@ -1101,6 +1481,14 @@ class OverviewPage(BasePage):
             super().on_show()
         else:
             self.refresh()
+        self._start_mem()
+
+    def on_hide(self) -> None:
+        """切走就停采样：没人看的时候不该有线程在数内存。"""
+        self._stop_mem()
+
+    def shutdown(self, timeout_ms: int = 8000) -> bool:
+        return self._stop_mem(timeout_ms)
 
     def apply_palette(self, pal: dict) -> None:
         super().apply_palette(pal)
@@ -1108,6 +1496,10 @@ class OverviewPage(BasePage):
             return
         for w in (self.kv_shell, self.kv_dsh, self.kv_src, self.kv_svc):
             w.set_palette_colors(pal)
+        for w in list(getattr(self, "mem_rows", {}).values()) + \
+                [getattr(self, "mem_row_other", None)]:
+            if w is not None:
+                w.set_palette_colors(pal)
         for c in self.findChildren(Card):
             c.set_palette_colors(pal)
         for r in getattr(self, "toggles", {}).values():
@@ -1394,7 +1786,7 @@ class DeployPage(BasePage):
         # 这条原本是托盘里的「准备运行环境…」。挪过来而不是删掉——能力还在，
         # 只是从"日常入口"降级成"不想自己装时的兜底"，且必须点进这一页才看得到。
         c3 = Card("不想自己装？", self.pal)
-        c3.add_text("可以让桌面壳代劳：自动安装 Node.js 与 DeepSeek Harness。"
+        c3.add_text(f"可以让{HOST_NAME}代劳：自动安装 Node.js 与 DeepSeek Harness。"
                     "装到应用自己的数据目录（和命令行里那份互不影响）。"
                     "需要联网，中途会弹出进度窗口。")
         holder = QWidget()
@@ -1508,6 +1900,13 @@ class RunModePage(BasePage):
         c0.add(self.kv_ver)
         self.layout_.addWidget(c0)
 
+        # --- 远程 ---
+        # 放在"私有/公共"之前：那两个是"用哪一份 DSH 安装"，属于本地细节；
+        # 远程是"用哪台机器"，是同一层级的顶层选择，而且日常使用频率最高
+        # （配好之后每次只是连一下）。放最后要滚两屏才够到，等于藏起来。
+        self.layout_.addWidget(self._build_remote_card())
+        self._rebuild_hosts()
+
         # --- 私有 ---
         c1 = Card("私有安装（推荐）", self.pal)
         self.kv_priv = KeyValueRow("状态", "—", self.pal)
@@ -1545,20 +1944,147 @@ class RunModePage(BasePage):
         c2.add(h2)
         self.layout_.addWidget(c2)
 
-        # --- 远程 ---
-        c3 = Card("远程 DSH（规划中）", self.pal)
-        c3.add_text("\n".join((
-            "· 把另一台设备上的 DSH 呈现在本机窗口里，多台设备各开一个窗口",
-            "· 目标设备可以还没启动 DSH——由连接过程带着把它拉起来",
-            "· 依托你已有的通道（SSH 隧道或组网），不额外占端口",
-        )))
-        c3.add_text(
-            "底线不变：我们不会让 DSH 监听外网。它仍然只听本机，"
-            "由隧道把本机端口借过来——官方正是因为这个能力才把监听锁死在本机。")
-        self.layout_.addWidget(c3)
-
         self.layout_.addStretch(1)
         self.refresh()
+
+    # ---- 远程主机（2026-11-12）----
+    #
+    # 面板在这里只做三件事：列出保存过的主机、发"连/断"的指令、显示主窗口推过来的
+    # 状态。**真正的 SSH 连接在主窗口**——面板不该自己去起隧道，否则自测要在
+    # 没有 SSH 的机器上跑不动，退出时也没人收尾。
+
+    def _build_remote_card(self) -> Card:
+        # 标"实验"是必须的：到发这一版为止，SSH 那条链路只验证到"连不上时的
+        # 错误分类是对的"，"复用远端已有实例"还没在真机上跑过（本机的 MSYS
+        # 判不准进程身份）。不标的话，用户会以为是成熟功能。
+        card = Card("远程 DSH（实验）", self.pal)
+        self.kv_remote = KeyValueRow("当前连接", "未连接", self.pal)
+        card.add(self.kv_remote)
+
+        self._hosts_box = QWidget()
+        self._hosts_lay = QVBoxLayout(self._hosts_box)
+        self._hosts_lay.setContentsMargins(0, 2, 0, 2)
+        self._hosts_lay.setSpacing(0)
+        card.add(self._hosts_box)
+
+        self.lbl_remote_empty = QLabel("还没有配置主机。")
+        self.lbl_remote_empty.setStyleSheet(Template(
+            "color: $dim; font-family: $font; font-size: 12px;"
+            " padding: 4px 16px 8px 16px;"
+        ).substitute(dim=self.pal["dim"], font=FONT))
+        card.add(self.lbl_remote_empty)
+
+        holder = QWidget()
+        row = QHBoxLayout(holder)
+        row.setContentsMargins(16, 4, 16, 10)
+        row.setSpacing(8)
+        self.btn_add_host = QPushButton("添加主机")
+        self.btn_add_host.setObjectName("primary")
+        self.btn_add_host.clicked.connect(self._add_remote_host)
+        self.btn_disconnect = QPushButton("断开")
+        self.btn_disconnect.setObjectName("action")
+        self.btn_disconnect.clicked.connect(lambda: self.host.remote_disconnect())
+        self.btn_disconnect.setEnabled(False)
+        row.addWidget(self.btn_add_host)
+        row.addWidget(self.btn_disconnect)
+        row.addStretch(1)
+        card.add(holder)
+
+        card.add_text("断开后远端服务留不留，由每台主机自己的设置决定；"
+                      "认证走你系统里的 SSH（密钥或 agent），我们不经手密码。")
+        card.add_text("底线不变：DSH 永远只听远端本机，由隧道把端口借过来。")
+        return card
+
+    def _rebuild_hosts(self) -> None:
+        while self._hosts_lay.count():
+            item = self._hosts_lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._remote_rows = {}
+        hosts = []
+        try:
+            hosts = list(self.host.remote_hosts() or [])
+        except Exception:                                       # noqa: BLE001
+            hosts = []
+        for h in hosts:
+            row = RemoteHostRow(h, self.pal, self._toggle_remote,
+                                self._edit_remote_host)
+            self._remote_rows[h.id] = row
+            self._hosts_lay.addWidget(row)
+        self.lbl_remote_empty.setVisible(not hosts)
+        self._apply_remote_state()
+
+    def _apply_remote_state(self) -> None:
+        state = {}
+        try:
+            state = self.host.remote_state() or {}
+        except Exception:                                       # noqa: BLE001
+            state = {}
+        cur = state.get("host_id") or ""
+        stage = state.get("stage") or ""
+        err = state.get("error") or ""
+        connected = bool(state.get("connected"))
+        self.kv_remote.set(
+            ("已连接：" + state.get("name", "")) if connected
+            else (stage or ("失败：" + err.splitlines()[0][:60] if err else "未连接")))
+        # 断开只在"真的连上了"才可点：连接过程中打断会留下半开的隧道，
+        # 而我们没法在半路取消一个正在阻塞的 SSH 调用。
+        self.btn_disconnect.setEnabled(connected)
+        for hid, row in getattr(self, "_remote_rows", {}).items():
+            if hid == cur:
+                row.set_state({"connected": connected, "stage": stage})
+            else:
+                row.set_state({})
+
+    def refresh_remote(self) -> None:
+        """主窗口推送远程状态变化时调用。
+
+        只更新文案、不重建主机行——重建会 deleteLater 掉正在点的那个按钮，
+        用户会觉得"点了一下界面闪了一下"。
+        """
+        if getattr(self, "_remote_rows", None) is None:
+            return
+        self._apply_remote_state()
+
+    def _toggle_remote(self, host_obj) -> None:
+        state = {}
+        try:
+            state = self.host.remote_state() or {}
+        except Exception:                                       # noqa: BLE001
+            state = {}
+        if state.get("host_id") == host_obj.id and (state.get("connected")
+                                                    or state.get("stage")):
+            self.host.remote_disconnect()
+            return
+        self.host.remote_connect(host_obj)
+        QTimer.singleShot(200, self._apply_remote_state)
+
+    def _add_remote_host(self) -> None:
+        dlg = RemoteHostDialog(self.pal, aliases=remote.ssh_config_aliases(),
+                               parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted or dlg.result_host is None:
+            dlg.deleteLater()
+            return
+        hosts = list(self.host.remote_hosts() or [])
+        hosts.append(dlg.result_host)
+        dlg.deleteLater()
+        self.host.remote_save(hosts)
+        self._rebuild_hosts()
+
+    def _edit_remote_host(self, host_obj) -> None:
+        dlg = RemoteHostDialog(self.pal, host=host_obj,
+                               aliases=remote.ssh_config_aliases(), parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted or dlg.result_host is None:
+            dlg.deleteLater()
+            return
+        new = dlg.result_host
+        dlg.deleteLater()
+        hosts = []
+        for h in (self.host.remote_hosts() or []):
+            hosts.append(new if h.id == host_obj.id else h)
+        self.host.remote_save(hosts)
+        self._rebuild_hosts()
 
     def refresh(self) -> None:
         mode = str(config.get("dsh_source") or "auto")
@@ -1583,6 +2109,8 @@ class RunModePage(BasePage):
         self.btn_public.setText("正在使用" if mode == "system" else "启用公共")
         self.btn_public.setEnabled(mode != "system")
 
+        self._apply_remote_state()
+
     def on_show(self) -> None:
         if not self._built:
             super().on_show()
@@ -1595,6 +2123,8 @@ class RunModePage(BasePage):
             return
         for w in (self.kv_mode, self.kv_ver, self.kv_priv, self.kv_pub):
             w.set_palette_colors(pal)
+        for row in getattr(self, "_remote_rows", {}).values():
+            row.set_palette_colors(pal)
         for c in self.findChildren(Card):
             c.set_palette_colors(pal)
 
@@ -1737,13 +2267,13 @@ class AboutPage(BasePage):
         rel = self.host.host_release()
 
         c = Card("版本", self.pal)
-        c.add(KeyValueRow("桌面壳", HOST_VERSION, self.pal))
+        c.add(KeyValueRow(HOST_NAME, HOST_VERSION, self.pal))
         c.add(KeyValueRow("DSH", inst.version if inst else "未检测", self.pal))
         c.add(KeyValueRow("可更新到", rel or "（未查询）", self.pal))
         self.layout_.addWidget(c)
 
         c2 = Card("来源与许可", self.pal)
-        c2.add(KeyValueRow("桌面壳仓库", HOST_REPO, self.pal))
+        c2.add(KeyValueRow("项目仓库", HOST_REPO, self.pal))
         c2.add(KeyValueRow("DSH 依赖", updater.PKG_NAME, self.pal))
         c2.add_text("界面图标来自 Lucide（ISC 许可），已内联为源码，"
                     "运行时不读外部文件。")
@@ -1841,7 +2371,7 @@ class ControlPanel(QWidget):
                          | Qt.WindowType.FramelessWindowHint)
         self.host = host
         self.setObjectName("panel")
-        self.setWindowTitle("DSH Launcher 控制面板")
+        self.setWindowTitle(f"{HOST_NAME}控制面板")
         self.setFixedSize(PANEL_W, PANEL_H)
         # 半透明底是自绘圆角的前提：四个角要能透出桌面
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
@@ -1854,7 +2384,7 @@ class ControlPanel(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        self.titlebar = TitleBar("DSH Launcher 控制面板", self.pal, self)
+        self.titlebar = TitleBar(f"{HOST_NAME}控制面板", self.pal, self)
         self.titlebar.btn_min.clicked.connect(self.showMinimized)
         self.titlebar.btn_close.clicked.connect(self.close)
         root.addWidget(self.titlebar)
@@ -1981,6 +2511,11 @@ class ControlPanel(QWidget):
     def goto(self, index: int) -> None:
         if index < 0 or index >= len(self.PAGES):
             return
+        if index != self.current:
+            prev = self.pages.get(self.current)
+            if prev is not None:
+                # 被切走的页面要停掉自己的周期任务（目前只有概览页的内存采样）
+                prev.on_hide()
         page = self._page(index)
         self.stack.setCurrentIndex(index)
         for i, nav in enumerate(self.navs):
@@ -1992,6 +2527,12 @@ class ControlPanel(QWidget):
         self.refresh_statusbar()
 
     # ---- 状态条 ----
+    def refresh_remote(self) -> None:
+        """主窗口推送远程状态时调用。转发给「运行方式」页。"""
+        page = self.pages.get(1)
+        if page is not None and hasattr(page, "refresh_remote"):
+            page.refresh_remote()
+
     def refresh_statusbar(self) -> None:
         inst = self.host.install()
         h = self.host.handle()
@@ -2022,6 +2563,24 @@ class ControlPanel(QWidget):
             self.close()
             return
         super().keyPressEvent(e)
+
+    # ---- 显示 / 隐藏 ----
+    #
+    # 概览页的内存采样是**持续**花钱的（每 2 秒遍历一次全机进程表），所以
+    # 它的生命周期必须跟"面板有没有开着"绑定：收起面板就停，
+    # 重新打开再起。否则关掉面板后线程还在后台数进程，纯属白烧。
+
+    def showEvent(self, e) -> None:                                # noqa: N802
+        super().showEvent(e)
+        page = self.pages.get(self.current)
+        if page is not None:
+            page.on_show()          # 各页的 on_show 都是幂等的
+
+    def hideEvent(self, e) -> None:                                # noqa: N802
+        page = self.pages.get(self.current)
+        if page is not None:
+            page.on_hide()
+        super().hideEvent(e)
 
 
 # ------------------------------------------------------------------ 自测钩子
@@ -2123,8 +2682,20 @@ def selftest_checks() -> list:
         time.sleep(1.2)
         return fake_usage
 
+    # 远程主机用假数据：自测不该去读用户真实的 remote-hosts.json，
+    # 更不该真去连 SSH。这里只验"面板能不能把主机列出来、状态对不对"。
+    fake_hosts = [
+        remote.SshHost(name="家里的服务器", host="home-box", user="cx",
+                       keep_service=remote.KEEP_KEEP),
+        remote.SshHost(name="临时机器", host="10.0.0.5", port=2222),
+    ]
+    fake_remote_state = {"host_id": fake_hosts[0].id, "name": fake_hosts[0].name,
+                         "stage": "正在建立隧道…", "connected": False, "error": ""}
+
     host = PanelHost(install=None, handle=None, theme=lambda: "dark",
-                     usage=fake_usage_scan)
+                     usage=fake_usage_scan,
+                     remote_hosts=lambda: list(fake_hosts),
+                     remote_state=lambda: dict(fake_remote_state))
     panel = ControlPanel(host)
     panel.resize(PANEL_W, PANEL_H)
     panel.show()
@@ -2165,6 +2736,62 @@ def selftest_checks() -> list:
     except Exception as e:                                       # noqa: BLE001
         check("五个页面都能切换并完成构建", False,
               "%s: %s" % (type(e).__name__, e))
+
+    # --- 概览页的内存栏（2026-11-12）---
+    # 数字靠**注入一份假快照**来验，不依赖本机真有哪些进程——否则这条断言
+    # 在 CI（只跑静态分支）和开发机上会得出不同结论。
+    check("内存格式化：MB 与 GB 两种量级",
+          human_mem(509) == "509 MB" and human_mem(1645) == "1.6 GB"
+          and human_mem(0) == "0 MB" and human_mem(None) == "—",
+          "%s / %s" % (human_mem(509), human_mem(1645)))
+
+    op = panel.pages.get(0)
+    check("概览页有内存栏（合计 + 壳/网页/服务三块）",
+          op is not None and hasattr(op, "kv_mem_total")
+          and set(getattr(op, "mem_rows", {})) == {"host", "webengine", "node"})
+
+    if op is not None and hasattr(op, "kv_mem_total"):
+        fake = {
+            "total_ws": 755.0, "total_private": 1645.0,
+            "groups": {"host": {"ws": 85, "private": 509, "count": 1},
+                       "webengine": {"ws": 364, "private": 521, "count": 2},
+                       "node": {"ws": 306, "private": 615, "count": 2},
+                       "other": {"ws": 0, "private": 0, "count": 0}},
+            "rows": [{}, {}, {}, {}, {}],
+        }
+        op._apply_mem(fake)
+        total_txt = op.kv_mem_total.v.text()
+        check("合计取私有内存并带进程数",
+              "1.6 GB" in total_txt and "6 个进程" in total_txt, total_txt)
+        web_txt = op.mem_rows["webengine"].v.text()
+        check("三块分开显示，多进程的行标注数量",
+              op.mem_rows["host"].v.text() == "509 MB"
+              and "521 MB" in web_txt and "2 个进程" in web_txt,
+              "%s ｜ %s" % (op.mem_rows["host"].v.text(), web_txt))
+        check("「其他」为空时不占位", op.mem_row_other.isHidden())
+
+        fake["groups"]["other"] = {"ws": 2, "private": 3, "count": 1}
+        op._apply_mem(fake)
+        check("「其他」有内容时才出现",
+              not op.mem_row_other.isHidden()
+              and op.mem_row_other.v.text().startswith("3 MB"),
+              op.mem_row_other.v.text())
+
+    # 采样线程必须跟着页面可见性走。这条同时钉住 QThread 的**重启**能力：
+    # 停止后再 `start_sampling()` 必须能真的跑起来（halt 事件忘了 clear 就是"重启无效"）。
+    panel.goto(0)
+    loop_events(app, 150)
+    mw = getattr(op, "_mem_worker", None) if op is not None else None
+    check("回到概览页会启动内存采样",
+          mw is not None and mw.isRunning(),
+          "worker=%s" % ("None" if mw is None else
+                         ("运行中" if mw.isRunning() else "已停")))
+    panel.goto(5)
+    loop_events(app, 150)
+    check("切走概览页后内存采样已停",
+          mw is not None and not mw.isRunning(),
+          "worker=%s" % ("None" if mw is None else
+                         ("运行中" if mw.isRunning() else "已停")))
 
     sp = panel.pages.get(4)
     check("状态检测页覆盖全部预期项",
@@ -2380,6 +3007,35 @@ def selftest_checks() -> list:
     rp = panel.pages.get(1)
     check("运行方式页给出私有 / 公共两档入口",
           rp is not None and hasattr(rp, "btn_private") and hasattr(rp, "btn_public"))
+
+    # --- 远程主机列表（2026-11-12）---
+    rows = getattr(rp, "_remote_rows", {}) if rp is not None else {}
+    check("远程主机按配置逐台列出", len(rows) == len(fake_hosts),
+          "%d 台" % len(rows))
+    first = rows.get(fake_hosts[0].id)
+    check("主机行显示名称与地址",
+          first is not None and first.name_lbl.text() == "家里的服务器"
+          and first.addr_lbl.text() == "cx@home-box")
+    check("非默认端口写进地址显示",
+          any(r.addr_lbl.text().endswith(":2222") for r in rows.values()))
+    check("连接中的那台按钮禁用并显示进度",
+          first is not None and not first.btn.isEnabled()
+          and "连接中" in first.btn.text(),
+          first.btn.text() if first is not None else "")
+    check("没连上的主机按钮可点",
+          any(r.btn.isEnabled() and r.btn.text() == "连接" for r in rows.values()))
+    check("连接中时「断开」不可点（半开的隧道没法取消）",
+          rp is not None and not rp.btn_disconnect.isEnabled())
+
+    fake_remote_state.update({"connected": True, "stage": "", "name": "家里的服务器"})
+    if rp is not None:
+        rp.refresh_remote()
+    check("连上后状态行与按钮同步",
+          rp is not None and "已连接" in rp.kv_remote.v.text()
+          and rp.btn_disconnect.isEnabled()
+          and (rows.get(fake_hosts[0].id) is not None
+               and rows[fake_hosts[0].id].btn.text() == "断开"),
+          rp.kv_remote.v.text() if rp is not None else "")
 
     check("后台检测线程能干净收尾", panel.shutdown(15000))
 

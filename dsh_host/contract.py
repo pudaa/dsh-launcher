@@ -74,6 +74,10 @@ class ServiceHandle:
     started_at: float
     proc: subprocess.Popen | None = None
     _read_pos: int = 0
+    #: 远程主机名（空 = 本地服务）。远程会话复用同一套 handle 走加载流程，
+    #: 但"停服务 / 版本复验 / 更新 / 回滚"这些事对它都不成立，靠这个字段分流。
+    #: 不要把它写进 service.json——远程状态随连接生灭，不该跨进程持久化。
+    remote: str = ""
 
 
 # ------------------------------------------------------------------ 进程工具

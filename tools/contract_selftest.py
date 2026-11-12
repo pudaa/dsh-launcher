@@ -747,6 +747,14 @@ def main_lite() -> int:
     selfupdate_download_checks()
 
     print(LINE)
+    print("[L4] 远程 DSH（SSH 隧道：远端脚本语法与结果解析，不联网）")
+    # 只验纯逻辑：脚本生成能不能被 sh 解析、带前缀的输出能不能正确解析、
+    # 主机配置能不能安全往返。真正的 SSH 连接与复用判据只能在真机上验
+    # （本地那层由 tools/remote_script_smoke.py 用 sh 扮演远端）。
+    from dsh_host import remote as _remote
+    failures.extend(_remote.selftest_checks())
+
+    print(LINE)
     if failures:
         print("失败项：", "、".join(failures))
         return 1

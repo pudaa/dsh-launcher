@@ -112,10 +112,10 @@ import dsh_console
 import dsh_devtools
 import dsh_panel
 import dsh_theme
-from dsh_host import (config, contract, dwm, procmem, provision, selfupdate,
-                      storage, updater)
+from dsh_host import (config, contract, dwm, procmem, provision, remote,
+                      selfupdate, storage, updater)
 from dsh_host.contract import DshError, ServiceHandle
-from dsh_host.version import HOST_VERSION
+from dsh_host.version import HOST_NAME, HOST_TAGLINE, HOST_VERSION
 
 APP_TITLE = "DSH — DeepSeek Harness"
 SINGLETON_ID = "DSH-Web-singleton"
@@ -201,7 +201,7 @@ def resource_report() -> tuple[str, bool]:
     """
     packaged = ("__compiled__" in globals()) or bool(getattr(sys, "frozen", False))
     lines = [
-        "DSH Launcher 产物自检",
+        f"{HOST_NAME} 产物自检",
         "  sys.frozen       = %s" % getattr(sys, "frozen", False),
         "  __compiled__     = %s" % ("__compiled__" in globals()),
         "  __file__         = %s" % globals().get("__file__", "(无)"),
@@ -417,6 +417,35 @@ def attach_handle(inst: contract.DshInstall, port: int, logf: str) -> ServiceHan
 
 # ------------------------------------------------------------------ 后台工作
 
+class RemoteConnectWorker(QThread):
+    """在后台建立一条远程会话（SSH + 可能要在远端起 dsh web + 建隧道）。
+
+    必须后台：远端冷启动实测十几秒，上游再慢一点就是半分钟。界面线程里做，
+    窗口会白纱、面板按钮点不动。
+
+    失败的分类原样往上抛（`remote.RemoteError.kind`）——"认证没过"和
+    "远端没装 dsh"对用户是完全不同的两件事，不能压成一句"连接失败"。
+    """
+    stage = Signal(str)
+    ready = Signal(object, str)      # (RemoteSession, 带令牌的本地地址)
+    failed = Signal(str, str)        # (kind, 可读消息)
+
+    def __init__(self, host_obj, parent=None):
+        super().__init__(parent)
+        self.host_obj = host_obj
+        self.session = None
+
+    def run(self):
+        try:
+            self.session = remote.RemoteSession(self.host_obj)
+            url = self.session.connect(on_stage=self.stage.emit)
+            self.ready.emit(self.session, url)
+        except remote.RemoteError as e:
+            self.failed.emit(e.kind, str(e))
+        except Exception as e:                                   # noqa: BLE001
+            self.failed.emit("other", "%s: %s" % (type(e).__name__, e))
+
+
 class StartupWorker(QThread):
     progress = Signal(str)
     ready = Signal(object)
@@ -591,10 +620,10 @@ class HostCheckWorker(QThread):
     def run(self):
         try:
             rel, note = selfupdate.check_host_update()
-            host_log("检查桌面壳更新：%s" % note)
+            host_log(f"检查{HOST_NAME}更新：{note}")
             self.found.emit(rel, note)
         except Exception as e:                                   # noqa: BLE001
-            host_log("检查桌面壳更新失败：%s: %s" % (type(e).__name__, e))
+            host_log(f"检查{HOST_NAME}更新失败：{type(e).__name__}: {e}")
             self.failed.emit("%s: %s" % (type(e).__name__, e))
         finally:
             self.done.emit()
@@ -669,10 +698,10 @@ class HostUpdateWorker(QThread):
                            "重启后会运行新版本——重启本身是瞬时的，"
                            "不需要等待文件替换。" % info.get("version", ""))
         except selfupdate.SelfUpdateError as e:
-            host_log("桌面壳更新失败：%s" % e)
+            host_log(f"{HOST_NAME}更新失败：{e}")
             self.done.emit(False, str(e))
         except Exception as e:                                   # noqa: BLE001
-            host_log("桌面壳更新异常：%s: %s" % (type(e).__name__, e))
+            host_log(f"{HOST_NAME}更新异常：{type(e).__name__}: {e}")
             self.done.emit(False, "%s: %s" % (type(e).__name__, e))
 
 
@@ -992,7 +1021,7 @@ class HostUpdateDialog(QDialog):
 
     def __init__(self, parent, rel):
         super().__init__(parent)
-        self.setWindowTitle("桌面壳更新")
+        self.setWindowTitle(f"{HOST_NAME}更新")
         self.setMinimumWidth(620)
         self.resize(640, 440)
         self.rel = rel
@@ -1003,8 +1032,8 @@ class HostUpdateDialog(QDialog):
         lay.setSpacing(12)
 
         headline = QLabel(
-            f"DSH Launcher 有新版本 v{rel.version}（当前 v{HOST_VERSION}）。\n\n"
-            "这是桌面壳程序自身的更新，与 DSH 无关——\n"
+            f"{HOST_NAME}有新版本 v{rel.version}（当前 v{HOST_VERSION}）。\n\n"
+            f"这是{HOST_NAME}自身的更新，与 DSH 无关——\n"
             "更新后你的 DSH 版本、会话记录、登录状态都不受影响。")
         headline.setWordWrap(True)
         headline.setObjectName("dlgBody")
@@ -1501,6 +1530,13 @@ class MainWindow(QMainWindow):
         self._surface_resets: list[float] = []   # 视图重建时间戳（防循环）
         self._reset_pending = False       # 已排队的重建请求（去重）
         self._manual_reloads: list[float] = []   # 手动重载时间戳（连按判定）
+        # 远程会话（2026-11-12）：SSH 隧道 + 远端 dsh web。
+        # 同一时刻只允许一条远程会话，与本地服务互斥——两套 handle 同时活着，
+        # 状态栏、菜单、退出的收尾逻辑就得分叉判断，复杂度不值当。
+        self._remote = None               # remote.RemoteSession
+        self._remote_host = None          # remote.SshHost
+        self._remote_worker = None        # RemoteConnectWorker
+        self._remote_state: dict = {}     # 推给面板显示的那一份
 
         self.stack = QStackedWidget()
         # 关键：**StackAll** —— 所有页都参与排版、且都保持 show 状态，
@@ -1977,16 +2013,16 @@ class MainWindow(QMainWindow):
         self.act_rollback = QAction("回滚 DSH 到上一版本", self)
         self.act_rollback.triggered.connect(self._rollback)
 
-        # --- 桌面壳自身 ---
-        self.act_host_check = QAction("检查桌面壳更新…", self)
+        # --- 鲸坞自身 ---
+        self.act_host_check = QAction(f"检查{HOST_NAME}更新…", self)
         self.act_host_check.triggered.connect(lambda: self._check_host_update(manual=True))
         # 开发运行时自更新不可用，直接不给点，避免"点了报错说不行"
         supported, _reason = selfupdate.self_update_supported()
         if not supported:
             self.act_host_check.setEnabled(False)
-            self.act_host_check.setText("检查桌面壳更新…（仅打包版可用）")
+            self.act_host_check.setText(f"检查{HOST_NAME}更新…（仅打包版可用）")
 
-        self.act_about = QAction("关于 DSH Launcher", self)
+        self.act_about = QAction(f"关于{HOST_NAME}", self)
         self.act_about.triggered.connect(self._show_about)
 
         # 控制面板：托盘 menu 装不下的东西都在这里（状态、后续的引导与连接）
@@ -2041,7 +2077,7 @@ class MainWindow(QMainWindow):
         menu.addAction(self.act_quit)
 
         self.tray.setContextMenu(menu)
-        self.tray.setToolTip(f"{APP_TITLE}\n桌面壳 v{HOST_VERSION}")
+        self.tray.setToolTip(f"{APP_TITLE}\n{HOST_NAME} v{HOST_VERSION}")
         self.tray.activated.connect(
             lambda reason: self._show_main()
             if reason == QSystemTrayIcon.ActivationReason.DoubleClick else None)
@@ -2053,36 +2089,57 @@ class MainWindow(QMainWindow):
         """按当前版本状态调整菜单可用性——不做无意义的可点项。"""
         info = self.update_info
         cur = self.handle.install.version if self.handle else None
+        is_remote = bool(self.handle is not None
+                         and getattr(self.handle, "remote", ""))
 
-        if info:
-            self.act_stable.setEnabled(info.action == "downgrade")
-            self.act_stable.setText(
-                f"回归稳定版 {info.stable}" if info.action == "downgrade"
-                else "已是稳定版")
+        if is_remote:
+            # 远程会话期间，"更新 / 回滚 / 回归稳定版 / 加预览 / 准备环境"动的
+            # 都是**本机这份** DSH，跟窗口里显示的那台机器毫无关系。留着可点
+            # 等于骗人按下去——用户会以为自己在升级远端。一律禁用并写明原因。
+            for act in (self.act_check, self.act_prev, self.act_stable,
+                        self.act_rollback, self.act_setup):
+                act.setEnabled(False)
+            self.act_stable.setText("（远程会话中不可用）")
+            self.act_rollback.setText("（远程会话中不可用）")
+            self.act_check.setText("检查 DSH 更新（远程会话中不可用）")
         else:
-            # 还没拿到通道信息时不知道该回到哪个版本，宁可不给点
-            self.act_stable.setEnabled(False)
-            self.act_stable.setText("回归稳定版")
+            # 回到本地会话：把上面禁掉的那几项放开，再按各自状态细化
+            for act in (self.act_check, self.act_prev, self.act_setup):
+                act.setEnabled(True)
+            self.act_check.setText("检查 DSH 更新…")
+            if info:
+                self.act_stable.setEnabled(info.action == "downgrade")
+                self.act_stable.setText(
+                    f"回归稳定版 {info.stable}" if info.action == "downgrade"
+                    else "已是稳定版")
+            else:
+                # 还没拿到通道信息时不知道该回到哪个版本，宁可不给点
+                self.act_stable.setEnabled(False)
+                self.act_stable.setText("回归稳定版")
 
-        prev = config.get("previous_version")
-        rollback_ok = bool(prev and cur and prev != cur)
-        self.act_rollback.setEnabled(rollback_ok)
-        self.act_rollback.setText(
-            f"回滚 DSH 到 {prev}" if rollback_ok else "回滚 DSH 到上一版本")
+            prev = config.get("previous_version")
+            rollback_ok = bool(prev and cur and prev != cur)
+            self.act_rollback.setEnabled(rollback_ok)
+            self.act_rollback.setText(
+                f"回滚 DSH 到 {prev}" if rollback_ok else "回滚 DSH 到上一版本")
 
         if self.host_release:
-            self.act_host_check.setText(f"更新桌面壳到 {self.host_release.version}…")
+            self.act_host_check.setText(f"更新{HOST_NAME}到 {self.host_release.version}…")
         else:
             self.act_host_check.setText(
-                "检查桌面壳更新…" if selfupdate.self_update_supported()[0]
-                else "检查桌面壳更新…（仅打包版可用）")
+                f"检查{HOST_NAME}更新…" if selfupdate.self_update_supported()[0]
+                else f"检查{HOST_NAME}更新…（仅打包版可用）")
 
     # ----------------------------------------------------------- 启动回调
 
     def _on_ready(self, handle):
         self.handle = handle
-        host_log("服务就绪：%s | 端口 %s | 来源 %s"
-                 % (handle.install.describe(), handle.port, handle.install.source))
+        is_remote = bool(getattr(handle, "remote", ""))
+        if is_remote:
+            host_log("会话就绪：远程 %s · 隧道端口 %s" % (handle.remote, handle.port))
+        else:
+            host_log("服务就绪：%s | 端口 %s | 来源 %s"
+                     % (handle.install.describe(), handle.port, handle.install.source))
         self._ensure_webview()
         # UniqueConnection：`_on_ready` 会被 StartupWorker 与 `_swap_service.done`
         # 反复调用（换来源、迁移数据后重启服务）。不加这个，一次加载会触发 N 条
@@ -2092,6 +2149,10 @@ class MainWindow(QMainWindow):
         self.view.load(QUrl(handle.url))
         QTimer.singleShot(15000, self, self._force_reveal)
         self._refresh_menu()
+        if is_remote:
+            # 远程不做版本复验、不查更新：那台机器上的 DSH 是它自己的事，
+            # 我们既改不了也不该替它下判断。界面上的"DSH 版本"会显示"未知"。
+            return
         # 版本复验放到后台：启动路径采信了缓存里的版本号，这里补一次真实核对。
         # 对不上（用户在壳之外装了别的版本）时更新显示并提示，但不挡首屏。
         self._reverify = VersionReverifyWorker(handle.install.version)
@@ -2113,7 +2174,7 @@ class MainWindow(QMainWindow):
         self._info("检测到 DSH 版本与界面显示的不一致。\n\n"
                    "此前显示　%s\n"
                    "实际版本　%s\n\n"
-                   "通常意味着 DSH 在桌面壳之外被升级或降级过"
+                   f"通常意味着 DSH 在{HOST_NAME}之外被升级或降级过"
                    "（例如手动执行过 npm install -g）。\n"
                    "显示已按实际版本更新。"
                    % (shown, fresh.version))
@@ -2307,6 +2368,15 @@ class MainWindow(QMainWindow):
         里记的端口：那种情况下进程是**已经起来了**的，不按端口反查就只能干看着
         它常驻。`stop()` 对映像名做了校验，误杀别的程序的概率很低（2026-10-20 体检）。
         """
+        # 远程会话：停的是隧道（和可选的远端进程），没有本地 node 进程可杀。
+        # 这里不能落到下面的 `contract.stop()`——那会按端口去杀本机进程，
+        # 而那个端口是我们自己的隧道监听端口，杀了等于砍掉自己的转发。
+        if self._remote is not None or (self.handle is not None
+                                        and getattr(self.handle, "remote", "")):
+            self._stop_remote()
+            self.handle = None
+            return 1
+
         if self.handle is not None:
             port = self.handle.port or 0
         else:
@@ -2494,13 +2564,13 @@ class MainWindow(QMainWindow):
         """检查桌面壳自身更新。与 DSH 检查完全独立。"""
         if getattr(self, "_host_checking", False):
             if manual:
-                self._info("正在检查桌面壳更新，请稍候。")
+                self._info(f"正在检查{HOST_NAME}更新，请稍候。")
             return
         self._host_checking = True
         if manual:
             self.act_host_check.setEnabled(False)
             self.act_host_check.setText("检查中…")
-            host_log("手动检查桌面壳更新")
+            host_log(f"手动检查{HOST_NAME}更新")
 
         self._host_checker = HostCheckWorker()
         self._host_checker.found.connect(
@@ -2516,11 +2586,11 @@ class MainWindow(QMainWindow):
         if not manual:
             if rel:
                 self.tray.showMessage(
-                    "DSH Launcher 更新", f"桌面壳有新版本 v{rel.version}（点击查看）",
+                    f"{HOST_NAME}更新", f"{HOST_NAME}有新版本 v{rel.version}（点击查看）",
                     QSystemTrayIcon.MessageIcon.Information, 10000)
             return
         if not rel:
-            self._info("桌面壳" + note)
+            self._info(f"{HOST_NAME}{note}")
             return
         self._show_host_update_dialog(rel)
 
@@ -2528,8 +2598,8 @@ class MainWindow(QMainWindow):
         if getattr(self, "_host_checking", False) and not manual:
             return
         if manual:
-            self._warn("检查桌面壳更新失败。\n\n" + msg + "\n\n"
-                       "桌面壳更新从 GitHub 获取，网络不可达时属正常现象。\n"
+            self._warn(f"检查{HOST_NAME}更新失败。\n\n" + msg + "\n\n"
+                       f"{HOST_NAME}更新从 GitHub 获取，网络不可达时属正常现象。\n"
                        "不影响 DSH 本身的更新（那条走 npm 通道）。")
 
     def _on_host_check_done(self):
@@ -2581,22 +2651,22 @@ class MainWindow(QMainWindow):
                 "%s\n\n当前版本仍可继续使用。" % e)
             return
 
-        host_log("桌面壳更新：已拉起新实例（接管端口 %s），本进程退出"
-                 % (port or "自动分配"))
+        host_log(f"{HOST_NAME}更新：已拉起新实例（接管端口 {port or '自动分配'}），"
+                 "本进程退出")
         self.tray.hide()
         os._exit(0)
 
     def _show_about(self):
         supported, reason = selfupdate.self_update_supported()
         text = (
-            f"DSH Launcher  v{HOST_VERSION}\n\n"
-            f"给 DeepSeek Harness 套的 Windows 桌面壳。\n"
+            f"{HOST_NAME}  v{HOST_VERSION}\n\n"
+            f"{HOST_TAGLINE}。\n"
             f"项目地址：https://github.com/{selfupdate.HOST_REPO}\n\n"
-            f"桌面壳更新　{'可用' if supported else '不可用'}\n"
+            f"{HOST_NAME}更新　{'可用' if supported else '不可用'}\n"
             f"　{('从 GitHub Release 拉取新版本并自动替换。' if supported else reason)}\n\n"
-            f"DSH 更新　走官方 npm 通道，与桌面壳更新互不影响。\n"
+            f"DSH 更新　走官方 npm 通道，与{HOST_NAME}更新互不影响。\n"
         )
-        dsh_theme.MessageDialog.about(self, "关于 DSH Launcher", text)
+        dsh_theme.MessageDialog.about(self, f"关于{HOST_NAME}", text)
 
     def _open_panel(self):
         """打开控制面板。
@@ -2619,6 +2689,13 @@ class MainWindow(QMainWindow):
                 flag=self._panel_flag,
                 set_flag=self._panel_set_flag,
                 action=self._panel_action,
+                # 远程：连接/断开必须由主窗口做（它管隧道生命周期和收尾），
+                # 面板只拿到"发指令"和"读状态"两件事。
+                remote_hosts=remote.load_hosts,
+                remote_save=remote.save_hosts,
+                remote_connect=self._panel_remote_connect,
+                remote_disconnect=self._panel_remote_disconnect,
+                remote_state=self._panel_remote_state,
             )
             self._panel = dsh_panel.ControlPanel(host, parent=None)
         self._panel.show()
@@ -3136,7 +3213,7 @@ class MainWindow(QMainWindow):
         info = storage.breakdown()
         if not dsh_theme.MessageDialog.ask(
                 self, "清空全部数据",
-                "删除桌面壳的全部数据（%s，%d 个文件）：设置、登录态、日志，"
+                f"删除{HOST_NAME}的全部数据（%s，%d 个文件）：设置、登录态、日志，"
                 "以及私有 DSH 安装。\n\n这个操作不可撤销。"
                 % (storage.str_of_bytes(info["bytes"]), info["files"]),
                 "全部清空", "取消"):
@@ -3145,7 +3222,7 @@ class MainWindow(QMainWindow):
         self._drop_webview()
         ok, payload = self._run_data_task(
             "clear_all", "清空全部数据",
-            "正在删除桌面壳的全部数据。",
+            f"正在删除{HOST_NAME}的全部数据。",
             "删除在后台进行，完成后需要退出应用重新启动。")
         if not ok:
             self._warn("清空未完成：\n\n%s" % ((payload or {}).get("error")
@@ -3154,6 +3231,117 @@ class MainWindow(QMainWindow):
         n = (payload or {}).get("files", 0)
         self._warn("已清空全部数据（%d 个文件）。\n\n"
                    "退出应用后重新启动，会回到首次运行的引导流程。" % n)
+
+    # ----------------------------------------------------------- 远程会话
+
+    def _panel_remote_state(self) -> dict:
+        return dict(self._remote_state)
+
+    def _push_remote_state(self) -> None:
+        """把远程状态推给面板（面板没开过就什么都不做）。"""
+        panel = getattr(self, "_panel", None)
+        if panel is None:
+            return
+        try:
+            panel.refresh_remote()
+        except Exception as e:                                   # noqa: BLE001
+            host_log("刷新远程状态失败：%s: %s" % (type(e).__name__, e))
+
+    def _panel_remote_connect(self, host_obj) -> None:
+        """面板点了某台主机的「连接」。"""
+        worker = self._remote_worker
+        if worker is not None and worker.isRunning():
+            self._info("正在连接中，请稍候。")
+            return
+        if self._remote is not None:
+            # 换主机 = 先断旧的。断开要在后台做（可能要等远端进程退出），
+            # 但它有超时上限，这里同步等一小会儿可接受。
+            self._stop_remote()
+        self._remote_host = host_obj
+        self._remote_state = {"host_id": host_obj.id, "name": host_obj.name,
+                              "stage": "正在连接 SSH…", "connected": False,
+                              "error": ""}
+        self._push_remote_state()
+
+        # 远程与本地服务互斥：本地那份先停掉，否则两个 DSH 抢同一套界面状态，
+        # 状态栏、菜单、退出收尾全得分叉判断。停本地是秒级的，用户感觉不到。
+        if self.handle is not None and not getattr(self.handle, "remote", ""):
+            host_log("切换远程：先停本地服务")
+            try:
+                self._stop_service()
+            except Exception as e:                               # noqa: BLE001
+                host_log("停本地服务失败：%s: %s" % (type(e).__name__, e))
+
+        w = RemoteConnectWorker(host_obj)
+        w.stage.connect(self._on_remote_stage)
+        w.ready.connect(self._on_remote_ready)
+        w.failed.connect(self._on_remote_failed)
+        self._remote_worker = w
+        w.start()
+
+    def _on_remote_stage(self, text: str) -> None:
+        self._remote_state["stage"] = text
+        self._push_remote_state()
+
+    def _on_remote_ready(self, session, url: str) -> None:
+        host_obj = self._remote_host
+        self._remote = session
+        self._remote_state.update({"connected": True, "stage": "", "error": ""})
+        self._push_remote_state()
+
+        endpoint = getattr(session, "endpoint", None)
+        tunnel = getattr(session, "tunnel", None)
+        local_port = getattr(tunnel, "local_port", 0) or 0
+        name = host_obj.name if host_obj else "远程"
+        # 远端装的是哪个版本我们不知道，也不该猜。写"未知"是诚实的；
+        # 界面上"DSH 版本"那一行会显示它，而不是拿本地的版本号冒充。
+        inst = contract.DshInstall(node="", bin_js="", pkg_root="", prefix="",
+                                   npm_cli=None, version="未知",
+                                   source="远程 · %s" % name)
+        handle = ServiceHandle(
+            install=inst,
+            pid=int(getattr(endpoint, "pid", 0) or 0),
+            host="127.0.0.1", requested_port=local_port, port=local_port,
+            url=url, token=getattr(endpoint, "token", ""),
+            log_path=config.service_log(), started_at=time.time(),
+            remote=name)
+        host_log("远程会话就绪：%s · 远端端口 %s · 隧道端口 %s"
+                 % (name, getattr(endpoint, "port", "?"), local_port))
+        self._on_ready(handle)
+
+    def _on_remote_failed(self, kind: str, message: str) -> None:
+        self._remote_state.update({"connected": False, "stage": "",
+                                   "error": message})
+        self._push_remote_state()
+        hint = remote.KIND_HINTS.get(kind, "")
+        text = message if (not hint or hint in message) else (message + "\n\n" + hint)
+        host_log("远程连接失败（%s）：%s" % (kind, message.splitlines()[0][:120]))
+        self._warn("远程连接失败。\n\n" + text)
+
+    def _panel_remote_disconnect(self) -> None:
+        worker = self._remote_worker
+        if worker is not None and worker.isRunning():
+            self._info("正在连接中，暂时不能断开。")
+            return
+        self._stop_remote()
+
+    def _stop_remote(self, stop_remote_side: bool | None = None) -> None:
+        """收掉远程会话。
+
+        `stop_remote_side` 为 None 时交给主机自己的设置（保留/停止/每次询问），
+        其中"每次询问"在这里按**保留**处理——退出流程里不该弹窗拦人。
+        想"停掉远端"的交互必须由调用方明确传入 True。
+        """
+        session, self._remote = self._remote, None
+        if session is not None:
+            try:
+                session.close(stop_remote=stop_remote_side)
+                host_log("远程会话已断开")
+            except Exception as e:                               # noqa: BLE001
+                host_log("断开远程会话失败：%s: %s" % (type(e).__name__, e))
+        self._remote_host = None
+        self._remote_state = {}
+        self._push_remote_state()
 
     def _panel_action(self, name: str) -> None:
         if name == "check_update":
@@ -3260,7 +3448,17 @@ class MainWindow(QMainWindow):
         代价：想在关掉窗口后继续跑 DSH 后台任务的人失去了入口。
         对桌面壳的目标用户（用图形界面干活的人）这个代价可以接受——
         真需要常驻服务的人本来就会用命令行。
+
+        远程连接进行中**拒绝退出**：`RemoteConnectWorker` 里的 SSH 调用是阻塞的
+        （远端冷启动最长 90 秒），把它丢下就退出，Qt 会因为线程还活着而 abort，
+        表现是"点了退出，程序直接消失，日志一段都没刷出来"。连接本身有超时上限，
+        等它结束只是一两分钟的事。
         """
+        worker = self._remote_worker
+        if worker is not None and worker.isRunning():
+            self._info("正在建立远程连接，请等它结束再退出。\n\n"
+                       "（远端冷启动最多需要一两分钟，界面上有进度。）")
+            return
         host_log("用户退出，连带停止后台服务")
         # 先收尾面板的后台线程。线程在解释器退出时还活着会让 Qt 直接 abort，
         # 而 abort 会丢掉未刷出的日志缓冲——那会让"退出"变成一件莫名其妙的事。
@@ -3286,7 +3484,7 @@ class MainWindow(QMainWindow):
 
     #: 退出时要等它收尾的后台任务（属性名）。面板自己的线程由 panel.shutdown() 管。
     _WORKERS = ("starter", "_reverify", "_checker", "_host_checker",
-                "_swap_worker", "_data_worker")
+                "_swap_worker", "_data_worker", "_remote_worker")
 
     def _join_workers(self, timeout_ms: int = 4000) -> list:
         """等主窗口的后台线程收尾，返回超时没等到的属性名。

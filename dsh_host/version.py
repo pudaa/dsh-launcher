@@ -21,7 +21,19 @@ GitHub Actions 会自动构建 exe 并创建 Release。见 .github/workflows/rel
 """
 from __future__ import annotations
 
-HOST_VERSION = "2.4.3"
+HOST_VERSION = "2.4.4"
+
+#: 产品显示名——用户在窗口标题、托盘、关于里看到的那个名字（2026-11-12 定）。
+#:
+#: **只改显示名，不动技术标识。** 仓库（HOST_REPO）、产物文件名
+#: （HOST_ASSET_NAME）、数据目录（`%LOCALAPPDATA%\DSH-Web`）都不随它变：
+#: 更新链路的锚是"从 HOST_REPO 的 Release 里找当前 exe 同名的资产"，
+#: 名字一动，已经装了旧版的用户就再也升不上来，而数据目录一动等于换了个应用。
+#: 所以这个常量只许出现在**给人看的字符串**里，不许参与任何路径或请求。
+HOST_NAME = "鲸坞"
+
+#: 一句话定位。窗口副标题与「关于」的第一句用它，避免各处口径不一。
+HOST_TAGLINE = "DeepSeek Harness 的 Windows 桌面客户端"
 
 #: 桌面壳自身的发布仓库（owner/repo）。自动更新从这里拉 Release。
 HOST_REPO = "pudaa/dsh-launcher"

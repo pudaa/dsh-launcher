@@ -150,9 +150,17 @@ def profile_dir() -> str:
     return d
 
 
+def remote_hosts_path() -> str:
+    """远程主机列表（2026-11-12）。**不含任何凭据**。
+
+    密码/私钥一律走用户自己的 SSH 配置与 agent，我们不落盘。
+    这个文件只存"要连哪台机器、用什么命令启动远程 DSH、断开后留不留服务"。
+    """
+    return os.path.join(data_root(), "remote-hosts.json")
+
+
 def webengine_state_path() -> str:
     """**旧版**崩溃哨兵的路径（2026-10-24 引入，2026-10-25 撤掉）。
-
     哨兵机制已移除——理由见 dsh_gui_qt.py 里 `_HW_ACCEL` 上方的说明：
     自动降级是概率缓解而非修复，且与"用户自己选了硬件加速"这个前提冲突。
     保留这个路径定义只为一件事：清理用户机器上残留的旧文件。一个再没人读的
