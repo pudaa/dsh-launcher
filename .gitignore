@@ -12,6 +12,14 @@ __pycache__/
 .venv-*/
 venv/
 pip-unpack-*/
+# pip 在 Windows 上失败时会在 cwd 留下这几种空目录，名字里带随机后缀，
+# 用通配把它们一并挡掉（2026-11-12 在根目录发现三个）
+pip-build-tracker-*/
+pip-ephem-wheel-cache-*/
+pip-install-*/
+# 自测沙箱：`tempfile.gettempdir()` 在某些环境下会返回相对路径，
+# 于是 `<tmp>/dsh-launcher-test-cfg` 落到 cwd。挡掉，别让它进仓库。
+dsh-launcher-test-cfg/
 
 # ---------------------------------------------------------------- 运行期数据
 # 桌面壳真实数据在 %LOCALAPPDATA%\DSH-Web\，不进仓库；

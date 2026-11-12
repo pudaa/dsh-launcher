@@ -451,6 +451,17 @@ class NavItem(QPushButton):
                                  self.pal["text"] if on else self.pal["dim"], 17))
 
 
+def _tooltip_html(text: str) -> str:
+    """把卡片说明转成 QToolTip 能吃的富文本。
+
+    只做转义和换行——提示框里塞不下复杂排版。转义是必须的：说明文字里会出现
+    `<select>` 这类写法，不转义会被当成 HTML 标签吞掉。
+    """
+    esc = (text.strip().replace("&", "&amp;").replace("<", "&lt;")
+           .replace(">", "&gt;"))
+    return esc.replace("\n", "<br>")
+
+
 class Card(QFrame):
     """内容分组卡片。
 
@@ -458,24 +469,54 @@ class Card(QFrame):
     跟着做才不会有割裂感；深色下才是 #232324 的浮起色。
     """
 
-    def __init__(self, title: str, pal: dict, parent=None):
+    def __init__(self, title: str, pal: dict, parent=None, help_text: str = ""):
         super().__init__(parent)
         self.setObjectName("card")
         self.pal = pal
+        self._help_text = help_text
         self.setStyleSheet(card_style(pal))
         self.body = QVBoxLayout(self)
         self.body.setContentsMargins(0, 0, 0, 10)
         self.body.setSpacing(0)
+
+        # 标题行是"标题 + 可选的说明按钮"。以前标题就是个带内边距的 QLabel，
+        # 现在要往右边塞一个 ⓘ，所以改成一整行的横向布局；内边距从 QLabel
+        # 挪到这一行的 contentsMargins 上，视觉位置不变（改动后逐页截图核对过）。
+        self.header = QWidget()
+        head = QHBoxLayout(self.header)
+        head.setContentsMargins(16, 14, 16, 8)
+        head.setSpacing(4)
         self.title_lbl = QLabel(title)
         self.title_lbl.setStyleSheet(Template(
-            "color: $muted; font-family: $font; font-size: 12px;"
-            " padding: 14px 16px 8px 16px; border: none;"
+            "color: $muted; font-family: $font; font-size: 12px; border: none;"
         ).substitute(muted=pal["muted"], font=FONT))
-        self.body.addWidget(self.title_lbl)
+        head.addWidget(self.title_lbl)
+        self.help_btn = None
+        if help_text:
+            self.help_btn = QToolButton()
+            self.help_btn.setObjectName("helpBtn")
+            self.help_btn.setCursor(Qt.CursorShape.WhatsThisCursor)
+            self.help_btn.setIcon(icons.qicon("info", pal["muted"], 12))
+            # QToolTip 会按窗口宽度换行，但长句在 880 宽的窗口里会拉得很宽；
+            # 用固定的富文本宽度把提示收成一块，读起来才像"说明"而不是横幅。
+            self.help_btn.setToolTip(
+                '<div style="width:300px; line-height:150%%;">%s</div>'
+                % _tooltip_html(help_text))
+            self.help_btn.setStyleSheet(
+                "QToolButton { border: none; background: transparent; padding: 0; }"
+                "QToolButton:hover { background: transparent; }")
+            head.addWidget(self.help_btn)
+        head.addStretch(1)
+        self.body.addWidget(self.header)
 
     def set_palette_colors(self, pal: dict) -> None:
         self.pal = pal
         self.setStyleSheet(card_style(pal))
+        self.title_lbl.setStyleSheet(Template(
+            "color: $muted; font-family: $font; font-size: 12px; border: none;"
+        ).substitute(muted=pal["muted"], font=FONT))
+        if self.help_btn is not None:
+            self.help_btn.setIcon(icons.qicon("info", pal["muted"], 12))
 
     def add(self, w: QWidget) -> None:
         self.body.addWidget(w)
@@ -1392,7 +1433,12 @@ class OverviewPage(BasePage):
     # 拿它加总既不准，也会让人误判"内存被释放了"。
 
     def _build_mem_card(self) -> Card:
-        card = Card("内存占用", self.pal)
+        card = Card(
+            "内存占用", self.pal,
+            help_text="只统计私有内存：任务管理器默认那列是工作集，"
+                      "窗口最小化时会掉到几十 MB，看着像释放了，实际没有。\n"
+                      "「主进程」含界面与浏览器内核；「网页」是渲染进程；"
+                      "「后台服务」是 DSH 自己拉起的 Node 进程。")
 
         # 合计单独一行，但**必须和下面三块走同一条左对齐线**。
         # 第一版把合计做成右对齐的大字，结果数字一左一右，
@@ -1417,7 +1463,6 @@ class OverviewPage(BasePage):
 
         # 说明压成一行：概览页固定 600 高，多一行就把下面的「进入工作」挤出首屏，
         # 而那句提示又必须留在界面上（工作集和私有内存混淆是真实发生过的误判）。
-        card.add_text("私有内存＝真实占用；任务管理器那列是工作集，最小化会缩水。")
         self._mem_worker = None
         return card
 
@@ -1525,8 +1570,8 @@ class GeneralPage(BasePage):
         ("adaptive_titlebar", "标题栏跟随界面配色",
          "让窗口标题栏跟随 DSH 界面的主色。需要 Windows 11。"),
         ("webengine_hw_accel", "硬件加速渲染（重启后生效）",
-         "默认开启（QtWebEngine 走 GPU）。这里设什么就是什么，程序不会自己"
-         "改回来。关闭本项 = 强制软件渲染（更稳、更耗 CPU）。"),
+         "默认开启。本项即最终结果，程序不会自行更改。关闭后强制使用软件渲染，"
+         "稳定性略高，CPU 占用明显增加。"),
     )
 
     #: 占用统计的复用期限（秒）。切回本页时先用缓存，过期才重算——
@@ -1609,14 +1654,17 @@ class GeneralPage(BasePage):
         self.layout_.addWidget(c2)
 
         # --- 数据目录 ---
-        c3 = Card("数据目录", self.pal)
+        c3 = Card(
+            "数据目录", self.pal,
+            help_text="设置、登录状态、日志、私有安装的 DSH 都在这里。"
+                      "删除程序本身不会移除这些数据；更换设备或重装前，"
+                      "可在此迁移到别处或清空。")
         self.card_data = c3
         self.kv_root = KeyValueRow("位置", self.host.data_dir(), self.pal)
         self.kv_usage = KeyValueRow("占用", "统计中…", self.pal)
         c3.add(self.kv_root)
         c3.add(self.kv_usage)
         self.group_rows: list[KeyValueRow] = []
-        c3.add_text("删掉 exe 不会带走这些数据——换机、重装前可以在这里搬家或清理。")
         dir_row = QWidget()
         dr = QHBoxLayout(dir_row)
         dr.setContentsMargins(16, 4, 16, 10)
@@ -1759,8 +1807,7 @@ class DeployPage(BasePage):
     def build(self) -> None:
         self.layout_.addWidget(_label("本机部署", "h1"))
         self.layout_.addWidget(_label(
-            "这一步由你来做，我们只负责告诉你做没做成。"
-            "每步做完回到「状态检测」页点一次重新检测，就能看到结果。"))
+            "这些步骤需要你手动执行；完成后回到「状态检测」页重新检测即可确认。"))
 
         # 代理提示（2026-10-20）：只在真的有风险时出现——设了代理、且
         # DeepSeek 域名没排除。这时账号功能会"半坏不坏"，用户不可能自己想到。
@@ -1785,7 +1832,11 @@ class DeployPage(BasePage):
 
         # 这条原本是托盘里的「准备运行环境…」。挪过来而不是删掉——能力还在，
         # 只是从"日常入口"降级成"不想自己装时的兜底"，且必须点进这一页才看得到。
-        c3 = Card("不想自己装？", self.pal)
+        c3 = Card(
+            "自动安装", self.pal,
+            help_text="由本程序自动安装 Node.js 与 DeepSeek Harness，"
+                      "装到应用数据目录，与命令行那份互不影响。\n"
+                      "需要联网，过程中会显示进度窗口。")
         c3.add_text(f"可以让{HOST_NAME}代劳：自动安装 Node.js 与 DeepSeek Harness。"
                     "装到应用自己的数据目录（和命令行里那份互不影响）。"
                     "需要联网，中途会弹出进度窗口。")
@@ -1803,10 +1854,13 @@ class DeployPage(BasePage):
         # 修复入口。为什么放在部署页而不是概览页：它不是日常动作，
         # 只在"更新过、但界面不对劲"时才需要——那种场景用户第一反应就是
         # 跑到部署页找重装。
-        c4 = Card("更新之后界面不对劲？", self.pal)
-        c4.add_text("版本号看着正常，但界面报接口错误、账号信息显示不出来？"
-                    "这通常是上一次更新没装干净——部分组件还留在旧版本。"
-                    "重新安装一遍即可修复，聊天记录、登录状态和设置都不会动。")
+        c4 = Card(
+            "修复版本不一致", self.pal,
+            help_text="更新后若部分组件仍停留在旧版本，会出现接口报错、"
+                      "账号信息无法加载等症状，版本号看起来却是正常的。\n"
+                      "重新安装会重装全部组件，会话记录、登录状态与设置不受影响。")
+        c4.add_text("若出现接口报错或账号信息无法加载，通常是部分组件仍停留在旧版本。"
+                    "重新安装即可修复，会话记录、登录状态与设置均不受影响。")
         holder2 = QWidget()
         lay2 = QHBoxLayout(holder2)
         lay2.setContentsMargins(16, 4, 16, 10)
@@ -1890,8 +1944,8 @@ class RunModePage(BasePage):
     def build(self) -> None:
         self.layout_.addWidget(_label("运行方式", "h1"))
         self.layout_.addWidget(_label(
-            "决定这个窗口用哪一份 DSH 运行。切换后会重启后台服务，"
-            "聊天记录与登录态不受影响。"))
+            "选择本程序使用的 DSH 安装。切换会重启后台服务，"
+            "会话记录与登录状态不受影响。"))
 
         self.kv_mode = KeyValueRow("当前使用", "—", self.pal)
         self.kv_ver = KeyValueRow("实际版本", "—", self.pal)
@@ -1908,11 +1962,14 @@ class RunModePage(BasePage):
         self._rebuild_hosts()
 
         # --- 私有 ---
-        c1 = Card("私有安装（推荐）", self.pal)
+        c1 = Card(
+            "私有安装（推荐）", self.pal,
+            help_text="本程序独占管理这份 DSH，升级只作用于它，"
+                      "不会因为终端里的 npm 操作变成「主程序升了、组件还在旧版」。\n"
+                      "代价是多占用一份磁盘空间。")
         self.kv_priv = KeyValueRow("状态", "—", self.pal)
         c1.add(self.kv_priv)
-        c1.add_text("在应用自己的数据目录里放一份 DSH，和命令行里那份互不影响。"
-                    "更新只动这一份，不会再出现「主程序升了、组件还停在旧版」。")
+        c1.add_text("独立安装在应用数据目录，与命令行那份互不影响。")
         h1 = QWidget()
         r1 = QHBoxLayout(h1)
         r1.setContentsMargins(16, 4, 16, 10)
@@ -1926,12 +1983,14 @@ class RunModePage(BasePage):
         self.layout_.addWidget(c1)
 
         # --- 公共 ---
-        c2 = Card("公共安装（与命令行共用）", self.pal)
+        c2 = Card(
+            "公共安装（与命令行共用）", self.pal,
+            help_text="它与终端里的那份 DSH 是同一套文件。你在终端执行升级时，"
+                      "这里的组件也会随之变化；两边同时改动同一份文件，"
+                      "可能出现版本不一致，表现为界面接口报错。")
         self.kv_pub = KeyValueRow("状态", "—", self.pal)
         c2.add(self.kv_pub)
-        c2.add_text("直接用命令行里那份 DSH，不额外占磁盘。"
-                    "代价是它也受你在终端里执行的升级影响——"
-                    "两边同时改同一份文件时，可能出现组件版本对不齐。")
+        c2.add_text("使用命令行里的那份 DSH，不额外占用磁盘。")
         h2 = QWidget()
         r2 = QHBoxLayout(h2)
         r2.setContentsMargins(16, 4, 16, 10)
@@ -1957,7 +2016,13 @@ class RunModePage(BasePage):
         # 标"实验"是必须的：到发这一版为止，SSH 那条链路只验证到"连不上时的
         # 错误分类是对的"，"复用远端已有实例"还没在真机上跑过（本机的 MSYS
         # 判不准进程身份）。不标的话，用户会以为是成熟功能。
-        card = Card("远程 DSH（实验）", self.pal)
+        card = Card(
+            "远程 DSH（实验）", self.pal,
+            help_text="断开会话后，远端 dsh web 的处置按这台主机的设置执行："
+                      "保留（适合跑长任务的服务器）、停止（适合临时连一次的机器），"
+                      "或每次询问。\n"
+                      "认证使用系统 SSH 的密钥或 agent，本程序不保存密码。\n"
+                      "DSH 始终只监听远端本机地址，端口由 SSH 隧道转发，不对外暴露。")
         self.kv_remote = KeyValueRow("当前连接", "未连接", self.pal)
         card.add(self.kv_remote)
 
@@ -1990,9 +2055,8 @@ class RunModePage(BasePage):
         row.addStretch(1)
         card.add(holder)
 
-        card.add_text("断开后远端服务留不留，由每台主机自己的设置决定；"
-                      "认证走你系统里的 SSH（密钥或 agent），我们不经手密码。")
-        card.add_text("底线不变：DSH 永远只听远端本机，由隧道把端口借过来。")
+        card.add_text("远端服务的去留按主机设置执行。DSH 只监听远端本机，"
+                      "端口经 SSH 隧道转发。")
         return card
 
     def _rebuild_hosts(self) -> None:

@@ -1515,8 +1515,12 @@ def health_checks() -> list:
     check("旧哨兵文件会被清理",
           "def purge_legacy_webengine_state(" in config_src
           and "purge_legacy_webengine_state()" in gui)
-    check("硬件加速文案不再承诺自动降级",
-          "程序不会自己" in panel)
+    # 这条守的是语义，不是措辞：撤掉自动降级之后，界面文案不能让用户以为
+    # "崩了会自己退到软件渲染"。2026-11-12 打磨文案时它挂了——旧写法直接比对
+    # 某个短语，措辞一变就失效（这已经是第二次栽在"断言绑死文案"上了）。
+    check("硬件加速文案不承诺自动降级",
+          ("自动降级" not in panel and "自动切换" not in panel)
+          and ("不会自行" in panel or "不会自己" in panel))
     # 版本约束与接手材料（2026-10-25）：6.12 起 WebEngine 拆成独立 wheel 且不含
     # 该崩溃的修复，requirements 的上界是拦住 pip 自动跨过去的唯一屏障；
     # 经验文档 + 校验脚本是"下一个 agent 能接手"的前提，别让它们被顺手删掉。
