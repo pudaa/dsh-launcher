@@ -1,0 +1,1135 @@
+"""开发者窗口：日志台、Chromium DevTools 宿主、终端页。"""
+from __future__ import annotations
+from ..web.page import *          # noqa: F401,F403
+from ..web.downloads import *     # noqa: F401,F403
+
+import html
+import json
+import os
+import re
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass
+
+from PySide6.QtCore import (QEvent, QObject, QRegularExpression, Qt, QTimer,
+                             QUrl)
+from PySide6.QtGui import (QColor, QFont, QTextCharFormat, QTextCursor,
+                           QTextDocument, QSyntaxHighlighter)
+from PySide6.QtWebEngineCore import (QWebEngineDownloadRequest, QWebEnginePage,
+                                     QWebEngineProfile, QWebEngineSettings,
+                                     QWebEngineUrlRequestInterceptor)
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup,
+                               QFileDialog,
+                               QFrame, QHBoxLayout, QLabel, QLineEdit,
+                               QPlainTextEdit, QPushButton,
+                               QSizePolicy, QStackedWidget, QTabWidget,
+                               QTableWidget, QTableWidgetItem, QVBoxLayout,
+                               QWidget)
+
+
+import dsh_console
+from dsh_host import config, procmem
+from dsh_host.logutil import host_log
+# 字体与调色板是面板那套设计令牌，开发者窗口沿用同一个来源，
+# 免得两个窗口的等宽字体各写各的。
+from dsh_panel import FONT, palette
+
+
+
+
+
+
+
+
+
+
+
+def _mono() -> str:
+    return '"Cascadia Mono", "Consolas", "Courier New", monospace'
+
+def _inspector_style(pal: dict) -> str:
+    """DevTools 窗口顶部工具条的样式。只覆盖我们自己的那条 bar，
+    里面的 DevTools 是内核页面，样式表管不到它。"""
+    return ("""
+QWidget#inspectorBar { background: %(side)s; border-bottom: 1px solid %(line)s; }
+QLabel#inspectorTitle { color: %(text)s; font-family: %(font)s;
+                        font-size: 12px; font-weight: 600; }
+QLabel#inspectorTarget { color: %(muted)s; font-family: %(mono)s; font-size: 11px; }
+QPushButton#segBtn { color: %(dim)s; background: transparent;
+    border: 1px solid %(line)s; border-radius: 6px; padding: 2px 10px;
+    font-family: %(font)s; font-size: 12px; }
+QPushButton#segBtn:hover { color: %(text)s; background: %(hover)s; }
+QPushButton#segBtn:checked { color: %(text)s; background: %(nav_active)s;
+                             border-color: %(line)s; font-weight: 600; }
+QPushButton#pinBtn { color: %(dim)s; background: transparent;
+    border: 1px solid %(line)s; border-radius: 6px; padding: 2px 10px;
+    font-family: %(font)s; font-size: 12px; }
+QPushButton#pinBtn:hover { background: %(hover)s; color: %(text)s; }
+QPushButton#pinBtn:checked { color: %(accent)s; border-color: %(accent)s;
+                             background: %(hover)s; font-weight: 600; }
+""" % {"side": pal["side"], "line": pal["line"], "text": pal["text"],
+       "dim": pal["dim"], "muted": pal["muted"], "hover": pal["hover"],
+       "accent": pal["accent"], "nav_active": pal["nav_active"],
+       "font": FONT, "mono": _mono()})
+
+def _style(pal: dict) -> str:
+    return ("""
+QWidget { background: %(bg)s; color: %(text)s;
+          font-family: %(font)s; font-size: 12px; }
+QLabel#devTitle { font-size: 15px; font-weight: 600; color: %(text)s; }
+QLabel#devHint  { color: %(muted)s; }
+QLabel#devUrl   { color: %(dim)s; }
+QTabWidget::pane { border: 1px solid %(line)s; border-radius: 8px;
+                   top: -1px; background: %(bg)s; }
+QTabBar::tab { background: transparent; color: %(dim)s;
+               padding: 6px 14px; margin-right: 2px; border: none; }
+QTabBar::tab:selected { color: %(text)s; background: %(hover)s;
+                        border-radius: 6px; font-weight: 600; }
+QTabBar::tab:hover { color: %(text)s; }
+QPlainTextEdit, QTableWidget { background: %(card)s; color: %(text)s;
+    border: 1px solid %(line)s; border-radius: 8px;
+    selection-background-color: %(nav_active)s; selection-color: %(text)s; }
+QHeaderView::section { background: %(side)s; color: %(dim)s; border: none;
+    border-bottom: 1px solid %(line)s; padding: 4px 8px; font-weight: 600; }
+QTableWidget { gridline-color: %(line_soft)s; }
+QPushButton { color: %(text)s; background: %(btn_fill)s;
+    border: 1px solid %(line)s; border-radius: 6px; padding: 5px 12px; }
+QPushButton:hover { background: %(btn_hover)s; }
+QPushButton:checked { color: %(accent)s; border-color: %(accent)s; }
+QPushButton:disabled { color: %(muted)s; }
+QLineEdit { background: %(card)s; color: %(text)s; border: 1px solid %(line)s;
+    border-radius: 6px; padding: 4px 8px; }
+""" % {
+        "bg": pal["bg"], "text": pal["text"], "font": FONT, "muted": pal["muted"],
+        "dim": pal["dim"], "line": pal["line"], "line_soft": pal["line_soft"],
+        "card": pal["card"], "side": pal["side"], "hover": pal["hover"],
+        "nav_active": pal["nav_active"], "btn_fill": pal["btn_fill"],
+        "btn_hover": pal["btn_hover"], "accent": pal["accent"],
+    })
+
+def _terminal_style(pal: dict) -> str:
+    """终端页的样式。日志区用等宽字体、不换行，与真正的终端一致。"""
+    return """
+QWidget#termBar { background: %(side)s; border-bottom: 1px solid %(line)s; }
+QLabel#termStatus { color: %(muted)s; font-family: %(font)s; font-size: 11px; }
+QPlainTextEdit#termLog {
+    background: %(card)s; color: %(text)s; border: none;
+    selection-background-color: %(nav_active)s; selection-color: %(text)s;
+    font-family: %(mono)s; font-size: 12px; padding: 6px 8px;
+}
+QLineEdit#termSearch {
+    background: %(card)s; color: %(text)s; border: 1px solid %(line)s;
+    border-radius: 6px; padding: 3px 8px;
+    font-family: %(font)s; font-size: 12px;
+}
+QPushButton#termBtn {
+    color: %(dim)s; background: transparent; border: 1px solid transparent;
+    border-radius: 6px; padding: 3px 9px;
+    font-family: %(font)s; font-size: 12px;
+}
+QPushButton#termBtn:hover { background: %(hover)s; color: %(text)s; }
+QPushButton#termBtn:checked { color: %(accent)s; background: %(hover)s; }
+QPushButton#termBtn:disabled { color: %(line)s; }
+QScrollBar:vertical, QScrollBar:horizontal {
+    background: transparent; width: 9px; height: 9px; margin: 2px;
+}
+QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
+    background: %(scroll)s; border-radius: 4px; min-height: 28px; min-width: 28px;
+}
+QScrollBar::add-line, QScrollBar::sub-line { width: 0px; height: 0px; }
+QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+""" % {
+        "side": pal["side"], "line": pal["line"], "muted": pal["muted"],
+        "card": pal["card"], "text": pal["text"], "hover": pal["hover"],
+        "nav_active": pal["nav_active"], "accent": pal["accent"],
+        "scroll": pal["scroll"], "dim": pal["dim"], "font": FONT,
+        "mono": '"Cascadia Mono", "Consolas", monospace',
+    }
+
+class _LogHighlighter(QSyntaxHighlighter):
+    """按级别给日志着色。**只改颜色，不改文本**——复制出来的内容必须是原样。"""
+
+    def __init__(self, document, pal: dict):
+        super().__init__(document)
+        self.set_palette(pal)
+
+    def set_palette(self, pal: dict) -> None:
+        def fmt(color: str, bold: bool = False) -> QTextCharFormat:
+            f = QTextCharFormat()
+            f.setForeground(QColor(color))
+            if bold:
+                f.setFontWeight(QFont.Weight.Bold)
+            return f
+
+        ci = QRegularExpression.PatternOption.CaseInsensitiveOption
+        self._rules = [
+            (QRegularExpression(
+                r"\[ERROR|\[FATAL|\bERROR\b|\bFATAL\b|\bCRITICAL\b|"
+                r"Traceback|\bException\b|Segmentation fault", ci),
+             fmt(pal["bad"], True)),
+            (QRegularExpression(r"\[WARN|\[WARNING|\bWARN(ING)?\b", ci),
+             fmt(pal["warn"])),
+            (QRegularExpression(r"^(js:|\[ERROR:CONSOLE|CONSOLE\()"),
+             fmt(pal["accent"])),
+        ]
+        self.rehighlight()
+
+    def highlightBlock(self, text: str) -> None:            # noqa: N802 (Qt 命名)
+        for rx, form in self._rules:
+            it = rx.globalMatch(text)
+            while it.hasNext():
+                m = it.next()
+                self.setFormat(m.capturedStart(), m.capturedLength(), form)
+
+class TerminalView(QWidget):
+    """宿主进程的输出面板（stdout / stderr，含 Chromium 的 C++ 日志）。
+
+    打包成 windowed exe 后没有控制台，这份输出去哪了？
+      · Python 的 print → 进程没有 stdout；
+      · Chromium 的 `js: ...`、`[ERROR:CONSOLE]` → 写向无效的 fd 2。
+    两条都看不见，而这恰恰是定位问题的第一手证据。`dsh_console.install()`
+    在启动最早期把 fd 1/2 接进环形缓冲，这里负责把它读出来、染上颜色、
+    并且**保证可以整段复制**——复制出去直接粘给 agent 就能复现问题。
+    """
+
+    def __init__(self, pal: dict, console=None, parent=None):
+        super().__init__(parent)
+        self.pal = pal
+        self.console = console or dsh_console.CONSOLE
+        self._seq = 0
+        self._pending = 0
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        lay.addWidget(self._build_bar())
+
+        self.editor = QPlainTextEdit()
+        self.editor.setObjectName("termLog")
+        self.editor.setReadOnly(True)
+        self.editor.setUndoRedoEnabled(False)
+        self.editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        # 比采集缓冲略大：多出来的部分只是显示余量，真正的内容由环形缓冲决定
+        self.editor.setMaximumBlockCount(dsh_console.MAX_LINES + 100)
+        font = QFont("Consolas")
+        font.setPointSize(9)
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        self.editor.setFont(font)
+        self.highlighter = _LogHighlighter(self.editor.document(), pal)
+        lay.addWidget(self.editor, 1)
+
+        # 用户主动滚上去就暂停跟随（用 actionTriggered，避免被程序滚动误触）
+        self.editor.verticalScrollBar().actionTriggered.connect(self._on_user_scroll)
+
+        self.setStyleSheet(_terminal_style(pal))
+
+        # 定时器的 parent 是本控件：DevTools 窗口关闭即销毁，它随之消失，
+        # 不会在后台留下一个每 300ms 醒一次的轮询。
+        self._timer = QTimer(self)
+        self._timer.setInterval(300)
+        self._timer.timeout.connect(self.tick)
+        self._timer.start()
+        self.tick()
+
+    # ---- 顶部工具条 ----
+
+    def _build_bar(self) -> QWidget:
+        bar = QWidget()
+        bar.setObjectName("termBar")
+        bar.setFixedHeight(34)
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(10, 0, 8, 0)
+        row.setSpacing(4)
+
+        self.btn_copy_all = self._button("复制全部", "复制全部输出（可直接粘给 agent）")
+        self.btn_copy_all.clicked.connect(self._copy_all)
+        self.btn_copy_sel = self._button("复制选中", "复制当前选中的内容")
+        self.btn_copy_sel.clicked.connect(self._copy_selected)
+        self.btn_clear = self._button("清空", "清空缓冲（不影响日志文件）")
+        self.btn_clear.clicked.connect(self._clear)
+
+        self.btn_follow = self._button("跟随", "新输出到达时自动滚到底部")
+        self.btn_follow.setCheckable(True)
+        self.btn_follow.setChecked(True)
+        self.btn_follow.toggled.connect(self._on_follow)
+
+        self.btn_bottom = self._button("回到底部", "跳到最新一行并恢复跟随")
+        self.btn_bottom.clicked.connect(self.jump_to_end)
+        self.btn_save = self._button("另存为…", "把当前缓冲导出为文本文件")
+        self.btn_save.clicked.connect(self._save)
+
+        self.search = QLineEdit()
+        self.search.setObjectName("termSearch")
+        self.search.setPlaceholderText("搜索（回车下一个，Shift+回车上一个）")
+        self.search.setFixedWidth(240)
+        self.search.returnPressed.connect(self._search)
+
+        self.status = QLabel("0 行")
+        self.status.setObjectName("termStatus")
+
+        for b in (self.btn_copy_all, self.btn_copy_sel, self.btn_clear):
+            row.addWidget(b)
+        row.addSpacing(6)
+        row.addWidget(self.btn_follow)
+        row.addWidget(self.btn_bottom)
+        row.addWidget(self.btn_save)
+        row.addWidget(self.search)
+        row.addStretch(1)
+        row.addWidget(self.status)
+        return bar
+
+    def _button(self, text: str, tip: str) -> QPushButton:
+        b = QPushButton(text)
+        b.setObjectName("termBtn")
+        b.setToolTip(tip)
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        b.setFlat(True)
+        return b
+
+    # ---- 数据 ----
+
+    def tick(self) -> None:
+        entries = self.console.since(self._seq)
+        if entries:
+            self._seq = entries[-1].seq
+            self._append(entries)
+        self._refresh_status()
+
+    def _append(self, entries) -> None:
+        if len(entries) > 400:
+            # 启动瞬间可能一次几百行：整段插入比逐行 append 快一个量级
+            self.editor.setUpdatesEnabled(False)
+            try:
+                cursor = QTextCursor(self.editor.document())
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                cursor.insertText("\n".join(e.text for e in entries) + "\n")
+            finally:
+                self.editor.setUpdatesEnabled(True)
+        else:
+            for e in entries:
+                self.editor.appendPlainText(e.text)
+        if self.btn_follow.isChecked():
+            self.jump_to_end(scroll_only=True)
+        else:
+            self._pending += len(entries)
+
+    def _refresh_status(self) -> None:
+        total, _seq = self.console.stats()
+        if self.btn_follow.isChecked():
+            self.status.setText("%d 行 · 跟随中" % total)
+        else:
+            self.status.setText("%d 行 · 已暂停%s"
+                                % (total, ("（新 %d 条）" % self._pending)
+                                   if self._pending else ""))
+        self.pal_hint()
+
+    def pal_hint(self) -> None:
+        """错误计数放在状态文字里（不额外占位）：有错误时用错误色。"""
+        total, _seq = self.console.stats()
+        try:
+            errors = sum(1 for e in self.console.since(0) if e.level == "error")
+        except Exception:                                      # noqa: BLE001
+            errors = 0
+        if errors:
+            self.status.setText(self.status.text() + " · 错误 %d" % errors)
+            self.status.setStyleSheet("color:%s;" % self.pal["bad"])
+        else:
+            self.status.setStyleSheet("")
+
+    def _on_follow(self, on: bool) -> None:
+        if on:
+            self._pending = 0
+            self.jump_to_end()
+        self._refresh_status()
+
+    def _on_user_scroll(self, _action: int) -> None:
+        if self.btn_follow.isChecked() and not self._at_bottom():
+            self.btn_follow.setChecked(False)
+
+    def _at_bottom(self) -> bool:
+        bar = self.editor.verticalScrollBar()
+        return bar.value() >= bar.maximum() - 2
+
+    def jump_to_end(self, scroll_only: bool = False) -> None:
+        bar = self.editor.verticalScrollBar()
+        bar.setValue(bar.maximum())
+        if not scroll_only:
+            self._pending = 0
+            if not self.btn_follow.isChecked():
+                self.btn_follow.setChecked(True)
+        self._refresh_status()
+
+    # ---- 动作 ----
+
+    def _flash(self, button: QPushButton, text: str, restore: str) -> None:
+        button.setText(text)
+        # 绑定到按钮自己（context 重载）：1.4 秒内窗口被关掉时定时器随之作废，
+        # 不会去碰一个已经删掉的控件（否则槽里抛 RuntimeError，还被 Qt 吞掉）。
+        QTimer.singleShot(1400, button, lambda: button.setText(restore))
+
+    def _copy_all(self) -> None:
+        from PySide6.QtWidgets import QApplication
+        text = self.console.text_all()
+        QApplication.clipboard().setText(text)
+        lines, _ = self.console.stats()
+        self._flash(self.btn_copy_all, "已复制 %d 行" % lines, "复制全部")
+
+    def _copy_selected(self) -> None:
+        self.editor.copy()
+
+    def _clear(self) -> None:
+        self.console.clear()
+        self._seq = 0
+        self._pending = 0
+        self.editor.clear()
+        self._refresh_status()
+
+    def _save(self) -> None:
+        import time as _t
+        name = "dsh-console-%s.txt" % _t.strftime("%Y%m%d-%H%M%S")
+        path, _f = QFileDialog.getSaveFileName(self, "导出终端输出", name,
+                                               "文本文件 (*.txt);;所有文件 (*)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.console.text_all() + "\n")
+            self._flash(self.btn_save, "已导出", "另存为…")
+        except OSError as e:
+            self.status.setText("导出失败：%s" % e)
+
+    def _search(self) -> None:
+        needle = self.search.text().strip()
+        if not needle:
+            return
+        backwards = bool(QApplication.keyboardModifiers()
+                         & Qt.KeyboardModifier.ShiftModifier)
+        flags = QTextDocument.FindFlag.FindBackward if backwards else \
+            QTextDocument.FindFlag(0)
+        if self.editor.find(needle, flags):
+            return
+        # 到头了：绕回另一端再找一次
+        cursor = self.editor.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End if backwards
+                            else QTextCursor.MoveOperation.Start)
+        self.editor.setTextCursor(cursor)
+        self.editor.find(needle, flags)
+
+    def apply_theme(self, pal: dict) -> None:
+        self.pal = pal
+        self.setStyleSheet(_terminal_style(pal))
+        self.highlighter.set_palette(pal)
+        self._refresh_status()
+
+class InspectorWindow(QWidget):
+    """Chromium 自带开发者工具的宿主窗口（Elements / Console / Network / Sources…）。
+
+    为什么直接用它、而不是自绘：盒模型与计算样式、强制状态、字体/对比度检查、
+    Sources 断点、Network 的状态码与瀑布图、Application 的存储查看，全是现成的，
+    而且与 Chrome 完全一致。自绘一张"布局表"永远追不上（老大的原话：完全无法比较）。
+
+    代价是它自己要一个渲染实例（约 100~200MB），所以只在用户明确打开时创建，
+    窗口关闭即销毁（`WA_DeleteOnClose`），不会常驻。
+    """
+
+    def __init__(self, inspected_page, theme: str = "light", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("DSH — 开发者工具")
+        self.resize(1200, 820)
+        self.setMinimumSize(720, 480)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self._theme = theme if theme in ("light", "dark") else "light"
+        self.pal = palette(self._theme)
+        # 先记下被检查页：顶部工具条要读它的 host:port
+        self._inspected = inspected_page
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(self._build_bar())
+
+        self.view = QWebEngineView(self)
+        # DevTools 自己的偏好（**包括界面语言**）要写进 profile 才记得住。
+        # 不给 profile 的 page 是临时存储：关掉窗口，语言选择就丢了，
+        # 于是每次都得重新点一次「Switch DevTools to Chinese」。
+        self.profile = QWebEngineProfile("dsh-devtools", self)
+        store = os.path.join(config.data_root(), "devtools-profile")
+        self.profile.setPersistentStoragePath(store)
+        self.profile.setCachePath(os.path.join(store, "cache"))
+        self.page = QWebEnginePage(self.profile, self.view)
+        self.view.setPage(self.page)
+
+        # 两页共用同一条工具条：DevTools 与终端输出随时切换。
+        # 终端页在主线程 300ms 拉一次增量，创建成本可以忽略，所以不懒加载。
+        self.terminal = TerminalView(self.pal)
+        self.body = QStackedWidget(self)
+        self.body.addWidget(self.view)
+        self.body.addWidget(self.terminal)
+        root.addWidget(self.body, 1)
+        self.mode_group.idClicked.connect(self._switch_mode)
+
+        self.setStyleSheet(_inspector_style(self.pal))
+
+        #: DevTools 前端是否真的加载出来了（供自测/日志用）
+        self.ready = False
+        try:
+            # Qt 6.3+：由工具页反向声明"我检查谁"
+            self.page.setInspectedPage(inspected_page)
+        except Exception:                                      # noqa: BLE001
+            self._attach_legacy()
+
+        # 个别发行版对 setInspectedPage 支持不全：2.5 秒还没起来就退老 API。
+        # 用子对象定时器，窗口销毁时自动停，不会打到已释放的 C++ 对象上。
+        self._check = QTimer(self)
+        self._check.setSingleShot(True)
+        self._check.timeout.connect(self._ensure_loaded)
+        self._check.start(2500)
+
+    def _build_bar(self) -> QWidget:
+        """顶部一条窄工具条：置顶 + 被检查页地址。
+
+        DevTools 自己的 UI 已经排得很满，且右上角被它自己的图标占着；
+        在窗口里加一条 30px 的条，比往它的工具栏上叠按钮稳妥得多。
+        """
+        bar = QWidget()
+        bar.setObjectName("inspectorBar")
+        bar.setFixedHeight(32)
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(12, 0, 8, 0)
+        lay.setSpacing(10)
+
+        title = QLabel("开发者工具")
+        title.setObjectName("inspectorTitle")
+        target = QLabel("")
+        target.setObjectName("inspectorTarget")
+        try:
+            target.setText(redact(self._target_text()))
+        except Exception:                                      # noqa: BLE001
+            pass
+        self.lbl_target = target
+
+        self.btn_dev = QPushButton("开发者工具")
+        self.btn_dev.setObjectName("segBtn")
+        self.btn_dev.setCheckable(True)
+        self.btn_dev.setChecked(True)
+        self.btn_dev.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_dev.setToolTip("Chromium 开发者工具：元素 / 控制台 / 网络 / 源码")
+        self.btn_term = QPushButton("终端")
+        self.btn_term.setObjectName("segBtn")
+        self.btn_term.setCheckable(True)
+        self.btn_term.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_term.setToolTip("宿主进程的输出（打包前在终端里能看到的那份）")
+        self.mode_group = QButtonGroup(self)
+        self.mode_group.setExclusive(True)
+        self.mode_group.addButton(self.btn_dev, 0)
+        self.mode_group.addButton(self.btn_term, 1)
+
+        self.btn_pin = QPushButton("置顶")
+        self.btn_pin.setObjectName("pinBtn")
+        self.btn_pin.setCheckable(True)
+        self.btn_pin.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_pin.setToolTip("让开发者工具保持在其它窗口之上（再次点击取消）")
+        self.btn_pin.toggled.connect(self._toggle_pin)
+
+        lay.addWidget(title)
+        lay.addWidget(target, 1)
+        lay.addWidget(self.btn_dev)
+        lay.addWidget(self.btn_term)
+        lay.addSpacing(8)
+        lay.addWidget(self.btn_pin)
+        return bar
+
+    def _target_text(self) -> str:
+        page = getattr(self, "_inspected", None)
+        if page is None:
+            return ""
+        u = page.url()
+        return (u.host() + (":%d" % u.port() if u.port() > 0 else "")) if u.host() else ""
+
+    def _switch_mode(self, index: int) -> None:
+        """在「开发者工具」与「终端」之间切换。
+
+        DevTools 不销毁也不重载：断点、选中的元素都保留；只是从布局里藏起来。
+        """
+        self.body.setCurrentIndex(index)
+        if index == 1:
+            self.terminal.tick()
+            if self.terminal.btn_follow.isChecked():
+                self.terminal.jump_to_end(scroll_only=True)
+
+    def _toggle_pin(self, on: bool) -> None:
+        """切换置顶。
+
+        Qt 必须重新设置窗口标志并 `show()` 才生效；DevTools 页面本身不会
+        重新加载，所以断点、选中的元素都还在。
+        """
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, bool(on))
+        self.show()
+        self.raise_()
+        self.btn_pin.setText("已置顶" if on else "置顶")
+
+    def apply_theme(self, theme: str) -> None:
+        if theme not in ("light", "dark") or theme == self._theme:
+            return
+        self._theme = theme
+        self.pal = palette(theme)
+        self.setStyleSheet(_inspector_style(self.pal))
+        terminal = getattr(self, "terminal", None)
+        if terminal is not None:
+            terminal.apply_theme(self.pal)
+
+    def _attach_legacy(self) -> None:
+        """Qt 6.3 之前只有 `setDevToolsPage()` 这一条路。"""
+        try:
+            self._inspected.setDevToolsPage(self.page)
+        except Exception:                                      # noqa: BLE001
+            pass
+
+    def _ensure_loaded(self) -> None:
+        try:
+            self.ready = not self.page.url().isEmpty()
+        except RuntimeError:
+            return
+        if not self.ready:
+            self._attach_legacy()
+
+class DevWindow(QWidget):
+    """原生开发者窗口：控制台 / 网络 / 布局 / 环境。
+
+    窗口**不**用 WebEngine 渲染（理由见模块文档）。所有数据都来自
+    `Recorder` 与按需注入的 JS，主线程按 400ms 轮询增量取。
+    """
+
+    NET_COLS = ("时间", "类型", "方法", "大小", "耗时", "地址")
+    LAY_COLS = ("元素", "尺寸 W×H", "位置 x,y", "display", "overflow")
+
+    def __init__(self, page, recorder: Recorder, theme: str = "dark",
+                 open_inspector=None, parent=None):
+        super().__init__(parent)
+        self.page = page
+        self.recorder = recorder
+        self._open_inspector_cb = open_inspector
+        self._theme = theme if theme in ("light", "dark") else "dark"
+        self.pal = palette(self._theme)
+
+        self.setWindowTitle("DSH — 开发者窗口")
+        self.resize(1000, 660)
+        self.setMinimumSize(760, 480)
+
+        self._console_seq = 0
+        self._net_seq = 0
+        self._only_errors = False
+        self._net_rows: dict[str, int] = {}
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 12, 14, 12)
+        root.setSpacing(8)
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        title = QLabel("轻量日志")
+        title.setObjectName("devTitle")
+        self.lbl_url = QLabel("—")
+        self.lbl_url.setObjectName("devUrl")
+        self.lbl_url.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.lbl_url.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                   QSizePolicy.Policy.Preferred)
+        head.addWidget(title)
+        head.addWidget(self.lbl_url, 1)
+        if self._open_inspector_cb is not None:
+            btn_full = QPushButton("打开完整开发者工具")
+            btn_full.setToolTip("Chromium 自带：Elements 盒模型 / Sources 断点 / "
+                                "Network 状态码 / Application 存储")
+            btn_full.clicked.connect(lambda: self._open_inspector_cb())
+            head.addWidget(btn_full)
+        root.addLayout(head)
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_console(), "控制台")
+        self.tabs.addTab(self._build_net(), "网络")
+        self.tabs.addTab(self._build_layout(), "布局快照")
+        self.tabs.addTab(self._build_env(), "环境")
+        self.tabs.currentChanged.connect(self._on_tab)
+        root.addWidget(self.tabs, 1)
+
+        self.lbl_foot = QLabel("—")
+        self.lbl_foot.setObjectName("devHint")
+        root.addWidget(self.lbl_foot)
+
+        self.setStyleSheet(_style(self.pal))
+
+        # 页面事件写进控制台，省得用户对不上"什么时候加载的"。
+        try:
+            page.loadStarted.connect(
+                lambda: self._note("页面开始加载"))
+            page.loadFinished.connect(
+                lambda ok: self._note("页面加载完成（%s）" % ("成功" if ok else "失败")))
+            page.renderProcessTerminated.connect(
+                lambda status, code: self._note(
+                    "渲染进程退出：%s / code=%s" % (status, code)))
+        except Exception:                                      # noqa: BLE001
+            pass
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(400)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start()
+        self._tick()
+
+    # ---- 主题 ----
+
+    def apply_theme(self, theme: str) -> None:
+        if theme not in ("light", "dark") or theme == self._theme:
+            return
+        self._theme = theme
+        self.pal = palette(theme)
+        self.setStyleSheet(_style(self.pal))
+        self._rebuild_console()
+
+    # ---- 控制台页 ----
+
+    def _build_console(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+
+        bar = QHBoxLayout()
+        bar.setSpacing(6)
+        self.btn_errors = QPushButton("只看错误")
+        self.btn_errors.setCheckable(True)
+        self.btn_errors.toggled.connect(self._on_error_filter)
+        btn_clear = QPushButton("清空")
+        btn_clear.clicked.connect(self._clear_console)
+        self.lbl_console = QLabel("0 条")
+        self.lbl_console.setObjectName("devHint")
+        bar.addWidget(self.btn_errors)
+        bar.addWidget(btn_clear)
+        bar.addWidget(self.lbl_console)
+        bar.addStretch(1)
+        lay.addLayout(bar)
+
+        self.console = QPlainTextEdit()
+        self.console.setReadOnly(True)
+        self.console.setMaximumBlockCount(MAX_CONSOLE)
+        self.console.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        f = self.console.font()
+        f.setFamily("Consolas")
+        f.setPointSize(9)
+        self.console.setFont(f)
+        lay.addWidget(self.console, 1)
+        return w
+
+    def _note(self, text: str) -> None:
+        """窗口自己产生的说明行（加载、崩溃之类），不进 Recorder。"""
+        if not hasattr(self, "console"):
+            return
+        ts = time.strftime("%H:%M:%S")
+        self.console.appendHtml(
+            '<span style="color:%s">%s</span> <i style="color:%s">· %s</i>'
+            % (self.pal["muted"], ts, self.pal["accent"], html.escape(text)))
+
+    def _console_line(self, e: ConsoleEntry) -> None:
+        color = {"error": self.pal["bad"], "warning": self.pal["warn"],
+                 "info": self.pal["muted"]}.get(e.level, self.pal["text"])
+        ts = time.strftime("%H:%M:%S", time.localtime(e.ts))
+        src = ""
+        if e.source:
+            src = "%s:%d" % (os.path.basename(e.source.split("?")[0]), e.line)
+        body = html.escape(e.message).replace("\n", "<br/>")
+        self.console.appendHtml(
+            '<span style="color:%s">%s</span> <b style="color:%s">[%s]</b> %s'
+            '<span style="color:%s"> %s</span>'
+            % (self.pal["muted"], ts, color, e.level, body,
+               self.pal["muted"], html.escape(src) if src else ""))
+
+    def _rebuild_console(self) -> None:
+        self.console.clear()
+        for e in self.recorder.since_console(0):
+            if self._only_errors and e.level != "error":
+                continue
+            self._console_line(e)
+
+    def _on_error_filter(self, on: bool) -> None:
+        self._only_errors = bool(on)
+        self._rebuild_console()
+
+    def _clear_console(self) -> None:
+        self.recorder.clear_console()
+        self._console_seq = 0
+        self.console.clear()
+        self.lbl_console.setText("0 条")
+
+    # ---- 网络页 ----
+
+    def _build_net(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+
+        bar = QHBoxLayout()
+        bar.setSpacing(6)
+        btn_clear = QPushButton("清空")
+        btn_clear.clicked.connect(self._clear_net)
+        btn_perf = QPushButton("读取已加载资源")
+        btn_perf.setToolTip("从页面性能条目里补齐开发者模式开启之前的请求")
+        btn_perf.clicked.connect(self._load_perf)
+        btn_copy = QPushButton("复制地址")
+        btn_copy.clicked.connect(self._copy_net_url)
+        self.lbl_net = QLabel("0 条")
+        self.lbl_net.setObjectName("devHint")
+        for b in (btn_clear, btn_perf, btn_copy):
+            bar.addWidget(b)
+        bar.addWidget(self.lbl_net)
+        bar.addStretch(1)
+        lay.addLayout(bar)
+
+        self.net = QTableWidget(0, len(self.NET_COLS))
+        self.net.setHorizontalHeaderLabels(self.NET_COLS)
+        self.net.verticalHeader().setVisible(False)
+        self.net.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.net.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.net.setAlternatingRowColors(True)
+        self.net.setShowGrid(False)
+        hh = self.net.horizontalHeader()
+        hh.setStretchLastSection(True)
+        self.net.setColumnWidth(0, 68)
+        self.net.setColumnWidth(1, 84)
+        self.net.setColumnWidth(2, 56)
+        self.net.setColumnWidth(3, 74)
+        self.net.setColumnWidth(4, 62)
+        self.net.cellDoubleClicked.connect(lambda r, c: self._copy_net_url())
+        lay.addWidget(self.net, 1)
+        return w
+
+    def _net_add(self, method: str, rtype: str, url: str, size: int = -1,
+                 duration: float = -1.0, stamp: float | None = None) -> None:
+        row = self._net_rows.get(url)
+        if row is not None and row < self.net.rowCount():
+            # 同一地址被性能条目补全：就地填大小/耗时，不重复记一行
+            self._set_net_cell(row, 3, _size_text(size))
+            self._set_net_cell(row, 4,
+                               "—" if duration < 0 else "%d ms" % duration)
+            return
+        row = self.net.rowCount()
+        self.net.insertRow(row)
+        for col in range(len(self.NET_COLS)):
+            self.net.setItem(row, col, QTableWidgetItem(""))
+        ts = time.strftime("%H:%M:%S",
+                           time.localtime(stamp if stamp is not None else time.time()))
+        vals = (ts, rtype, method, _size_text(size),
+                "—" if duration < 0 else "%d ms" % duration, url)
+        for col, v in enumerate(vals):
+            self._set_net_cell(row, col, v)
+        self._net_rows[url] = row
+        # 表里不要无限长：超过上限就砍最旧的
+        if self.net.rowCount() > MAX_NET:
+            self.net.removeRow(0)
+            self._net_rows = {u: r - 1 for u, r in self._net_rows.items() if r > 0}
+
+    def _set_net_cell(self, row: int, col: int, text: str) -> None:
+        item = self.net.item(row, col)
+        if item is None:
+            item = QTableWidgetItem()
+            self.net.setItem(row, col, item)
+        item.setText(text)
+        item.setToolTip(text)
+
+    def _clear_net(self) -> None:
+        self.recorder.clear_net()
+        self._net_seq = 0
+        self.net.setRowCount(0)
+        self._net_rows.clear()
+        self.lbl_net.setText("0 条")
+
+    def _copy_net_url(self) -> None:
+        row = self.net.currentRow()
+        if row < 0:
+            return
+        item = self.net.item(row, len(self.NET_COLS) - 1)
+        if item is not None:
+            from PySide6.QtWidgets import QApplication
+            QApplication.clipboard().setText(item.text())
+            self.lbl_foot.setText("已复制地址：" + redact(item.text()))
+
+    def _load_perf(self) -> None:
+        def done(raw):
+            value = _as_json(raw)
+            if not isinstance(value, list):
+                self.lbl_foot.setText("没有读到性能条目（页面可能还没加载完）")
+                return
+            for e in value:
+                if not isinstance(e, dict):
+                    continue
+                self._net_add("GET", str(e.get("type") or "resource"),
+                              redact(str(e.get("name") or "")),
+                              int(e.get("size") or 0), float(e.get("dur") or 0))
+            self.lbl_net.setText("%d 条" % self.net.rowCount())
+            self.lbl_foot.setText("已从页面性能条目补齐 %d 条" % len(value))
+
+        self.page.runJavaScript(JS_PERF, done)
+
+    # ---- 布局页 ----
+
+    def _build_layout(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+
+        bar = QHBoxLayout()
+        bar.setSpacing(6)
+        btn_scan = QPushButton("重新扫描")
+        btn_scan.clicked.connect(self._scan_layout)
+        self.edit_filter = QLineEdit()
+        self.edit_filter.setPlaceholderText("按标签 / 类名 / 选择器过滤")
+        self.edit_filter.textChanged.connect(self._filter_layout)
+        self.lbl_layout = QLabel("0 个元素")
+        self.lbl_layout.setObjectName("devHint")
+        bar.addWidget(btn_scan)
+        bar.addWidget(self.edit_filter, 1)
+        bar.addWidget(self.lbl_layout)
+        lay.addLayout(bar)
+
+        tip = QLabel("这里只给一份坐标尺寸快照（用来快速定位谁把它挤走了）。"
+                     "盒模型、计算样式、层级与实时改动请用「打开完整开发者工具」的 Elements。")
+        tip.setObjectName("devHint")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+
+        self.layout_tbl = QTableWidget(0, len(self.LAY_COLS))
+        self.layout_tbl.setHorizontalHeaderLabels(self.LAY_COLS)
+        self.layout_tbl.verticalHeader().setVisible(False)
+        self.layout_tbl.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self.layout_tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.layout_tbl.setAlternatingRowColors(True)
+        self.layout_tbl.setShowGrid(False)
+        self.layout_tbl.horizontalHeader().setStretchLastSection(True)
+        self.layout_tbl.setColumnWidth(0, 420)
+        self.layout_tbl.setColumnWidth(1, 96)
+        self.layout_tbl.setColumnWidth(2, 96)
+        self.layout_tbl.setColumnWidth(3, 76)
+        self.layout_tbl.itemSelectionChanged.connect(self._highlight_row)
+        lay.addWidget(self.layout_tbl, 1)
+        return w
+
+    def _scan_layout(self) -> None:
+        def done(raw):
+            value = _as_json(raw)
+            if not isinstance(value, list):
+                self.lbl_foot.setText("扫描失败：页面还没准备好")
+                return
+            self.layout_tbl.setRowCount(0)
+            for e in value:
+                if not isinstance(e, dict):
+                    continue
+                r = self.layout_tbl.rowCount()
+                self.layout_tbl.insertRow(r)
+                name = "<%s>" % e.get("tag", "?")
+                if e.get("id"):
+                    name += "#" + str(e["id"])
+                if e.get("cls"):
+                    name += "." + str(e["cls"])
+                if e.get("depth"):
+                    name = "  " * min(int(e["depth"]), 8) + name
+                vals = (name,
+                        "%s×%s" % (e.get("w"), e.get("h")),
+                        "%s,%s" % (e.get("x"), e.get("y")),
+                        str(e.get("display") or ""),
+                        str(e.get("of") or ""))
+                for c, v in enumerate(vals):
+                    item = QTableWidgetItem(v)
+                    if c == 0:
+                        item.setData(Qt.ItemDataRole.UserRole, e.get("sel"))
+                        item.setToolTip(str(e.get("sel") or ""))
+                    self.layout_tbl.setItem(r, c, item)
+            self.lbl_layout.setText("%d 个元素" % self.layout_tbl.rowCount())
+            self.lbl_foot.setText("已扫描：点击任意一行会在页面里高亮该元素")
+
+        self.page.runJavaScript(JS_LAYOUT, done)
+
+    def _filter_layout(self, text: str) -> None:
+        needle = (text or "").strip().lower()
+        shown = 0
+        for r in range(self.layout_tbl.rowCount()):
+            item = self.layout_tbl.item(r, 0)
+            hit = True
+            if needle and item is not None:
+                hay = (item.text() + " " + str(item.toolTip())).lower()
+                hit = needle in hay
+            self.layout_tbl.setRowHidden(r, not hit)
+            if hit:
+                shown += 1
+        self.lbl_layout.setText("%d / %d 个元素"
+                                % (shown, self.layout_tbl.rowCount()))
+
+    def _highlight_row(self) -> None:
+        row = self.layout_tbl.currentRow()
+        if row < 0:
+            return
+        item = self.layout_tbl.item(row, 0)
+        if item is None:
+            return
+        sel = item.data(Qt.ItemDataRole.UserRole)
+        if not sel:
+            return
+
+        def done(res):
+            if res != "ok":
+                self.lbl_foot.setText("没能定位到该元素（页面可能已经重绘）：%s" % res)
+
+        self.page.runJavaScript(JS_HILITE + "(%s)" % json.dumps(str(sel)), done)
+
+    # ---- 环境页 ----
+
+    def _build_env(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(8)
+
+        self.env_rows: dict[str, QLabel] = {}
+        for key, title in (("url", "页面地址"), ("title", "页面标题"),
+                           ("viewport", "视口"), ("dpr", "设备像素比"),
+                           ("ready", "就绪状态"), ("nodes", "DOM 节点数"),
+                           ("ua", "User Agent")):
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            k = QLabel(title)
+            k.setObjectName("devHint")
+            k.setFixedWidth(96)
+            v = QLabel("—")
+            v.setWordWrap(True)
+            v.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            row.addWidget(k)
+            row.addWidget(v, 1)
+            lay.addLayout(row)
+            self.env_rows[key] = v
+
+        bar = QHBoxLayout()
+        bar.setSpacing(6)
+        btn_reload = QPushButton("重新加载")
+        btn_reload.clicked.connect(
+            lambda: self.page.triggerAction(QWebEnginePage.WebAction.Reload))
+        btn_cache = QPushButton("清缓存并重载")
+        btn_cache.clicked.connect(self._clear_cache_reload)
+        btn_tools = QPushButton("内核开发者工具")
+        btn_tools.setToolTip("Chromium 自带的完整开发者工具：Elements / Sources / "
+                             "Application / Performance 都在里面。"
+                             "会额外启动一个渲染实例（约 100~200MB），"
+                             "关掉窗口即释放。")
+        if self._open_inspector_cb is not None:
+            btn_tools.clicked.connect(lambda: self._open_inspector_cb())
+        else:
+            btn_tools.setEnabled(False)
+        btn_copy = QPushButton("复制诊断信息")
+        btn_copy.clicked.connect(self._copy_diag)
+        for b in (btn_reload, btn_cache, btn_tools, btn_copy):
+            bar.addWidget(b)
+        bar.addStretch(1)
+        lay.addLayout(bar)
+
+        hint = QLabel("轻量窗口：控制台消息与请求只保留最近 %d / %d 条，"
+                      "布局扫描上限 1200 个可见元素。"
+                      "完整能力（Elements / Sources / Network 瀑布图 / Application）"
+                      "在「打开完整开发者工具」里。"
+                      % (MAX_CONSOLE, MAX_NET))
+        hint.setObjectName("devHint")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+        lay.addStretch(1)
+        return w
+
+    def _refresh_env(self) -> None:
+        def done(raw):
+            v = _as_json(raw)
+            if not isinstance(v, dict):
+                return
+            self.lbl_url.setText(redact(str(v.get("url") or "")))
+            self.env_rows["url"].setText(redact(str(v.get("url") or "")))
+            self.env_rows["title"].setText(str(v.get("title") or "—"))
+            self.env_rows["viewport"].setText("%s × %s"
+                                              % (v.get("vw"), v.get("vh")))
+            self.env_rows["dpr"].setText(str(v.get("dpr")))
+            self.env_rows["ready"].setText(str(v.get("ready")))
+            self.env_rows["nodes"].setText(str(v.get("nodes")))
+            self.env_rows["ua"].setText(str(v.get("ua") or ""))
+
+        self.page.runJavaScript(JS_ENV, done)
+
+    def _clear_cache_reload(self) -> None:
+        try:
+            self.page.profile().clearHttpCache()
+        except Exception as e:                                 # noqa: BLE001
+            self.lbl_foot.setText("清缓存失败：%s" % e)
+            return
+        self.page.triggerAction(QWebEnginePage.WebAction.Reload)
+        self.lbl_foot.setText("已清空 HTTP 缓存并重新加载")
+
+    def _diag_text(self) -> str:
+        c_count, n_count = self.recorder.counts()
+        errs = [e for e in self.recorder.since_console(0)
+                if e.level == "error"][-30:]
+        lines = [
+            "%s v%s" % (HOST_NAME, HOST_VERSION),
+            "页面地址：%s" % redact(self.lbl_url.text()),
+            "视口：%s" % self.env_rows["viewport"].text(),
+            "设备像素比：%s" % self.env_rows["dpr"].text(),
+            "User Agent：%s" % self.env_rows["ua"].text(),
+            "控制台 %d 条 / 请求 %d 条" % (c_count, n_count),
+        ]
+        if errs:
+            lines.append("— 最近的控制台错误 —")
+            for e in errs:
+                ts = time.strftime("%H:%M:%S", time.localtime(e.ts))
+                lines.append("[%s] %s (%s:%d)"
+                             % (ts, e.message.replace("\n", " "),
+                                os.path.basename(e.source or ""), e.line))
+        return "\n".join(lines)
+
+    def _copy_diag(self) -> None:
+        from PySide6.QtWidgets import QApplication
+        QApplication.clipboard().setText(self._diag_text())
+        self.lbl_foot.setText("诊断信息已复制到剪贴板")
+
+    # ---- 轮询 ----
+
+    def showEvent(self, e) -> None:                            # noqa: N802
+        super().showEvent(e)
+        self._tick()
+        if not self._timer.isActive():
+            self._timer.start()
+
+    def hideEvent(self, e) -> None:                            # noqa: N802
+        self._timer.stop()
+        super().hideEvent(e)
+
+    def _on_tab(self, index: int) -> None:
+        if index == 1:
+            self.lbl_net.setText("%d 条" % self.net.rowCount())
+        elif index == 2:
+            self._scan_layout()
+        elif index == 3:
+            self._refresh_env()
+
+    def _tick(self) -> None:
+        for e in self.recorder.since_console(self._console_seq):
+            self._console_seq = e.seq
+            if not self._only_errors or e.level == "error":
+                self._console_line(e)
+        for e in self.recorder.since_net(self._net_seq):
+            self._net_seq = e.seq
+            self._net_add(e.method, e.rtype, e.url, e.size, e.duration, e.ts)
+
+        c, n = self.recorder.counts()
+        self.lbl_console.setText("%d 条" % c)
+        self.lbl_net.setText("%d 条" % self.net.rowCount())
+        self.lbl_foot.setText("控制台 %d · 请求 %d · %s"
+                              % (c, n, "开发者模式已开启"
+                                 if self.recorder.net_enabled
+                                 else "开发者模式已关闭（仅显示历史记录）"))

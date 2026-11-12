@@ -96,6 +96,7 @@ python -m nuitka --onefile \
   --windows-icon-from-ico=assets/icon.ico \
   --enable-plugin=pyside6 \
   --include-package=dsh_host \
+  --include-package=dsh_ui \
   --onefile-tempdir-spec={CACHE_DIR}/DSH-Web-runtime \
   --output-dir=build --output-filename=DSH-Web.exe \
   --lto=yes dsh_gui_qt.py

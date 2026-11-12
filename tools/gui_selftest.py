@@ -1391,9 +1391,32 @@ def health_checks() -> list:
         with open(os.path.join(ROOT, rel), encoding="utf-8") as fh:
             return fh.read()
 
-    gui = read("dsh_gui_qt.py")
-    panel = read("dsh_panel.py")
-    dev = read("dsh_devtools.py")
+    def read_pkg(rel_dir: str, skip: tuple = ()) -> str:
+        """把一个包目录下的所有 .py 拼起来读。
+
+        2026-11-12 拆分界面层之后，`dsh_gui_qt.py` 只剩入口，Worker 与对话框
+        搬进了 `dsh_ui/`。下面大量断言是"源码里得有这段"，只有把包一起读进来
+        它们才有意义——否则拆分本身会让一整套回归断言静默失效。
+        `skip` 用于排除以后单独归类出去的子包（例如面板、开发者工具），
+        免得"面板的断言在入口文件里也能找到"这种假通过。
+        """
+        base = os.path.join(ROOT, rel_dir)
+        chunks = []
+        for dirpath, _dirs, files in os.walk(base):
+            if any(os.path.join(rel_dir, s) in dirpath for s in skip):
+                continue
+            for name in sorted(files):
+                if name.endswith(".py"):
+                    with open(os.path.join(dirpath, name), encoding="utf-8") as fh:
+                        chunks.append(fh.read())
+        return "\n".join(chunks)
+
+    gui = read("dsh_gui_qt.py") + "\n" + read_pkg(
+        "dsh_ui", skip=("panel", "web", "devtools"))
+    panel = read("dsh_panel.py") + "\n" + read_pkg(os.path.join("dsh_ui", "panel"))
+    dev = (read("dsh_devtools.py")
+           + "\n" + read_pkg(os.path.join("dsh_ui", "web"))
+           + "\n" + read_pkg(os.path.join("dsh_ui", "devtools")))
     console = read("dsh_console.py")
     storage = read(os.path.join("dsh_host", "storage.py"))
     procmem_src = read(os.path.join("dsh_host", "procmem.py"))
