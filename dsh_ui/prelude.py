@@ -48,7 +48,14 @@ def _asset_dir() -> str:
     """
     bases: list[str] = []
     try:
-        bases.append(os.path.dirname(os.path.abspath(__file__)))
+        # **取包的上一级，不是这个文件所在的目录。**
+        # 这个函数原先住在根目录的 `dsh_gui_qt.py`，`dirname(__file__)` 正好
+        # 就是项目根 / onefile 解包根，`assets/` 就在它下面。
+        # 2026-11-13 搬进 `dsh_ui/prelude.py` 之后，同样的算式变成了
+        # `<根>/dsh_ui/`，去找 `dsh_ui/assets` 必然落空；于是只剩 cwd 这个
+        # 兜底候选——从桌面快捷方式启动（cwd 不在项目根）就找不到图标，
+        # 资源自检失败、自更新直接中止（v2.5.0 更新事故）。
+        bases.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     except NameError:                                          # pragma: no cover
         pass
     # Nuitka 打包后 __compiled__ 存在；frozen 覆盖其他打包器
@@ -93,6 +100,7 @@ def resource_report() -> tuple[str, bool]:
         "  ASSET_DIR 存在    = %s" % os.path.isdir(ASSET_DIR),
     ]
     ok = True
+    reasons: list[str] = []
     for label, p in (("icon.ico ", ICON_PATH),
                      ("icon-light", ICON_FOR_DARK_BG),
                      ("icon-dark ", ICON_FOR_LIGHT_BG)):
@@ -102,6 +110,7 @@ def resource_report() -> tuple[str, bool]:
         loadable = not ic.isNull()
         if not (exists and loadable):
             ok = False
+            reasons.append("%s 缺失或无法加载" % label.strip())
         lines.append("  %s  存在=%-5s 大小=%-7d 可加载=%s  %s"
                      % (label, exists, size, loadable, p))
 
@@ -119,9 +128,11 @@ def resource_report() -> tuple[str, bool]:
     lines.append("  current_exe      = %s" % exe)
     if packaged and not supported:
         ok = False
+        reasons.append("打包版里自更新不可用，菜单项会被禁用")
         lines.append("  ↑ 打包版里自更新应当可用，否则菜单项会被禁用")
     if packaged and not exe.lower().endswith(".exe"):
         ok = False
+        reasons.append("current_exe 未指向 .exe")
         lines.append("  ↑ 打包版里 current_exe 应指向 .exe")
 
     # --- 内联 SVG 图标链路 ---
@@ -141,12 +152,18 @@ def resource_report() -> tuple[str, bool]:
                      % (ratio, "正常" if good else "异常"))
         if not (good and icon_ok):
             ok = False
+            reasons.append("SVG 渲染异常（比例 %.3f，缺图标 %s）"
+                           % (ratio, dsh_icons.missing([probe_name]) or "无"))
             lines.append("  ↑ QtSvg 渲染异常：打包时可能漏收了 QtSvg 的库")
     except Exception as e:                                     # noqa: BLE001
         ok = False
+        reasons.append("内联图标不可用：%s: %s" % (type(e).__name__, e))
         lines.append("  内联图标不可用     = %s: %s" % (type(e).__name__, e))
         lines.append("  ↑ 面板图标会全部空白；多半是打包漏收了 PySide6.QtSvg")
 
+    if not ok:
+        # 汇总成一行放在结论之前：preflight 只带这一句回去，用户一眼能看到原因
+        lines.append("  失败项           = %s" % "；".join(reasons))
     lines.append("  结论             = %s" % ("通过" if ok else "**失败**"))
     return "\n".join(lines), ok
 

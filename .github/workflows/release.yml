@@ -232,12 +232,19 @@ jobs:
         # 这一步直接问打包产物自己：assets 解析到哪、图标能不能加载、
         # **内联 SVG 图标能不能渲染**（控制面板的图标靠 QtSvg，这是本项目
         # 第一次在产物里用 QtSvg——漏收它的库会表现为图标全部空白）。
-        # 少了这一步，图标会在发布后才被发现是坏的。
+        #
+        # **必须从一个没有 assets/ 的目录启动，而且 exe 也要放过去。**
+        # 以前直接在仓库根跑 `./build/DSH-Web.exe`，cwd 里就有 assets/，
+        # `_asset_dir()` 的 cwd 兜底会命中；argv[0] 所在的 build/ 也挨着仓库根。
+        # 于是"解包目录里其实没带 assets"被完全掩盖，CI 绿、用户更新却失败
+        # （2026-11-13 v2.5.0 事故）。现在两个兜底都被排除，只能靠包里的资源。
         shell: bash
         run: |
-          # 报告用相对路径：exe 在 bash 的 cwd 下运行，避免 Windows/POSIX
-          # 路径混写带来的坑。
-          DSH_HOST_RESOURCE_CHECK="resource-check.txt" ./build/DSH-Web.exe || CODE=$?
+          PROBE_DIR="$RUNNER_TEMP/dsh-probe-$$"
+          mkdir -p "$PROBE_DIR"
+          cp build/DSH-Web.exe "$PROBE_DIR/DSH-Web.exe"
+          cd "$PROBE_DIR"
+          DSH_HOST_RESOURCE_CHECK="resource-check.txt" ./DSH-Web.exe || CODE=$?
           CODE=${CODE:-0}
           echo "退出码=$CODE"
           echo "----- 自检报告 -----"

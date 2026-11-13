@@ -21,7 +21,7 @@ GitHub Actions 会自动构建 exe 并创建 Release。见 .github/workflows/rel
 """
 from __future__ import annotations
 
-HOST_VERSION = "2.5.0"
+HOST_VERSION = "2.5.1"
 
 #: 产品显示名——用户在窗口标题、托盘、关于里看到的那个名字（2026-11-12 定）。
 #:

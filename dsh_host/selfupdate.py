@@ -912,8 +912,19 @@ def preflight(exe: str, timeout: float = 240) -> tuple[bool, str]:
     try:
         with open(report, encoding="utf-8") as f:
             lines = [ln for ln in f.read().splitlines() if ln.strip()]
-        # 自检报告最后一行是"结论 = ..."，前面都只是环境信息
-        detail = "；".join(lines[-2:])[:200] if lines else ""
+        # 取**失败原因**，不是最后两行。
+        #
+        # 以前这里写的是"最后一行是结论，前面都只是环境信息"——这个假设是错的：
+        # 报告里以 `↑` 开头的那几行才是原因，而它们恰恰在最前面。
+        # 于是用户看到的是"SVG 渲染上色比例 = 0.313（正常）；结论 = 失败"这种
+        # 自相矛盾的话，完全无从下手（2026-11-13 v2.5.0 更新失败时踩到）。
+        reasons = [ln.lstrip("↑ ").strip() for ln in lines if ln.startswith("↑")]
+        if reasons:
+            detail = "；".join(reasons)[:300]
+        else:
+            # 没有 `↑` 说明失败来自异常分支，取以"异常""不可用"开头的行
+            odd = [ln for ln in lines if ("异常" in ln or "不可用" in ln)]
+            detail = "；".join(odd or lines[-2:])[:300]
     except OSError:
         pass
     return False, (f"候选版本自检未通过（退出码 {p.returncode}）"
