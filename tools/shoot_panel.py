@@ -31,7 +31,7 @@ from PySide6.QtWidgets import QApplication                       # noqa: E402
 from dsh_ui import panel as dsh_panel                                                 # noqa: E402
 from dsh_host import contract                                    # noqa: E402
 
-OUT = os.path.dirname(os.path.abspath(__file__))
+OUT = os.path.join(ROOT, "build")   # 产物固定落在 build/，不跟脚本位置跑
 
 
 def pump(seconds: float) -> None:
@@ -77,9 +77,13 @@ def shoot(theme: str, out_path: str, root_pid: int | None = None,
     # 圆角外的区域是透明的，垫一层纯色才看得出边界。
     # **画布必须按物理像素建、并继承 devicePixelRatio**：`QPixmap.size()` 是逻辑
     # 尺寸，直接拿它建画布会把 2 倍图缩回 1 倍——README 里那张糊图就是这么来的。
-    canvas = QImage(shot.size(), QImage.Format.Format_RGB32)
+    # **透明底，不是灰底。**
+    # 面板窗口带 WA_TranslucentBackground，四角是圆角；以前给画布填灰色
+    # （#8a8d92），圆角处就露出一圈灰边——Win11 下看着像截图没裁干净
+    # （2026-11-13 老大指出）。透明底让圆角自然过渡，叠到任何背景上都干净。
+    canvas = QImage(shot.size(), QImage.Format.Format_ARGB32_Premultiplied)
     canvas.setDevicePixelRatio(shot.devicePixelRatio())
-    canvas.fill(QColor("#8a8d92"))
+    canvas.fill(Qt.GlobalColor.transparent)
     p = QPainter(canvas)
     p.drawImage(0, 0, shot)
     p.end()

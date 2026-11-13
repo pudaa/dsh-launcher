@@ -1,14 +1,11 @@
-<h1 align="center">鲸坞</h1>
-
 <p align="center">
-  <b>DeepSeek Harness 的 Windows 桌面客户端</b><br>
-  双击即可运行：原生窗口里的 DSH Web UI，不必敲命令、不必处理端口与令牌。
+  <img src="docs/images/hero-banner.webp" alt="鲸坞：深色背景上的产品名与一句话定位——DeepSeek Harness 的桌面客户端" width="100%">
 </p>
 
 <p align="center">
-  <a href="https://github.com/pudaa/dsh-launcher/releases"><img alt="release" src="https://img.shields.io/github/v/release/pudaa/dsh-launcher"></a>
-  <img alt="platform" src="https://img.shields.io/badge/platform-Windows%2010%2B-4a5568">
-  <img alt="size" src="https://img.shields.io/badge/download-102%20MB-4a5568">
+  <a href="https://github.com/pudaa/dsh-launcher/releases"><img alt="release" src="https://img.shields.io/github/v/release/pudaa/dsh-launcher?style=flat-square"></a>
+  <img alt="platform" src="https://img.shields.io/badge/platform-Windows%2010%2B-4a5568?style=flat-square">
+  <img alt="size" src="https://img.shields.io/badge/download-102%20MB-4a5568?style=flat-square">
 </p>
 
 ## 它解决什么问题
@@ -112,35 +109,45 @@ GitHub Actions 会运行自测、构建 exe、创建 Release。工作流校验 t
 
 ## 界面
 
-控制面板用原生控件绘制，不额外开一个 WebEngine 实例——每开一个页面就是多占一百多兆，
-而它要展示的只是几行状态和几个开关。
+截图都是真实窗口，不是效果图。背景与标题由本地模型生成，配色取自 DSH 官方的设计令牌
+（深色底 `#151517`、强调色 `#679efe`）。
 
-### 概览：先知道它现在是什么状态
+### 主界面
 
 <p align="center">
-  <img src="docs/images/panel-overview.png" alt="控制面板概览页：版本与来源、后台服务状态、按进程树归拢的内存占用" width="100%">
+  <img src="docs/images/card-main.webp" alt="主窗口：左侧图标栏，中间是「探索未至之境」与输入框，标题栏是本程序的" width="100%">
 </p>
 
-三块内容按"你最常问的问题"排：
+一个原生窗口，里面就是完整的 DSH。没有地址栏、没有标签页，也不需要先开浏览器。
+
+### 控制面板 · 概览
+
+<p align="center">
+  <img src="docs/images/card-overview.webp" alt="控制面板概览页：版本与来源、后台服务状态、按进程树归拢的内存占用" width="100%">
+</p>
+
+三块内容按"最常问的问题"排：
 
 - **当前状态** —— 用的哪份安装、什么版本、后台服务起没起
 - **内存占用** —— 按进程树归拢成主进程 / 网页 / 后台服务，只算私有内存
   （任务管理器那列是工作集，窗口最小化会掉到几十兆，看着像释放了，其实没有）
-- **进入工作** —— 同一个窗口切到工作区，不必再去终端复制带令牌的地址
+- **进入工作** —— 同一个窗口切到工作区
 
-### 运行方式：本机，或者另一台机器
+面板用原生控件绘制，每开一个页面就少占一百多兆——它要展示的只是几行状态和几个开关。
+
+### 控制面板 · 运行方式
 
 <p align="center">
-  <img src="docs/images/panel-runmode.png" alt="控制面板运行方式页：私有安装与命令行共用两种模式，以及远程主机列表" width="100%">
+  <img src="docs/images/card-runmode.webp" alt="控制面板运行方式页：私有安装与命令行共用两种模式，以及远程主机列表" width="100%">
 </p>
 
-- **私有安装** 与命令行那份互不影响：升级只动它，不会因为终端里的 `npm` 操作
-  变成"主程序升了、组件还在旧版"（这个症状的排查见下节）
-- **公共安装** 直接用命令行那份，不额外占磁盘，代价同上——两边共用一套文件
+- **私有安装** 与命令行那份互不影响：升级只动它，不会因为终端里的 `npm` 操作变成
+  "主程序升了、组件还在旧版"
+- **公共安装** 直接用命令行那份，不额外占磁盘
 - **远程主机** 经 SSH 隧道接入：远端 DSH 仍然只监听 `127.0.0.1`，端口借到本机，
   认证走系统 SSH 的密钥或 agent，程序不保存任何凭据
 
-远程功能目前标着「实验」：代码完整，但"复用远端已启动的实例"这条判据还没在真机验证过。
+远程功能还标着「实验」：代码完整，但"复用远端已启动的实例"这条判据没在真机验证过。
 
 ## 架构
 
