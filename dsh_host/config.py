@@ -150,6 +150,23 @@ def profile_dir() -> str:
     return d
 
 
+def webview_cache_dir(tag: str = "") -> str:
+    """QtWebEngine 的磁盘缓存目录（与 profile 分开，按 Qt 版本隔离）。
+
+    为什么不能让它走默认路径（2026-11-13 真机）：QtWebEngine 的默认缓存
+    路径只按应用名/组织名推导，**与 Qt 版本无关**。同一份源码用
+    Python312（Qt 6.10.1）和 .venv-6113（Qt 6.11.3）启动时，两个版本会
+    共用同一个 `Cache`；后启动的那个想迁移前一个写的缓存，直接
+    `Unable to move the cache: 拒绝访问 (0x5)`，控制台一屏 Chromium 红字。
+    缓存不含登录态（Cookie 在 profile 里），按版本分目录没有副作用。
+    """
+    d = os.path.join(data_root(), "webview-cache")
+    if tag:
+        d = os.path.join(d, tag)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
 def remote_hosts_path() -> str:
     """远程主机列表（2026-11-12）。**不含任何凭据**。
 

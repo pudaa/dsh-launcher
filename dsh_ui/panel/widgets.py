@@ -176,8 +176,10 @@ class Card(QFrame):
             self.help_btn.setIcon(icons.qicon("info", pal["muted"], 12))
             # QToolTip 会按窗口宽度换行，但长句在 880 宽的窗口里会拉得很宽；
             # 用固定的富文本宽度把提示收成一块，读起来才像"说明"而不是横幅。
+            # 行距交给 dsh_theme 的浮窗统一给：两层 div 各写一份 line-height
+            # 会把段落间的空行撑开（2026-11-13 出图核对）。
             self.help_btn.setToolTip(
-                '<div style="width:300px; line-height:150%%;">%s</div>'
+                '<div style="width:300px;">%s</div>'
                 % _tooltip_html(help_text))
             self.help_btn.setStyleSheet(
                 "QToolButton { border: none; background: transparent; padding: 0; }"

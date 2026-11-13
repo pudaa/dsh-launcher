@@ -722,6 +722,33 @@ def _read_new(path: str, pos: int) -> tuple[str, int]:
         return "", pos
 
 
+def _open_log(log_path: str) -> tuple:
+    """打开服务日志；被瞬时占用时重试并退到备用文件。
+
+    2026-11-13 真机：上一个实例刚退出（或杀软扫描）时，`open(..., "ab")`
+    抛 `PermissionError: [Errno 13]`。这行原本是 launch() 的第一步，于是
+    整个 DSH 起不来、面板弹「DSH 启动失败」。日志属于观测设施，不该成为
+    启动的单点故障：
+
+      · 先原地重试 3 次（150 ms 间隔），吃掉瞬时占用；
+      · 仍失败就退到同目录的 `dsh-web.fallback.log`，返回**实际路径** ——
+        `_read_new` / `recover_url` / `stop` 都按这个路径走，URL 解析不受
+        影响（只写 DEVNULL 会让服务起来了却拿不到地址）。
+    """
+    fallback = os.path.join(os.path.dirname(log_path),
+                            "dsh-web.fallback.log")
+    last = None
+    for path in (log_path, fallback):
+        for attempt in range(3):
+            try:
+                return open(path, "ab"), path
+            except OSError as e:
+                last = e
+                if attempt < 2:
+                    time.sleep(0.15)
+    raise last
+
+
 def launch(install: DshInstall, port: int, log_path: str, cwd: str | None = None) -> ServiceHandle:
     """启动 dsh web。stdout/stderr 落到我们自己的日志文件——不读 DSH 的私有日志。"""
     profile = install.profile
@@ -738,7 +765,10 @@ def launch(install: DshInstall, port: int, log_path: str, cwd: str | None = None
     if home:
         env["DSH_HOME"] = home
 
-    fh = open(log_path, "ab")
+    wanted_log = log_path
+    fh, log_path = _open_log(wanted_log)
+    if log_path != wanted_log:
+        host_log("服务日志被占用，改用备用文件：%s" % log_path)
     try:
         proc = subprocess.Popen(
             args, stdout=fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,

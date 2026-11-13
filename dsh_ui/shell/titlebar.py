@@ -143,6 +143,13 @@ class TitlebarMixin:
         # 不要在面板里再判一次——两处判断迟早会不一致。同时记住，下次启动能直接用。
         self._theme_dark = bool(dark)
         config.set(last_theme_dark=bool(dark))
+        # 浮窗是按显示那一刻的配色画的，主题翻了就先收起来，别留一块旧色。
+        try:
+            dsh_theme.hide_tooltip()
+            # 兜底模式的调色板是全局静态量，主题翻了要重新写一次。
+            dsh_theme.refresh_tooltips()
+        except (AttributeError, RuntimeError):
+            pass
         panel = getattr(self, "_panel", None)
         if panel is not None:
             panel.apply_theme("dark" if dark else "light")

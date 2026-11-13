@@ -96,7 +96,7 @@ if _flags:
         pass
 
 from PySide6.QtCore import (QCoreApplication, QEvent, QStandardPaths, Qt,
-                            QThread, Signal, QTimer, QUrl)
+                            QThread, Signal, QTimer, QUrl, qVersion)
 from PySide6.QtGui import (QIcon, QAction, QDesktopServices, QImage,
                            QKeySequence, QShortcut)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
@@ -553,7 +553,17 @@ def main() -> int:
     if bool(config.get("dev_mode")):
         dsh_console.install()
 
-    QApplication.setApplicationName("DSH-Web")
+    # applicationName 决定 QtWebEngine **默认 profile** 的缓存目录
+    # （`QStandardPaths::CacheLocation`），而 `defaultProfile().setCachePath()`
+    # 实测无效（cachePath() 恒为空）。
+    #
+    # 本机同时存在 Python312(Qt 6.10.1) 与 .venv-6113(Qt 6.11.3) 两份环境，
+    # 它们会共用同一个默认 Cache（路径只按 app 名推导），后启动的那个一启动
+    # 就报 `Unable to move the cache: 拒绝访问 (0x5)`。所以 app 名统一带
+    # Qt 版本后缀，**打包版也带** —— 否则打包版（6.11.3）与源码 6.10.1
+    # 仍会撞；下载目录等系统路径与 app 名无关，不受影响。
+    app_name = "DSH-Web-qt%s" % qVersion()
+    QApplication.setApplicationName(app_name)
     QApplication.setOrganizationName("DSH")
     app = QApplication(sys.argv)
 
@@ -569,6 +579,10 @@ def main() -> int:
     #
     # 所以：退出只走 `_quit()`（托盘菜单），窗口的开关一概不退出进程。
     app.setQuitOnLastWindowClosed(False)
+
+    # 工具提示：原生 QToolTip 不吃样式表，接管成自绘卡片后才会跟官方令牌走。
+    # 必须在任何窗口创建之前挂上全局过滤器。
+    dsh_theme.install_tooltips(app)
 
     # 打包产物资源自检：设了环境变量就只检查、写报告、退出，不进 GUI。
     # CI 构建完 exe 后立刻跑这个，用来兜住"包里没带 assets"这类问题。

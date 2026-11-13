@@ -130,7 +130,7 @@ Qt 对应：`QPropertyAnimation` + `QEasingCurve.OutCubic`（`dsh_theme.EASE`）
 | `:disabled` | `:disabled` | 文字降为 `muted`，不改透明度 |
 | `:focus-visible` | **不画焦点环** | 官方在指针模态下 outline 透明；Qt 的系统虚线框必须去掉 |
 | `::-webkit-scrollbar` 5px 圆角 | `QScrollBar` 8px 圆角 | 面板改用浮动指示条，见 §9 |
-| `box-shadow` 浮层 | `1px` 描边 + 底色层次 | Qt 叠阴影代价高；QWindows11Style 还会给 QMenu 加一层被窗口裁切的投影（§11.2） |
+| `box-shadow` 浮层 | `1px` 描边 + 底色层次 | 面板/菜单走平面；QWindows11Style 给 QMenu 加的投影见 §11.2。**下拉弹层例外**：细描边 + 温和底影，见 §11.3 |
 
 **焦点环的处理要特别说明**：官方用 `:focus-visible` 区分"键盘操作"和"鼠标点击"，
 Qt 的 `:focus` 没有这个区分。我们的选择是**一律不画环**，用底色/描边表达选中；
@@ -234,6 +234,71 @@ offset 到右下的阴影被窗口边缘硬裁，正好露出 3px。
 **验证**：离屏 `theme_checks()` 查 `graphicsEffect() is None`，并扫菜单
 右/下**直边中段** 3px（避开圆角抗锯齿）不应有半透明暗像素；真机截图确认
 右/下与桌面背景一致，无渐变、无硬边。
+
+### 11.3 下拉列表的右下硬阴影：这回真的是 DWM 窗口阴影
+
+**现象**（2026-11-13 老大审验）：「添加远程主机」的下拉展开后右下有一条实色
+灰边；白卡片叠在白对话框上，边界也几乎看不出来。对照 DSH 官方下拉，那边是
+细灰描边 + 温和的底部投影。
+
+**与 §11.2 的区别**（容易混淆，探针实测）：
+- QMenu 那次 `graphicsEffect()` 是 `QGraphicsDropShadowEffect`，窗口外侧没有
+  DWM 阴影，`NoDropShadowWindowHint` 管不到它。
+- `QComboBoxPrivateContainer` 这次 `graphicsEffect() == None`、
+  `NoDropShadowWindowHint` 未设、`WA_TranslucentBackground` 未开 —— 硬边来自
+  **DWM 的窗口级阴影**。两条路径不同，处理原则一致：关掉系统那层，自己按令牌画。
+
+**修法**（`dsh_theme._ComboPopupGuard`）：
+- 整组 OR 写入 `FramelessWindowHint | NoDropShadowWindowHint`（单独
+  `setWindowFlag` 对私有容器无效，与 `apply_menu` 同款坑）；
+- 容器 `WA_TranslucentBackground` + `autoFillBackground=False` + QSS 透明，
+  view 自绘 `card` 底、`1px` 细边框、`8px` 圆角。边框色 `popup_edge()` 用
+  `dim` 以 18% 压到 `card` 上：全局 `line` 只有 10% 黑，在白底上分不出边界，
+  之前又被不透明的 view 盖住；
+- 底部投影是低 alpha 的 `QGraphicsDropShadowEffect`（blur 10、offset (0,2)、
+  浅色 alpha 26 / 暗色 70），装在**容器**上；layout 的 (10,6,10,12) 留白就是
+  它的绘制空间，不会再被窗口边缘裁出硬边；
+- `showPopup()` 会重设容器 palette（实测 #efefef）和几何，所以 Show 事件里
+  重设调色板，并把容器加高留白那 18px —— 否则最后一项被截半行。
+
+**真机上为什么曾经完全不一样（2026-11-13 第二次审验）**：
+`apply()` 里的 `setWindowFlags()` 会重建本机窗口并触发 Resize/Polish，
+回调可能早于 `__init__` 返回。1x 缩放下 `_popup` 还没赋值就进了
+`eventFilter`，`AttributeError` 被 Qt 吞掉（打包版没有控制台），守卫初始化
+中断 —— 留白、投影、加高原封不动，表现就是系统滚动条 + 最后一项截断。
+2x 出图恰好躲过这个时序，所以我当时的截图和老大实机完全对不上。修法：
+字段给类级默认值、先 `installEventFilter` 再 `apply`，`_pad()` 只在容器
+**可见**时记录基准高度，并在 Show 后下一拍补一次加高。
+
+**出图倍率也要对齐实机**：`build/shoot_tooltip_combo.py` 默认 1x，需要高清
+图时才加 `--hires`。用 2x 判断圆角/阴影/留白会失真，还会掩盖上面这类时序
+问题。
+
+**PySide6 6.10.1 与 6.11 的差异（2026-11-13，老大双击用的系统 Python312）**：
+同一个源码，6.11.2/6.11.3 下正常，6.10.1 下必现滚动条 + 最后一项截断。
+两个独立原因：
+1. 6.10.1 下弹层容器的 Show/Polish **不会到达**守卫的 eventFilter，`_pad()`
+   一次都不执行；
+2. `setWindowFlags` 重建本机窗口时 Qt 会删掉挂在上面的
+   `QGraphicsDropShadowEffect`，Python 引用变成"已删除对象"，下一次
+   `apply()` 抛 `RuntimeError`，被 Qt 吞掉后整条加高/描边链路静默失效。
+
+修法：
+- 点击/按键后 `QTimer.singleShot(0, _ensure_popup)` 主动补一次，不依赖 Show；
+- effect 用前探活（`eff.blurRadius()` 抛 RuntimeError 即重建），不缓存死；
+- `_pad()` 只在容器可见、高度 ≥ 60 时记录基准；
+- 加高后再隔 30 ms 补一次，防 Qt 收尾按 sizeHint 重摆。
+
+**验证口径**：真实入口探针 `build/probe_real_path.py`（控制面板 → 运行方式 →
+添加主机 → `exec()`），并在脚本里打印解释器与 PySide6 版本。Python312/6.10.1、
+3.13/6.11.2、`.venv-6113`/6.11.3 三个环境都必须输出
+`结论: OK（无系统滚动条）`。发布态用 6.11.3，源码双击可能是 6.10.1，两边都要过。
+
+**验证**：`theme_checks()` 查窗口标志、effect 参数、边框/圆角 QSS、留白与
+最后一项完整；`build/shoot_tooltip_combo.py` 出 `combo-*.png`（控件渲染）与
+`combo-screen-*.png`（真实屏幕，专门核对窗口外的阴影性质），明暗两套。
+暗色下官方怎么配阴影没有实证，此处按同一套令牌派生：边框稍亮、投影用稍浓的
+低 alpha 黑。
 
 
 

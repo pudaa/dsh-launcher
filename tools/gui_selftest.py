@@ -1238,6 +1238,277 @@ def theme_checks() -> list[str]:
     check("托盘菜单走 dsh_theme.Menu（不退回裸 QMenu）",
           "dsh_theme.Menu()" in src and "QMenu()" not in src)
 
+    # --- 工具提示浮窗 / 下拉弹层（2026-11-13 真机反馈）---
+    # 两者都是顶层窗口，原生形态不吃面板样式表：提示框是系统灰底黑框，
+    # 下拉列表在 Win11 下渲染成一整块黑。只验"样式表里有这行字"没用，
+    # 这里发真实 QHelpEvent、真 showPopup，再 grab() 看渲染出来的像素。
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QColor, QCursor, QHelpEvent, QPalette
+    from dsh_ui.panel.widgets import Card, RemoteHostDialog
+
+    check("主程序在 QApplication 建好后安装浮窗过滤器",
+          "dsh_theme.install_tooltips(app)" in src)
+    check("主题切换会刷新兜底模式的调色板",
+          "dsh_theme.refresh_tooltips()" in src)
+    check("兜底默认关闭（显式开关，不自动降级）",
+          dsh_theme.NATIVE_TOOLTIP_ENV == "DSH_TOOLTIP_NATIVE"
+          and not dsh_theme.native_tooltip_enabled())
+    holder = {"pal": dsh_theme.palette("light")}
+    mgr = dsh_theme.install_tooltips(QApplication.instance(),
+                                     lambda: holder["pal"])
+    tip = dsh_theme.active_tooltip()
+    check("工具提示已接管（管理器与自绘卡片都在）",
+          mgr is not None and tip is not None)
+
+    card = Card("自动安装", holder["pal"],
+                help_text="第一段 <select> 不能被吞掉。\n第二段要另起一段。")
+    card.show()
+    QApplication.processEvents()
+    old_pos = QCursor.pos()
+    for name, expect in (("light", "#ffffff"), ("dark", "#232324")):
+        holder["pal"] = dsh_theme.palette(name)
+        # 浮窗按鼠标真实位置决定去留，把光标放到 ⓘ 上才是真 hover。
+        local = card.help_btn.rect().center()
+        gpos = card.help_btn.mapToGlobal(local)
+        QCursor.setPos(gpos)
+        QApplication.sendEvent(card.help_btn,
+                               QHelpEvent(QEvent.Type.ToolTip, local, gpos))
+        QApplication.processEvents()
+        img = tip.grab().toImage()
+        mid = img.pixelColor(img.width() // 2, img.height() // 2)
+        check("%s 浮窗底色等于 card 令牌且真的显示" % name,
+              mid.name().lower() == expect and tip.isVisible(),
+              "%s visible=%s" % (mid.name(), tip.isVisible()))
+        check("%s 浮窗四角透明（圆角生效）" % name,
+              img.pixelColor(1, 1).alpha() < 40,
+              "a=%d" % img.pixelColor(1, 1).alpha())
+    html = tip.label.text()
+    check("浮窗转义 HTML 并保留分段",
+          "&lt;select&gt;" in html and "第二段" in html
+          and "margin-top:6px" in html,
+          repr(html[:60]))
+    # FONT 里的双引号要是直接拼进 style="..."，属性会在字体名处提前闭合，
+    # 后面的 font-size / line-height 全被吃掉（字号会悄悄退回系统默认）。
+    check("字体名用 &quot; 转义，字号行距没被截断",
+          "&quot;" in html and "font-size:12px" in html
+          and "line-height:140%" in html)
+    short = g.QLabel("x")
+    short.setToolTip("最小化")
+    short.show()
+    QApplication.processEvents()
+    s_local = short.rect().center()
+    s_gpos = short.mapToGlobal(s_local)
+    QCursor.setPos(s_gpos)
+    QApplication.sendEvent(short, QHelpEvent(
+        QEvent.Type.ToolTip, s_local, s_gpos))
+    QApplication.processEvents()
+    check("短提示按内容收窄（不撑成横幅）", tip.width() < 180,
+          "%dpx" % tip.width())
+    dsh_theme.hide_tooltip()
+    check("hide_tooltip 能收起浮窗", not tip.isVisible())
+    # 生命周期照抄 Qt 的 QTipLabel：Leave 只排一次 300 ms 单次隐藏，
+    # 到期复核鼠标位置；MouseMove 回到锚点可撤销。没有周期轮询。
+    from PySide6.QtCore import QPointF, QTimer
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtTest import QTest
+    timers = mgr.findChildren(QTimer)
+    check("浮窗生命周期只有单次定时器（没有周期轮询）",
+          len(timers) == 2 and all(t.isSingleShot() for t in timers),
+          "%d 个: %s" % (len(timers), [t.isSingleShot() for t in timers]))
+    check("过期时间按文字长度算（Qt 公式）",
+          mgr._expire_ms("x") == 10000
+          and mgr._expire_ms("x" * 200) == 14000)
+    QCursor.setPos(s_gpos)
+    QApplication.sendEvent(short, QHelpEvent(
+        QEvent.Type.ToolTip, s_local, s_gpos))
+    QApplication.processEvents()
+    check("重新 hover 后浮窗再次显示", tip.isVisible())
+    QCursor.setPos(2000, 2000)
+    QApplication.sendEvent(short, QEvent(QEvent.Type.Leave))
+    QApplication.processEvents()
+    check("Leave 后不立刻收起（300 ms 宽限）", tip.isVisible())
+    QTest.qWait(420)
+    check("鼠标移开后浮窗自动收起", not tip.isVisible())
+    # 宽限期内鼠标移回：MouseMove 应撤销待隐藏，浮窗不闪。
+    QCursor.setPos(s_gpos)
+    QApplication.sendEvent(short, QHelpEvent(
+        QEvent.Type.ToolTip, s_local, s_gpos))
+    QApplication.processEvents()
+    QApplication.sendEvent(short, QEvent(QEvent.Type.Leave))
+    QApplication.sendEvent(short, QMouseEvent(
+        QEvent.Type.MouseMove, QPointF(s_local), QPointF(s_gpos),
+        g.Qt.MouseButton.NoButton, g.Qt.MouseButton.NoButton,
+        g.Qt.KeyboardModifier.NoModifier))
+    QTest.qWait(420)
+    check("宽限期内鼠标移回可取消隐藏（不闪）", tip.isVisible())
+    dsh_theme.hide_tooltip()
+    short.close()
+    short.deleteLater()
+    card.close()
+    card.deleteLater()
+
+    # 开发者工具的表格把提示放在 item 的 ToolTipRole 上，Qt 又把事件发给
+    # viewport：这条分支漏了的话，那边的提示会退回系统灰底黑框。
+    from PySide6.QtWidgets import QTableWidget, QTableWidgetItem
+    table = QTableWidget(2, 1)
+    item = QTableWidgetItem("请求 /api/chat")
+    item.setToolTip("这条请求的完整 URL")
+    table.setItem(0, 0, item)
+    table.show()
+    QApplication.processEvents()
+    vp = table.viewport()
+    local = table.visualItemRect(item).center()
+    gpos = vp.mapToGlobal(local)
+    QCursor.setPos(gpos)
+    QApplication.sendEvent(vp, QHelpEvent(QEvent.Type.ToolTip, local, gpos))
+    QApplication.processEvents()
+    check("列表项提示也走自绘浮窗",
+          tip.isVisible() and "完整 URL" in tip.label.text(),
+          repr(tip.label.text()[:40]))
+    table.close()
+    table.deleteLater()
+    dsh_theme.hide_tooltip()
+    QCursor.setPos(old_pos)
+
+    for name, expect in (("light", "#ffffff"), ("dark", "#232324")):
+        p2 = dsh_theme.palette(name)
+        dlg = RemoteHostDialog(p2, aliases=[])
+        dlg.show()
+        QApplication.processEvents()
+        cb = dlg.cb_keep
+        view, popup = cb.view(), cb.view().parentWidget()
+        check("%s 下拉视图与对话框都带令牌规则" % name,
+              p2["card"] in view.styleSheet()
+              and "QComboBox QAbstractItemView" in dlg.styleSheet())
+        # 容器现在是透明底（alpha=0 的 QColor.name() 会显示 #000000，
+        # 那是"透明"不是"黑"），底色由 view 的 QSS 自绘。这里验真正生效的
+        # 那条路径，别再拿容器 palette 的 name() 当颜色比。
+        check("%s 下拉视图底色取自 card 令牌（容器不铺底）" % name,
+              ("background: %s" % expect) in view.styleSheet().lower()
+              and not popup.autoFillBackground(),
+              "autoFill=%s" % popup.autoFillBackground())
+        arrow = cb.findChild(g.QLabel, "comboArrow")
+        # QSS 的 ::down-arrow 在这套 Qt 上要么画成灰方块、要么什么都不画，
+        # 箭头只能靠自绘子控件。顺便验它的 ink 就是 dim 令牌。
+        ink = (arrow.pixmap().toImage().pixelColor(7, 7)
+               if arrow is not None and arrow.pixmap() is not None
+               else QColor("#000000"))
+        want = QColor(p2["dim"])
+        check("%s 下拉箭头自绘、不吃鼠标、ink 用 dim 令牌" % name,
+              arrow is not None
+              and arrow.testAttribute(
+                  g.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+              and ink.alpha() > 200
+              and max(abs(ink.red() - want.red()),
+                      abs(ink.green() - want.green()),
+                      abs(ink.blue() - want.blue())) <= 12,
+              ink.name())
+        # 老大 2026-11-13 审验：Qt 的 DWM 窗口阴影是右下实色硬边，且
+        # 10% 黑的 line 令牌太淡、又被 view 的不透明底盖住，看着没有边界。
+        # 现在关掉系统阴影，view 自绘细边框/圆角，容器留白给柔和底影。
+        check("%s 下拉弹层关掉了系统 DWM 硬阴影" % name,
+              bool(popup.windowFlags()
+                   & g.Qt.WindowType.NoDropShadowWindowHint)
+              and popup.testAttribute(
+                  g.Qt.WidgetAttribute.WA_TranslucentBackground))
+        eff = popup.graphicsEffect()
+        check("%s 下拉弹层用低 alpha 底部柔影（不是实色）" % name,
+              isinstance(eff, QGraphicsDropShadowEffect)
+              and eff.blurRadius() >= 10
+              and 0 <= eff.offset().y() <= 5
+              and eff.color().alpha() <= 120,
+              "%s blur=%s a=%s" % (
+                  type(eff).__name__,
+                  getattr(eff, "blurRadius", lambda: "-")(),
+                  eff.color().alpha() if isinstance(
+                      eff, QGraphicsDropShadowEffect) else "-"))
+        check("%s 下拉视图画了细边框与圆角" % name,
+              "border: 1px solid" in view.styleSheet()
+              and "border-radius" in view.styleSheet()
+              and dsh_theme.popup_edge(p2) in view.styleSheet())
+        margins = popup.layout().contentsMargins()
+        check("%s 弹层为投影留了底部空间" % name,
+              margins.bottom() > margins.top() >= 0,
+              "上=%d 下=%d" % (margins.top(), margins.bottom()))
+
+        cb.showPopup()
+        QApplication.processEvents()
+        img = popup.grab().toImage()
+        mid = img.pixelColor(img.width() // 2, img.height() // 2)
+        check("%s 下拉弹层实际渲染为 card 底色" % name,
+              mid.name().lower() == expect and mid.alpha() > 200,
+              "%s a=%d" % (mid.name(), mid.alpha()))
+        model = view.model()
+        if model is not None and model.rowCount():
+            last = view.visualRect(model.index(model.rowCount() - 1, 0))
+        check("%s 留白后最后一个选项仍完整" % name,
+              last.bottom() <= view.height() + 2,
+              "bottom=%d view_h=%d" % (last.bottom(), view.height()))
+        # 老大实机截图里的那一版：守卫初始化被时序异常打断，留白没加上，
+        # 结果 view 内容超高 → 系统滚动条 + 最后一项截断。这条直接钉住它。
+        check("%s 弹层高度足够，没有系统滚动条" % name,
+              not view.verticalScrollBar().isVisible(),
+              "h=%d view_h=%d" % (popup.height(), view.height()))
+        cb.hidePopup()
+        dlg.close()
+        dlg.deleteLater()
+
+    # --- 方案 1 兜底：显式开关切回原生 QToolTip ---
+    # 默认不启用，也没有自动降级。自绘浮窗若在某种平台上出问题，设
+    # DSH_TOOLTIP_NATIVE=1 就能立刻用回 Qt 自己的生命周期与位置。
+    from PySide6.QtWidgets import QToolTip
+    app_now = QApplication.instance()
+    old_env = os.environ.get(dsh_theme.NATIVE_TOOLTIP_ENV)
+    old_sheet = app_now.styleSheet()
+    try:
+        os.environ[dsh_theme.NATIVE_TOOLTIP_ENV] = "1"
+        native = dsh_theme.install_tooltips(
+            app_now, lambda: dsh_theme.palette("dark"))
+        check("兜底开关生效：不装自绘过滤器",
+              native is None and dsh_theme.active_tooltip() is None)
+        base = QToolTip.palette().color(QPalette.ColorRole.ToolTipBase)
+        ink = QToolTip.palette().color(QPalette.ColorRole.ToolTipText)
+        check("兜底模式调色板取自令牌",
+              base.name().lower() == "#232324"
+              and ink.name().lower() == "#cfd3d6",
+              "%s / %s" % (base.name(), ink.name()))
+        check("兜底模式应用级 QSS 含 QToolTip 规则",
+              "QToolTip," in app_now.styleSheet())
+        dsh_theme.refresh_tooltips()
+        check("刷新兜底样式不会重复追加 QSS",
+              app_now.styleSheet().count(dsh_theme._NATIVE_QSS_BEGIN) == 1)
+        nw = g.QLabel("x")
+        nw.setToolTip("兜底提示")
+        nw.show()
+        QApplication.processEvents()
+        n_local = nw.rect().center()
+        n_gpos = nw.mapToGlobal(n_local)
+        QCursor.setPos(n_gpos)
+        QApplication.sendEvent(nw, QHelpEvent(
+            QEvent.Type.ToolTip, n_local, n_gpos))
+        QApplication.processEvents()
+        native_tips = [w for w in QApplication.topLevelWidgets()
+                       if w.objectName() == "qtooltip_label"]
+        check("兜底模式真的显示原生 QToolTip",
+              bool(native_tips) and native_tips[0].isVisible())
+        QToolTip.hideText()
+        # Qt 6.11 的 hideText() 只调 hideTip() 启动 **300 ms** 的单次
+        # hideTimer，到点才 close()+deleteLater()。等不够就 os._exit，
+        # 会撞上仍活着的 QTipLabel 顶层窗口（offscreen 下偶发 139）。
+        QApplication.processEvents()
+        QTest.qWait(420)
+        QApplication.processEvents()
+        nw.close()
+        nw.deleteLater()
+    finally:
+        if old_env is None:
+            os.environ.pop(dsh_theme.NATIVE_TOOLTIP_ENV, None)
+        else:
+            os.environ[dsh_theme.NATIVE_TOOLTIP_ENV] = old_env
+        app_now.setStyleSheet(old_sheet)
+        dsh_theme.install_tooltips(app_now, lambda: holder["pal"])
+        QCursor.setPos(old_pos)
+
     return failures
 
 
@@ -1910,4 +2181,9 @@ def main() -> int:
 if __name__ == "__main__":
     code = main()
     sys.stdout.flush()
-    os._exit(code)      # QWebEngine 的收尾线程不保证干净退出，直接结束进程
+    if os.environ.get("DSH_GUI_SELFTEST_STATIC") == "1":
+        # 静态模式没起 WebEngine，正常收尾即可。走 os._exit() 反而会撞上
+        # 仍在 DWM 侧的透明弹层/投影，偶发 139（2026-11-13 静态自测跑 3 崩 1）。
+        sys.exit(code)
+    # QWebEngine 的收尾线程不保证干净退出，动态模式仍直接结束进程。
+    os._exit(code)

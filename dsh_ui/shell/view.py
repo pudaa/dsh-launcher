@@ -11,8 +11,8 @@ import re
 import sys
 import time
 
-from PySide6.QtCore import (QCoreApplication, QEvent, QPoint, QRect, QStandardPaths,
-                            Qt, QThread, QTimer, QUrl)
+from PySide6.QtCore import (QCoreApplication, QEvent, QPoint, QRect,
+                            QStandardPaths, Qt, QThread, QTimer, QUrl, qVersion)
 from PySide6.QtGui import (QAction, QColor, QDesktopServices, QIcon, QImage,
                            QKeySequence, QPixmap, QShortcut)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
@@ -55,14 +55,31 @@ class ViewMixin:
     def _ensure_webview(self):
         if self.view is not None:
             return
-        self.profile = QWebEngineProfile("dsh-profile", self)
         # `DSH_PROFILE_DIR` 只给自测/排查用：让一次冒烟测试不去碰用户正在用的
         # profile 目录。踩过的坑（2026-10-20）：前一个探针进程还留着一个
         # QtWebEngineProcess 握着 profile 的缓存锁，冒烟测试这边就一路报
         # "Unable to move the cache: 拒绝访问 (0x5)"，然后启动链路超时——
         # 看起来像产品缺陷，其实是两个进程抢同一个缓存目录。
-        self.profile.setPersistentStoragePath(
-            os.environ.get("DSH_PROFILE_DIR") or config.profile_dir())
+        profile_root = (os.environ.get("DSH_PROFILE_DIR")
+                        or config.profile_dir())
+        # 缓存路径必须显式指定并按 Qt 版本隔离：默认路径只按应用名推导，
+        # 6.10 与 6.11 共用同一个 Cache，后启动的迁移失败就是一屏
+        # `Unable to move the cache`。自测设了 DSH_PROFILE_DIR 时跟着临时
+        # 目录走，别去碰用户真实缓存。
+        if os.environ.get("DSH_PROFILE_DIR"):
+            cache_dir = os.path.join(profile_root, "cache")
+        else:
+            cache_dir = config.webview_cache_dir(qVersion())
+        os.makedirs(cache_dir, exist_ok=True)
+
+        # 默认 profile（`QWebEngineView(self)` 构造时那个临时 page 用的）
+        # **没法用 setCachePath 改路径**：实测 `defaultProfile().cachePath()`
+        # 设置前后都是空串，它始终走 applicationName 推导出来的默认目录。
+        # 所以隔离放在 `dsh_gui_qt.main()`：源码运行时 app 名带 Qt 版本后缀。
+        # 这里只管自定义 profile 的路径。
+        self.profile = QWebEngineProfile("dsh-profile", self)
+        self.profile.setPersistentStoragePath(profile_root)
+        self.profile.setCachePath(cache_dir)
         # 下载必须自己接（2026-10-21 老大报"点下载 session 没反应"）：
         # QtWebEngine 对没人处理的 downloadRequested **静默取消**，而前端
         # `a.download` 的 click 早就同步返回了 —— 不报错、不落盘、什么都不发生。

@@ -21,13 +21,18 @@ DSH 的美术规范是 **Web 的 CSS 令牌**（`--dsw-alias-*` / `--dsh-font-*`
 """
 from __future__ import annotations
 
+import os
 import re
 
-from PySide6.QtCore import QEasingCurve, Qt
-from PySide6.QtGui import QColor, QFont, QPalette, QTextCharFormat, QTextCursor
-from PySide6.QtWidgets import (QDialog, QFrame, QGraphicsDropShadowEffect,
+from PySide6.QtCore import (QEasingCurve, QEvent, QObject, QPoint, QRectF, Qt,
+                            QTimer)
+from PySide6.QtGui import (QColor, QCursor, QFont, QGuiApplication, QHelpEvent,
+                           QPainter, QPainterPath, QPalette, QPen, QPixmap,
+                           QTextCharFormat, QTextCursor)
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox,
+                               QDialog, QFrame, QGraphicsDropShadowEffect,
                                QHBoxLayout, QLabel, QMenu, QPushButton,
-                               QTextBrowser, QVBoxLayout, QWidget)
+                               QTextBrowser, QToolTip, QVBoxLayout, QWidget)
 
 from dsh_ui import icons
 from dsh_host import config
@@ -67,6 +72,398 @@ def palette_now() -> dict:
 
 
 # ------------------------------------------------------------------ 样式表
+
+def combo_qss(pal: dict) -> str:
+    """下拉框与它的弹出列表。
+
+    为什么单独成段（2026-11-13 真机反馈）
+    ------------------------------------
+    「添加远程主机」里点开"断开后远端服务"，弹出来的是**一整块黑**。
+    QComboBox 的 popup 是独立的顶层窗口（`QComboBoxPrivateContainer`），
+    `QDialog { background: ... }` 管不到它，QWindows11Style 又按系统调色板
+    去画——应用是浅色令牌、弹层是系统色，于是文字和底一起沉进黑里。
+
+    所以三处都要给死：下拉框本体、列表视图、以及包着视图的那个顶层容器。
+    颜色全部来自同一份 palette，不另起色表。
+    """
+    return """
+QComboBox {
+    background: %(card)s; color: %(text)s; border: 1px solid %(line)s;
+    border-radius: %(r_sm)spx; padding: 7px 28px 7px 10px;
+    font-family: %(font)s; font-size: 13px; min-height: 16px;
+}
+QComboBox:hover      { border-color: %(muted)s; }
+QComboBox:focus      { border-color: %(accent)s; outline: none; }
+QComboBox:disabled   { color: %(muted)s; }
+QComboBox::drop-down {
+    subcontrol-origin: padding; subcontrol-position: top right;
+    width: 26px; border: none; background: transparent;
+}
+/* 箭头由 style_combo() 挂的自绘子控件画，这里只给 drop-down 留出位置。
+   Qt 的 ::down-arrow 写 border 会变成实心小方块、留空则什么都不画；
+   image: url() 又依赖外部文件，打包成单文件后会静默失效。 */
+QComboBox QAbstractItemView {
+    background: %(card)s; color: %(text)s;
+    border: 1px solid %(line)s; border-radius: %(r_sm)spx;
+    padding: 4px; outline: none;
+    selection-background-color: %(nav_hover)s; selection-color: %(text)s;
+}
+QComboBox QAbstractItemView::item {
+    min-height: 26px; padding: 5px 8px;
+    border-radius: %(r_xs)spx; background: transparent; color: %(text)s;
+}
+QComboBox QAbstractItemView::item:selected {
+    background: %(nav_hover)s; color: %(text)s;
+}
+QComboBox QAbstractItemView::item:hover { background: %(hover)s; }
+""" % {
+        "card": pal["card"], "text": pal["text"], "dim": pal["dim"],
+        "muted": pal["muted"], "line": pal["line"], "accent": pal["accent"],
+        "hover": pal["hover"], "nav_hover": pal["nav_hover"],
+        "font": FONT, "r_sm": RADIUS["sm"], "r_xs": RADIUS["xs"],
+    }
+
+
+def popup_edge(pal: dict) -> str:
+    """弹层描边：把 `dim` 以 18% 压到 `card` 上，得到一条看得见的细灰线。
+
+    全局 `line` 是 10% 黑（白底上 ≈ #e8e8e8），叠在白对话框上几乎分不出
+    边界（老大 2026-11-13 指出下拉列表"缺少边框"）。这里只在弹层上加深
+    一档，仍是同一套令牌派生，没有另起色表。
+    """
+    return _solid("#2e%s" % pal["dim"].lstrip("#"), pal["card"])
+
+
+def combo_view_qss(pal: dict) -> str:
+    """直接设在 `combo.view()` 上的样式：卡片底、细边框、圆角。
+
+    popup 是顶层窗口，`QComboBox QAbstractItemView` 这类后代选择器未必能
+    穿过它；把规则贴在视图本身，任何 Qt 风格下都有确定的底色与描边。
+    """
+    return """
+QListView, QAbstractItemView {
+    background: %(card)s; color: %(text)s;
+    border: 1px solid %(edge)s; border-radius: %(r_sm)spx;
+    padding: 4px; outline: none;
+    selection-background-color: %(nav_hover)s; selection-color: %(text)s;
+}
+QListView::item, QAbstractItemView::item {
+    min-height: 26px; padding: 5px 8px;
+    border-radius: %(r_xs)spx; background: transparent; color: %(text)s;
+}
+QListView::item:selected, QAbstractItemView::item:selected {
+    background: %(nav_hover)s; color: %(text)s;
+}
+QListView::item:hover, QAbstractItemView::item:hover { background: %(hover)s; }
+/* 项多到需要滚动时也走令牌：系统滚动条的箭头/翻页区在浅色下会画成
+   黑色方块（2026-11-13 老大实机截图里那一坨）。 */
+QScrollBar:vertical { background: transparent; width: 6px; margin: 2px; }
+QScrollBar::handle:vertical {
+    background: %(scroll)s; border-radius: 3px; min-height: 24px;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background: transparent;
+}
+""" % {
+        "card": pal["card"], "text": pal["text"], "hover": pal["hover"],
+        "nav_hover": pal["nav_hover"], "edge": popup_edge(pal),
+        "scroll": pal["scroll"], "r_sm": RADIUS["sm"],
+        "r_xs": RADIUS["xs"],
+    }
+
+
+class _ComboPopupGuard(QObject):
+    """下拉弹层的边框与阴影守卫。
+
+    初始化顺序有讲究：`apply()` 里的 `setWindowFlags()` 会重建本机窗口并
+    触发 Resize/Polish 等事件，**可能在 `__init__` 返回前就回调到
+    `eventFilter`**。真机 1 倍缩放时就是这样：字段还没设完，回调先到，
+    `AttributeError` 被 Qt 吞掉（没有控制台），守卫初始化中断 —— 留白、
+    投影、加高全都没装上，表现为系统滚动条 + 最后一项被截。所以这里
+    先装过滤器、字段全部有类级默认值，再走 apply()。
+
+    为什么需要（2026-11-13 老大审验反馈）
+    ------------------------------------
+    Qt 给 `QComboBoxPrivateContainer` 留的是 **DWM 系统窗口阴影**：右下
+    一条实色硬边，和官方"温和底部投影"完全两种气质。它跟托盘菜单那次的
+    `QGraphicsDropShadowEffect` 不是同一路径（探针实测此处 effect=None、
+    `NoDropShadowWindowHint` 未设），但处理原则一样 —— 关掉系统阴影，
+    自己按令牌画。
+
+    容器改成透明 + 四周留白，view 自己画细边框/圆角/card 底；投影用低
+    alpha 的 `QGraphicsDropShadowEffect` 装在容器上，留白就是它的绘制空间，
+    不会再被窗口边缘硬裁。
+
+    还有一个坑：Qt 按 view 的原始高度算 popup 尺寸，layout 一旦有上下
+    margin，最后一项就会被吃掉（试验图里第三项只剩半行）。Show 时把容器
+    加高 margin 的那一段，view 才能保持原高度。
+    """
+
+    MARGINS = (10, 6, 10, 12)       # 左 上 右 下；底部多留给投影
+    #: 官方下拉是 CSS `0 4px 12px rgba(0,0,0,.08)` 那一档：很淡、范围小。
+    #: 早先 blur 14 / alpha 34 在 1x 下能看出十几像素的灰雾，偏重。
+    BLUR = 10
+    OFFSET_Y = 2
+
+    #: 类级默认值：eventFilter 可能早于 __init__ 完成被调用（见类说明）。
+    _popup = None
+    _base_h = None
+    _pal = None
+    _effect = None
+
+    def __init__(self, popup: QWidget, pal: dict):
+        super().__init__(popup)      # parent 是容器，随它一起回收
+        self._popup = popup
+        self._base_h = None
+        self._pal = pal
+        self._effect = None
+        # 先装过滤器：apply() 里的 setWindowFlags 会触发窗口重建事件。
+        popup.installEventFilter(self)
+        self.apply(pal)
+
+    def _effect_now(self) -> QGraphicsDropShadowEffect:
+        """拿一个可用的投影对象；失效就重建。
+
+        为什么不能缓存死（2026-11-13，PySide6 6.10.1 实测）：`setWindowFlags`
+        重建本机窗口时，Qt 会把挂在窗口上的 effect 一起删掉，Python 侧
+        引用还在。下一次 `apply()` 访问它就抛
+        `RuntimeError: Internal C++ object already deleted`，异常被 Qt 吞掉，
+        加高/描边整条链路静默失效 —— 表现就是系统滚动条 + 最后一项截断。
+        6.11 不复现，所以之前三个解释器里只有 6.10.1 出问题。
+        """
+        eff = self._effect
+        if eff is not None:
+            try:
+                eff.blurRadius()     # 探活：已删对象在这里抛 RuntimeError
+                return eff
+            except RuntimeError:
+                pass
+        eff = QGraphicsDropShadowEffect(self._popup)
+        self._effect = eff
+        return eff
+
+    def _apply_palette(self) -> None:
+        """把容器调色板按令牌上死，兜住"某种风格下 QSS 没穿透"的情形。
+
+        `QComboBox::showPopup()` 内部会把容器 palette 重设成系统灰
+        （实测 #efefef），所以 Show 事件里要再写一次；只设一次是无效的。
+        """
+        app = QApplication.instance()
+        p = QPalette(app.palette() if app is not None else QPalette())
+        card, text = QColor(self._pal["card"]), QColor(self._pal["text"])
+        for role in (QPalette.ColorRole.Window, QPalette.ColorRole.Base,
+                     QPalette.ColorRole.AlternateBase):
+            p.setColor(role, card)
+        for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text,
+                     QPalette.ColorRole.HighlightedText):
+            p.setColor(role, text)
+        p.setColor(QPalette.ColorRole.Highlight,
+                   QColor(self._pal["nav_active"]))
+        self._popup.setPalette(p)
+
+    def apply(self, pal: dict) -> None:
+        pop = self._popup
+        self._pal = pal
+        # 必须整组 OR 后写入：setWindowFlag(..., True) 对这类私有容器无效，
+        # 托盘菜单的 apply_menu 里踩过同一个坑。
+        want = (Qt.WindowType.FramelessWindowHint
+                | Qt.WindowType.NoDropShadowWindowHint)
+        flags = pop.windowFlags()
+        if (flags & want) != want:
+            # setWindowFlags 会重建本机窗口，之前设过的 palette 会被冲掉。
+            pop.setWindowFlags(flags | want)
+        self._apply_palette()
+        pop.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        pop.setAutoFillBackground(False)
+        pop.setStyleSheet("QWidget { background: transparent; border: none; }")
+        lay = pop.layout()
+        if lay is not None:
+            lay.setContentsMargins(*self.MARGINS)
+        dark = QColor(pal["card"]).lightness() < 128
+        eff = self._effect_now()
+        eff.setBlurRadius(self.BLUR)
+        eff.setOffset(0, self.OFFSET_Y)
+        ink = QColor(0, 0, 0)
+        ink.setAlpha(70 if dark else 26)
+        eff.setColor(ink)
+        if pop.graphicsEffect() is not eff:
+            pop.setGraphicsEffect(eff)
+
+    def _pad(self) -> None:
+        pop = self._popup
+        # 只在真正可见、且已按 view 摆好时记录基准高度：apply() 期间也会
+        # 收到事件，那时容器还停在 100x30，拿它当基准会让每次加高都少一截。
+        if pop is None or not pop.isVisible() or pop.height() < 60:
+            return
+        lay = pop.layout()
+        extra = (lay.contentsMargins().top() + lay.contentsMargins().bottom()
+                 if lay is not None else self.MARGINS[1] + self.MARGINS[3])
+        if self._base_h is None:
+            self._base_h = pop.height()
+        target = self._base_h + extra
+        if pop.height() != target:
+            pop.resize(pop.width(), target)
+
+    def eventFilter(self, obj, ev) -> bool:                    # noqa: N802
+        if self._popup is None or obj is not self._popup:
+            return False
+        try:
+            kind = int(ev.type())
+            if kind in (int(QEvent.Type.Show), int(QEvent.Type.Polish)):
+                # QWindows11Style 可能在 polish() 时装回自己的投影，覆盖回来。
+                eff = self._effect_now()
+                if self._popup.graphicsEffect() is not eff:
+                    self._popup.setGraphicsEffect(eff)
+                if kind == int(QEvent.Type.Show):
+                    self._apply_palette()   # showPopup 把 palette 改成系统灰
+                    self._pad()
+                    # Qt 在 show 之后还可能按 view 的 sizeHint 再摆一次，
+                    # 所以下一拍补一次加高（真机 1x 下这一步是必需的）。
+                    QTimer.singleShot(0, self._pad_later)
+        except (RuntimeError, AttributeError, TypeError, ValueError):
+            return False
+        return False
+
+    def _pad_later(self) -> None:
+        try:
+            if self._popup is not None and self._popup.isVisible():
+                self._pad()
+        except RuntimeError:
+            pass
+
+
+def _combo_arrow_pixmap(pal: dict) -> QPixmap:
+    """下拉箭头：自绘一个 filled triangle，ink 用 dim 令牌。
+
+    不用 `::down-arrow` 的 border 三角（Qt 会画成实心小方块），也不用
+    `image: url(...)`（打包成单文件后外部资源会静默失效）。这是一张运行时
+    生成的位图，没有路径、没有文件、跟着传入的 palette 走。
+    """
+    pm = QPixmap(14, 14)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    path = QPainterPath()
+    path.moveTo(3.0, 5.5)
+    path.lineTo(11.0, 5.5)
+    path.lineTo(7.0, 9.5)
+    path.closeSubpath()
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(pal["dim"]))
+    p.drawPath(path)
+    p.end()
+    return pm
+
+
+class _ComboArrow(QObject):
+    """贴在下拉框右侧的箭头，随 combo 尺寸与主题更新。
+
+    为什么用子控件：QSS 接管 QComboBox 之后，`::down-arrow` 无论写 border
+    还是留空都画不出正常的三角（实测分别是灰方块和空白）。子 QLabel 完全
+    受我们控制，且 `WA_TransparentForMouseEvents` 保证点击仍然落在 combo 上。
+    """
+
+    def __init__(self, combo: QComboBox, pal: dict):
+        super().__init__(combo)          # parent 是 combo，随它一起回收
+        self._combo = combo
+        self._pal = pal
+        self.label = QLabel(combo)
+        self.label.setObjectName("comboArrow")
+        self.label.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.label.setStyleSheet("background: transparent; border: none;")
+        self.label.setFixedSize(14, 14)
+        self.set_palette(pal)
+        combo.installEventFilter(self)
+        self._place()
+
+    def set_palette(self, pal: dict) -> None:
+        self._pal = pal
+        self.label.setPixmap(_combo_arrow_pixmap(pal))
+
+    def _place(self) -> None:
+        self.label.move(self._combo.width() - 24,
+                        max(0, (self._combo.height() - 14) // 2))
+        self.label.raise_()
+
+    def _ensure_popup(self) -> None:
+        """打开下拉后，确保当前容器真的挂上了守卫并完成加高。
+
+        为什么不能只靠 Show 事件（2026-11-13 实测）：PySide6 **6.10.1**
+        下弹层容器的 Show/Polish 不会到达我们装在它身上的过滤器，`_pad`
+        一次都不执行 —— 表现就是系统滚动条 + 最后一项截断。6.11 正常。
+        改成点击/按键之后主动补一次，跨版本都成立。
+        """
+        combo = self._combo
+        view = combo.view()
+        popup = view.parentWidget() if view is not None else None
+        if popup is None or not popup.isVisible():
+            return
+        guard = getattr(combo, "_dsh_popup_guard", None)
+        if guard is None or getattr(guard, "_popup", None) is not popup:
+            guard = _ComboPopupGuard(popup, self._pal)
+            combo._dsh_popup_guard = guard
+        else:
+            guard.apply(self._pal)
+        guard._pad()
+        # Qt 6.10 在 showPopup 收尾时还会按 sizeHint 再摆一次，隔一拍补。
+        QTimer.singleShot(30, guard._pad_later)
+
+    def eventFilter(self, obj, ev) -> bool:                    # noqa: N802
+        if obj is not self._combo:
+            return False
+        kind = int(ev.type())
+        if kind == int(QEvent.Type.Resize):
+            self._place()
+        elif kind in (int(QEvent.Type.MouseButtonPress),
+                      int(QEvent.Type.KeyPress)):
+            QTimer.singleShot(0, self._ensure_popup)
+        return False
+
+
+def style_combo(combo: QComboBox, pal: dict) -> None:
+    """给一个下拉框套令牌，并接管它那个顶层弹层容器的外观。
+
+    `view().parentWidget()` 是 `QComboBoxPrivateContainer`。配色按 palette
+    上死（防 Win11 系统调色板把弹层画成全黑），边框/圆角/投影交给
+    `_ComboPopupGuard`：容器透明，卡片由 view 自绘，所以不会出现"半透明
+    又没自绘"那种黑块。
+    """
+    # combo 自己的文字/底色也要跟主题（下拉箭头另由自绘子控件负责）。
+    cp = combo.palette()
+    card, text = QColor(pal["card"]), QColor(pal["text"])
+    cp.setColor(QPalette.ColorRole.Window, card)
+    cp.setColor(QPalette.ColorRole.Base, card)
+    for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text,
+                 QPalette.ColorRole.ButtonText):
+        cp.setColor(role, text)
+    combo.setPalette(cp)
+
+    arrow = getattr(combo, "_dsh_arrow", None)
+    if arrow is None:
+        combo._dsh_arrow = _ComboArrow(combo, pal)
+    else:
+        arrow.set_palette(pal)
+        arrow._place()
+
+    view = combo.view()
+    if view is not None:
+        view.setStyleSheet(combo_view_qss(pal))
+        popup = view.parentWidget()
+        if popup is not None:
+            # 调色板、窗口标志、透明底、投影统一由守卫设置（顺序有讲究，
+            # setWindowFlags 会重建窗口并把 palette 冲掉）。
+            guard = getattr(combo, "_dsh_popup_guard", None)
+            if guard is None:
+                guard = _ComboPopupGuard(popup, pal)
+                combo._dsh_popup_guard = guard
+            else:
+                guard.apply(pal)
+            # 两边都留引用：popup 上的是自检/兼容用，combo 上的是"换容器后
+            # 还能找回来"的那一份（Qt 6.10 的 Show 事件送不到守卫）。
+            popup._dsh_popup_guard = guard
+
 
 def dialog_qss(pal: dict) -> str:
     """对话框 / 提示窗的样式。
@@ -125,7 +522,7 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: trans
         "nav_active": pal["nav_active"], "scroll": pal["scroll"],
         "font": FONT, "mono": '"Cascadia Mono", "Consolas", monospace',
         "r_sm": RADIUS["sm"],
-    }
+    } + combo_qss(pal)
 
 
 # ------------------------------------------------------------------ 更新说明
@@ -483,8 +880,405 @@ class Menu(QMenu):
 
 
 def style_dialog(widget: QWidget, pal: dict | None = None) -> None:
-    """给对话框套上统一样式。子控件靠 objectName 取到标题/正文/提示三种字级。"""
-    widget.setStyleSheet(dialog_qss(pal or palette_now()))
+    """给对话框套上统一样式。子控件靠 objectName 取到标题/正文/提示三种字级。
+
+    下拉框要额外走一遍 `style_combo()`：它的弹层是顶层窗口，样式表不一定
+    能穿透过去，必须把视图和容器都按当前 palette 上色。
+    """
+    p = pal or palette_now()
+    widget.setStyleSheet(dialog_qss(p))
+    for combo in widget.findChildren(QComboBox):
+        style_combo(combo, p)
+
+
+# ------------------------------------------------------------------ 工具提示
+#
+# 原生 QToolTip 是一块**独立顶层窗口**，不吃任何 QWidget 的样式表：Windows
+# 上永远是浅灰底 + 1px 黑框 + 系统字体，和官方令牌完全没关系（老大截图里
+# 「自动安装」旁边那块）。应用级 QSS 只能改它的底色和边框，圆角、行距、
+# 富文本宽度都改不动。所以这里接管 QEvent.ToolTip，用一张自绘卡片显示，
+# 颜色、圆角、字号全部取自同一份 palette，切主题时下一次显示就跟着变。
+#
+# 同一个坑在两个地方出现过：下拉列表弹层也是顶层窗口，被系统调色板接管
+# 就变全黑（见 combo_qss）。处理原则一致 —— 不让弹层自己决定颜色。
+
+_TIP_TAG = re.compile(r"</?[a-zA-Z][^>]*>")
+_TIP_BR = re.compile(r"<br\s*/?>", re.I)
+
+# 生命周期照抄 Qt 6.11 的 QTipLabel（qtbase/src/widgets/kernel/qtooltip.cpp）：
+#   · MouseMove 移出锚点矩形 / Leave → hideTip()，即**单次 300 ms** 延迟隐藏
+#   · 点击 / 滚轮 / 按键 → hideTipImmediately()
+#   · 过期用**单次** 10000 + 40×(字数−100) ms
+# 没有周期轮询。Tool 窗口首次 show 时宿主会收到一轮 Leave/FocusOut 误报，
+# 靠「延迟到期时复核 QCursor.pos()」挡住，而不是靠忽略事件。
+_TIP_LEAVE = int(QEvent.Type.Leave)
+_TIP_MOUSE_MOVE = int(QEvent.Type.MouseMove)
+_TIP_SOFT = frozenset(int(t) for t in (
+    QEvent.Type.WindowDeactivate, QEvent.Type.FocusOut))
+_TIP_DIRECT = frozenset(int(t) for t in (
+    QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease,
+    QEvent.Type.MouseButtonDblClick, QEvent.Type.Wheel,
+    QEvent.Type.KeyPress))
+_TIP_IMMEDIATE = frozenset(int(t) for t in (
+    QEvent.Type.Hide, QEvent.Type.Close))
+_TOOLTIP_EVENTS = (_TIP_SOFT | _TIP_DIRECT | _TIP_IMMEDIATE
+                   | {_TIP_LEAVE, _TIP_MOUSE_MOVE})
+
+
+def _tip_html(text: str, pal: dict) -> str:
+    """把提示文字包成带令牌颜色的富文本。
+
+    纯文本要转义（说明里会出现 `<select>` 这种写法，不转义会被吞掉）；
+    已经是富文本的（卡片说明自带 `width:300px` 的 div）原样保留，只在外层
+    补颜色与字号——内联样式优先，宽度约束不会被冲掉。
+    """
+    s = (text or "").strip()
+    if _TIP_TAG.search(s):
+        inner = s
+    else:
+        inner = (s.replace("&", "&amp;").replace("<", "&lt;")
+                  .replace(">", "&gt;").replace("\n", "<br>"))
+    # 换行是"另起一段"，不是"再空一行"：QTextDocument 里 `<br>` 会连同
+    # line-height 撑出一整行空白，改成两个块 + 6px 段距，紧凑又分得开。
+    inner = _TIP_BR.sub('</div><div style="margin-top:6px;">', inner)
+    # FONT 里的字体名带 ASCII 双引号，直接塞进 HTML 的 style="..." 会把属性
+    # 提前闭合，后面的 font-size / line-height 全被当成属性吃掉。用 &quot;
+    # 让浏览器（QTextDocument）解出正确的 CSS 字符串。
+    family = FONT.replace('"', "&quot;")
+    return ('<div style="color:%s; font-family:%s; font-size:12px; '
+            'line-height:140%%;">%s</div>' % (pal["dim"], family, inner))
+
+
+class ToolTipCard(QWidget):
+    """自绘的工具提示卡片：card 底 + line 描边 + 8px 圆角。
+
+    与 ControlPanel 一样用 `WA_TranslucentBackground` + paintEvent 画圆角，
+    而不是给顶层窗口套 QSS 的 border-radius —— 后者圆角外仍由系统画成直角。
+    """
+
+    PAD_X, PAD_Y = 12, 9
+    MAX_TEXT_W = 320
+    RADIUS = 8
+
+    def __init__(self):
+        super().__init__(None, Qt.WindowType.Tool
+                         | Qt.WindowType.FramelessWindowHint
+                         | Qt.WindowType.NoDropShadowWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._pal = palette_now()
+        self.label = QLabel(self)
+        self.label.setWordWrap(True)
+        self.label.setTextFormat(Qt.TextFormat.RichText)
+        self.label.setMaximumWidth(self.MAX_TEXT_W)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(self.PAD_X, self.PAD_Y, self.PAD_X, self.PAD_Y)
+        lay.addWidget(self.label)
+
+    def set_content(self, text: str, pal: dict) -> None:
+        self._pal = pal
+        # 长说明给一块稳定的宽度：自适应会把「目录」「Harness」这类词从中间
+        # 拆到两行；短提示（"最小化"）仍按内容收窄，不撑成一条横幅。
+        plain = _TIP_TAG.sub("", text or "")
+        self.label.setMinimumWidth(260 if len(plain) > 30 else 0)
+        self.label.setStyleSheet(
+            "QLabel { background: transparent; color: %s; font-family: %s;"
+            " font-size: 12px; }" % (pal["dim"], FONT))
+        self.label.setText(_tip_html(text, pal))
+        self.label.adjustSize()
+        self.adjustSize()
+        self.update()
+
+    def show_at(self, pos: QPoint) -> None:
+        self.adjustSize()
+        screen = (QGuiApplication.screenAt(pos)
+                  or QGuiApplication.primaryScreen())
+        if screen is None:
+            self.move(pos + QPoint(14, 18))
+            self.show()
+            return
+        area = screen.availableGeometry()
+        x, y = pos.x() + 14, pos.y() + 18
+        if x + self.width() > area.right():
+            x = pos.x() - self.width() - 12
+        if y + self.height() > area.bottom():
+            y = pos.y() - self.height() - 12
+        x = max(area.left() + 4,
+                min(x, area.right() - self.width() - 4))
+        y = max(area.top() + 4,
+                min(y, area.bottom() - self.height() - 4))
+        self.move(x, y)
+        self.show()
+        self.raise_()
+
+    def paintEvent(self, _e) -> None:                           # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0.5, 0.5, self.width() - 1.0,
+                                   self.height() - 1.0),
+                            self.RADIUS, self.RADIUS)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(self._pal["card"]))
+        p.drawPath(path)
+        p.setPen(QPen(QColor(self._pal["line"]), 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+        p.end()
+
+
+class _ToolTipManager(QObject):
+    """全局 `QEvent.ToolTip` 过滤器。挂在 QApplication 上，覆盖所有窗口。
+
+    生命周期与 Qt 的 `QTipLabel` 同构：两个**单次**定时器（延迟隐藏、过期），
+    加事件驱动的隐藏判定。整个类里没有 interval 型定时器。
+    """
+
+    HIDE_DELAY_MS = 300          # Qt: QTipLabel::hideTip()
+    BASE_EXPIRE_MS = 10000       # Qt: restartExpireTimer()
+    PER_CHAR_MS = 40
+    BASE_CHARS = 100
+
+    def __init__(self, app: QApplication, palette_provider):
+        super().__init__(app)
+        self._provider = palette_provider
+        self.card = ToolTipCard()
+        self._anchor = None
+        self._life = QTimer(self)
+        self._life.setSingleShot(True)
+        self._life.timeout.connect(self.hide)
+        self._hide = QTimer(self)
+        self._hide.setSingleShot(True)
+        self._hide.timeout.connect(self._on_hide_timeout)
+
+    def hide(self) -> None:
+        self._life.stop()
+        self._hide.stop()
+        self.card.hide()
+        QToolTip.hideText()
+
+    def _still_hovering(self) -> bool:
+        """鼠标是否还停在触发提示的那个控件上（只在事件里调用）。"""
+        try:
+            anchor = self._anchor
+            if anchor is None or not anchor.isVisible():
+                return False
+            return anchor.rect().contains(
+                anchor.mapFromGlobal(QCursor.pos()))
+        except (RuntimeError, AttributeError, TypeError):
+            return False
+
+    def _schedule_hide(self) -> None:
+        """Qt 的 hideTip()：延迟一拍再收，给相邻控件之间的移动留余地。"""
+        if not self._hide.isActive():
+            self._hide.start(self.HIDE_DELAY_MS)
+
+    def _on_hide_timeout(self) -> None:
+        # 延迟到期再复核一次位置。Tool 窗口首次 show 时宿主发来的那轮
+        # Leave 是合成的，鼠标其实还在 ⓘ 上 —— 这种情况不能真的收起。
+        if self.card.isVisible() and not self._still_hovering():
+            self.hide()
+
+    def _expire_ms(self, text: str) -> int:
+        plain = _TIP_TAG.sub("", text or "")
+        return (self.BASE_EXPIRE_MS
+                + self.PER_CHAR_MS * max(0, len(plain) - self.BASE_CHARS))
+
+    def _from_anchor(self, obj) -> bool:
+        """事件是否来自"触发这次提示的那个控件"或它所在的窗口。
+
+        早先是对**任何**控件的 Leave/Hide/FocusOut 都收起浮窗：Tool 窗口
+        一显示，宿主窗口就会收到一轮 WindowDeactivate/FocusOut，浮窗刚 show
+        就被自己收掉（离屏探针里 visible=False 抓到了）。这类事件只认锚点。
+        """
+        try:
+            anchor = self._anchor
+            if anchor is None or obj is anchor:
+                return obj is anchor
+            win = anchor.window()
+            return win is not None and obj is win
+        except RuntimeError:
+            return False
+
+    def eventFilter(self, obj, ev) -> bool:                    # noqa: N802
+        try:
+            kind = int(ev.type())
+            if kind == int(QEvent.Type.ToolTip):
+                return self._on_tip(obj, ev)
+            if (not self.card.isVisible() or obj is self.card
+                    or self.card.isAncestorOf(obj)):
+                return False
+            if kind == _TIP_MOUSE_MOVE:
+                # 回到锚点就撤销待隐藏，移出去就排一次延迟隐藏。
+                if self._still_hovering():
+                    self._hide.stop()
+                else:
+                    self._schedule_hide()
+            elif kind == _TIP_LEAVE:
+                if self._from_anchor(obj):
+                    self._schedule_hide()
+            elif kind in _TIP_DIRECT:
+                self.hide()
+            elif kind in _TIP_IMMEDIATE:
+                if self._from_anchor(obj):
+                    self.hide()
+            elif kind in _TIP_SOFT and not self._still_hovering():
+                # WindowDeactivate / FocusOut：鼠标还在锚点上多半是首次
+                # show 的合成事件，交给 300 ms 延迟隐藏去复核。
+                self._schedule_hide()
+        except (RuntimeError, AttributeError, TypeError, ValueError):
+            return False
+        return False
+
+    def _on_tip(self, obj, ev) -> bool:
+        if not isinstance(obj, QWidget) or obj is self.card \
+                or self.card.isAncestorOf(obj):
+            return False
+        if not obj.isVisible() or not obj.isEnabled():
+            return False
+        text = obj.toolTip() or ""
+        pos = ev.globalPos() if isinstance(ev, QHelpEvent) else QCursor.pos()
+        if not text:
+            # 表格/列表项的提示存在 model 的 ToolTipRole 里，不在 widget 上；
+            # 而且 Qt 通常把 QEvent.ToolTip 发给 **viewport**，不是 view 本身。
+            # 两种接收者都要认，否则开发者窗口里的条目提示会漏回系统灰框。
+            view = obj if isinstance(obj, QAbstractItemView) else obj.parentWidget()
+            if isinstance(view, QAbstractItemView):
+                index = view.indexAt(view.viewport().mapFromGlobal(pos))
+                if index.isValid():
+                    text = str(index.data(Qt.ItemDataRole.ToolTipRole) or "")
+        if not text.strip():
+            return False
+        self._anchor = obj
+        self._hide.stop()          # Qt: restartExpireTimer() 里 hideTimer.stop()
+        QToolTip.hideText()
+        self.card.set_content(text, self._provider() or palette_now())
+        self.card.show_at(QPoint(pos))
+        self._life.start(self._expire_ms(text))
+        return True
+
+
+_TOOLTIPS: _ToolTipManager | None = None
+_PROVIDER = palette_now
+
+#: 兜底开关。默认走自绘卡片；设为 1 时把提示交回 Qt 原生 QToolTip，
+#: 由 Qt 自己管生命周期与位置。只在排障/验证时用，**不做自动降级**：
+#: 自绘浮窗万一在某个平台上出问题，用户设一个环境变量就能继续用，
+#: 不必等发版。与渲染后端开关（DSH_WEBENGINE_HW_ACCEL）同一套路。
+NATIVE_TOOLTIP_ENV = "DSH_TOOLTIP_NATIVE"
+_NATIVE_QSS_BEGIN = "/* dsh-native-tooltip */"
+_NATIVE_QSS_END = "/* /dsh-native-tooltip */"
+
+
+def native_tooltip_enabled() -> bool:
+    return os.environ.get(NATIVE_TOOLTIP_ENV, "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def native_tooltip_qss(pal: dict) -> str:
+    """兜底模式的 QToolTip 样式。Qt 会把 QTipLabel 的 objectName 设成
+    `qtooltip_label`（见 QToolTip::showText），两个选择器都写，防止某种
+    风格下 `QToolTip` 伪类型选择器不生效。
+    """
+    return """%s
+QToolTip, QLabel#qtooltip_label {
+    background: %s; color: %s; border: 1px solid %s;
+    border-radius: 8px; padding: 6px 9px;
+    font-family: %s; font-size: 12px;
+}
+%s""" % (_NATIVE_QSS_BEGIN, pal["card"], pal["dim"], pal["line"],
+         FONT, _NATIVE_QSS_END)
+
+
+def _apply_native(app: QApplication, pal: dict) -> None:
+    """把配色交给原生 QToolTip：调色板 + 字体 + 应用级 QSS。
+
+    Qt 的 QTipLabel 用 ToolTipBase / ToolTipText 两个角色上色，字体走
+    `QApplication::font("QTipLabel")`（即 QToolTip.setFont）。样式表必须设在
+    QApplication 上 —— tooltip 是独立顶层窗口，窗口自己的 QSS 管不到它
+    （这正是自绘方案存在的原因，见文件开头的说明）。
+    """
+    p = QPalette(app.palette())
+    p.setColor(QPalette.ColorRole.ToolTipBase, QColor(pal["card"]))
+    p.setColor(QPalette.ColorRole.ToolTipText, QColor(pal["dim"]))
+    QToolTip.setPalette(p)
+    font = QFont()
+    font.setFamilies(["Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI"])
+    font.setPixelSize(12)
+    QToolTip.setFont(font)
+    sheet = app.styleSheet() or ""
+    start = sheet.find(_NATIVE_QSS_BEGIN)
+    if start >= 0:
+        end = sheet.find(_NATIVE_QSS_END, start)
+        if end >= 0:
+            sheet = sheet[:start] + sheet[end + len(_NATIVE_QSS_END):]
+    app.setStyleSheet((sheet + "\n" + native_tooltip_qss(pal)).strip())
+
+
+def install_tooltips(app: QApplication | None = None,
+                     palette_provider=None) -> _ToolTipManager | None:
+    """接管全应用的工具提示。在 QApplication 建好后调一次即可，重复调用安全。
+
+    默认走自绘卡片；`DSH_TOOLTIP_NATIVE=1` 时改用 Qt 原生 QToolTip 兜底，
+    此时不安装任何事件过滤器，返回 None。
+    """
+    global _TOOLTIPS, _PROVIDER
+    application = app or QApplication.instance()
+    if application is None:
+        return None
+    if palette_provider is not None:
+        _PROVIDER = palette_provider
+    provider = _PROVIDER
+    if native_tooltip_enabled():
+        # 从自绘模式切过来时，旧的全局过滤器必须摘掉，否则它会继续吞事件。
+        if _TOOLTIPS is not None:
+            try:
+                application.removeEventFilter(_TOOLTIPS)
+            except RuntimeError:
+                pass
+            _TOOLTIPS = None
+        _apply_native(application, provider())
+        return None
+    if _TOOLTIPS is not None:
+        try:
+            if _TOOLTIPS.parent() is application:
+                if palette_provider is not None:
+                    _TOOLTIPS._provider = palette_provider
+                return _TOOLTIPS
+        except RuntimeError:
+            _TOOLTIPS = None
+    mgr = _ToolTipManager(application, provider)
+    application.installEventFilter(mgr)
+    _TOOLTIPS = mgr
+    return mgr
+
+
+def refresh_tooltips() -> None:
+    """主题变化时刷新兜底模式的调色板与 QSS。
+
+    自绘模式不用刷新：浮窗在每次显示的那一刻读 palette。原生模式的调色板
+    是全局静态量，得重新写一次才会跟上明暗切换。
+    """
+    app = QApplication.instance()
+    if app is not None and native_tooltip_enabled():
+        _apply_native(app, _PROVIDER())
+
+
+def hide_tooltip() -> None:
+    """主动收起浮窗（切主题、关窗口时用）。"""
+    if _TOOLTIPS is not None:
+        try:
+            _TOOLTIPS.hide()
+        except RuntimeError:
+            pass
+    else:
+        QToolTip.hideText()
+
+
+def active_tooltip() -> ToolTipCard | None:
+    """给自检用的当前浮窗；兜底模式或没安装时返回 None。"""
+    return _TOOLTIPS.card if _TOOLTIPS is not None else None
 
 
 def style_loading_page(page: QWidget, pal: dict | None = None) -> None:
