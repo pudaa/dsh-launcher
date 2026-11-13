@@ -270,5 +270,17 @@ class UpdatesMixin:
 
         host_log(f"{HOST_NAME}更新：已拉起新实例（接管端口 {port or '自动分配'}），"
                  "本进程退出")
+        # **退出前必须摘掉 Job 的"退出即回收"**（2026-11-13 加）。
+        # 服务被挂在一个 KILL_ON_JOB_CLOSE 的作业对象里，本进程 `os._exit`
+        # 会让 Job 关闭 → 服务跟着被杀 → 新实例只好重新拉起（慢七八秒，
+        # 而且这条路径存在的意义就是把服务留给它接手）。
+        # 摘掉之后服务独立存活，新实例按端口接管。
+        try:
+            from dsh_host import jobobj
+            if jobobj.detach_kill_on_close():
+                host_log("已解除作业对象的退出回收，服务交由新实例接管")
+        except Exception as e:                                 # noqa: BLE001
+            host_log("解除作业对象回收失败（新实例会重新拉起服务）："
+                     "%s: %s" % (type(e).__name__, e))
         self.tray.hide()
         os._exit(0)

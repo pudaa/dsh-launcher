@@ -29,7 +29,8 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
-from . import config, compat
+from . import compat, config
+from .logutil import host_log
 
 # Windows 进程创建标志
 DETACHED = 0x00000008 | 0x00000200     # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
@@ -74,6 +75,9 @@ class ServiceHandle:
     started_at: float
     proc: subprocess.Popen | None = None
     _read_pos: int = 0
+    #: 本次是**接管**一个已在运行的服务（不是我们刚起的）。
+    #: 用来在界面上如实说明"后台本来就有个服务在跑"，而不是假装刚启动。
+    attached: bool = False
     #: 远程主机名（空 = 本地服务）。远程会话复用同一套 handle 走加载流程，
     #: 但"停服务 / 版本复验 / 更新 / 回滚"这些事对它都不成立，靠这个字段分流。
     #: 不要把它写进 service.json——远程状态随连接生灭，不该跨进程持久化。
@@ -743,6 +747,26 @@ def launch(install: DshInstall, port: int, log_path: str, cwd: str | None = None
         )
     finally:
         fh.close()   # 子进程已持有该句柄的独立副本
+
+    # 把服务挂进一个「鲸坞退出就回收」的 Job（2026-11-13）。
+    #
+    # 服务是 DETACHED 起的（关窗口后要继续跑），所以鲸坞一死没人通知它退场。
+    # 正常退出有下面的 `stop()` 兜着，但**崩溃和强杀没有任何收尸机制**——
+    # 实测会留下一棵常驻 600 MB 的 node 进程树，用户完全看不见。
+    #
+    # Job 的 KILL_ON_JOB_CLOSE 正好对上需求：句柄随鲸坞进程消亡 → Job 关闭
+    # → 服务树被系统杀掉；而"关窗口不退出进程"这条路 Job 还活着，服务照常跑。
+    # 失败只记日志：没有收尸保障总比起不来强。
+    try:
+        from . import jobobj
+        if jobobj.attach(proc.pid):
+            host_log("服务已纳入退出即回收的作业对象（pid %d）" % proc.pid)
+        else:
+            ok, why = jobobj.ensure()
+            host_log("服务未纳入作业对象：%s（崩溃后可能残留进程）"
+                     % ("可用但挂载失败" if ok else why))
+    except Exception as e:                                     # noqa: BLE001
+        host_log("作业对象挂载异常：%s: %s" % (type(e).__name__, e))
 
     return ServiceHandle(
         install=install, pid=proc.pid, host=profile.get("service_host", "127.0.0.1"),

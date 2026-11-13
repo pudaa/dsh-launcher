@@ -48,6 +48,18 @@ class ServiceMixin:
         is_remote = bool(getattr(handle, "remote", ""))
         if is_remote:
             host_log("会话就绪：远程 %s · 隧道端口 %s" % (handle.remote, handle.port))
+        elif getattr(handle, "attached", False):
+            # 接管上次留下的服务——可能是"关窗口没退出"（设计如此），
+            # 也可能是崩溃/强杀后没人收尸。用户看不到进程表，所以要主动说一声，
+            # 否则他会以为"我刚打开，怎么就已经占着内存了"。
+            # 用托盘气泡而不是对话框：**"关窗口留服务"是设计好的常态**，
+            # 每次启动都弹窗会打断人。气泡三秒自散，只做告知。
+            host_log("接管已在运行的服务：端口 %s" % handle.port)
+            QTimer.singleShot(1500, lambda: self.tray.showMessage(
+                HOST_NAME,
+                "已接管一个正在运行的背景服务（端口 %s）。\n"
+                "关窗口不会停它；点「退出」会一并停止。" % handle.port,
+                QSystemTrayIcon.MessageIcon.Information, 3500))
         else:
             host_log("服务就绪：%s | 端口 %s | 来源 %s"
                      % (handle.install.describe(), handle.port, handle.install.source))
