@@ -505,7 +505,7 @@ def host_update_checks() -> list[str]:
     _src = inspect.getsource(_dt.ShellPage._on_new_window)
     ok = ('"about"' in _src and "openIn" in _src
           and hasattr(_dt.ShellPage, "createWindow")
-          and "def _reload_page" in inspect.getsource(g.MainWindow))
+          and "def _reload_page" in inspect.getsource(g.MainWindow._reload_page))
     print(f"  [{'OK  ' if ok else 'FAIL'}] window.open 交给 Qt，且新页面拦截外部授权页")
     if not ok:
         failures.append("登录弹窗/刷新入口")
@@ -872,9 +872,10 @@ def titlebar_checks() -> list[str]:
     if not ok:
         failures.append("跟踪间隔配置")
 
-    ok = (g.THEME_CHANGE_TOL > 0 and g._THEME_WATCH_MIN_MS >= 1000)
+    from dsh_ui.shell.titlebar import THEME_CHANGE_TOL, _THEME_WATCH_MIN_MS
+    ok = (THEME_CHANGE_TOL > 0 and _THEME_WATCH_MIN_MS >= 1000)
     print(f"  [{'OK  ' if ok else 'FAIL'}] 变更容差与最小间隔有下限"
-          f"（tol={g.THEME_CHANGE_TOL}, min={g._THEME_WATCH_MIN_MS}ms）")
+          f"（tol={THEME_CHANGE_TOL}, min={_THEME_WATCH_MIN_MS}ms）")
     if not ok:
         failures.append("跟踪下限")
 
@@ -892,7 +893,7 @@ def titlebar_checks() -> list[str]:
 
     # 6f. 变更比对：容差内不算变、超出才算变
     def _changed(a, b):
-        return not all(abs(a[i] - b[i]) <= g.THEME_CHANGE_TOL for i in range(3))
+        return not all(abs(a[i] - b[i]) <= THEME_CHANGE_TOL for i in range(3))
     ok = (not _changed((255, 255, 255), (253, 254, 255))
           and _changed((255, 255, 255), (21, 21, 23)))
     print(f"  [{'OK  ' if ok else 'FAIL'}] 主题变更判定（白→白不算变，白→深色算变）")
@@ -951,7 +952,8 @@ def titlebar_checks() -> list[str]:
         print("        缺失:", missing)
 
     # 7d. JS 探针只能用标准 DOM API，不得出现 DSH 私有选择器
-    js = getattr(g, "_JS_THEME_PROBE", "")
+    from dsh_ui.shell.titlebar import _JS_THEME_PROBE as js_probe
+    js = js_probe
     uses_std = ("elementFromPoint" in js and "getComputedStyle" in js
                 and "parentElement" in js)
     # 私有选择器特征：querySelector 带类名/id、以及 DSH 相关字样
@@ -1061,7 +1063,7 @@ def titlebar_checks() -> list[str]:
     #     2026-10-20 体检：`_on_ready` 会被 StartupWorker 与 `_swap_service.done`
     #     反复调用（换来源、迁移数据后重启服务），所以这条连接必须是
     #     UniqueConnection——否则一次加载会触发 N 条取色链 + N 条渲染探针链。
-    src = open(os.path.join(ROOT, "dsh_gui_qt.py"), encoding="utf-8").read()
+    src = gui_source()
     ok = ("QTimer.singleShot(4000" not in src
           and "loadFinished.connect(self._on_view_loaded" in src)
     print(f"  [{'OK  ' if ok else 'FAIL'}] 取色由 loadFinished 触发（无固定死等）")
@@ -1232,7 +1234,7 @@ def theme_checks() -> list[str]:
     check("更新说明视图只读", notes.isReadOnly())
 
     # 防止以后有人把菜单换回裸 QMenu：裸 QMenu 的 show() 不经过 aboutToShow。
-    src = open(os.path.join(ROOT, "dsh_gui_qt.py"), encoding="utf-8").read()
+    src = gui_source()
     check("托盘菜单走 dsh_theme.Menu（不退回裸 QMenu）",
           "dsh_theme.Menu()" in src and "QMenu()" not in src)
 
@@ -1249,7 +1251,7 @@ def stack_overlay_checks() -> list[str]:
     这条断言只钉住"用的是哪种叠放"，防止有人把 StackAll 改回去。
     """
     failures: list[str] = []
-    src = open(os.path.join(ROOT, "dsh_gui_qt.py"), encoding="utf-8").read()
+    src = gui_source()
 
     def check(name: str, ok: bool, extra: str = "") -> None:
         print(f"  [{'OK  ' if ok else 'FAIL'}] {name}{('  ' + extra) if extra else ''}")
@@ -1608,6 +1610,26 @@ def health_checks() -> list:
     check("保存位置由用户选择，取消时显式 cancel",
           "getSaveFileName" in gui and "request.cancel()" in dev)
     return failures
+
+
+
+def gui_source() -> str:
+    """入口文件 + `dsh_ui/` 下全部源码。
+
+    MainWindow 2026-11-13 拆成七个 mixin 之后，"窗口里有没有这段代码"不能再
+    只看 `dsh_gui_qt.py`——大部分方法已经搬进 `dsh_ui/shell/`。这里统一拼起来，
+    免得每条断言各写一份读取逻辑、拆一次文件就要改十几处。
+    """
+    parts = []
+    base = os.path.join(ROOT, "dsh_ui")
+    for dirpath, _dirs, files in os.walk(base):
+        for name in sorted(files):
+            if name.endswith(".py"):
+                with open(os.path.join(dirpath, name), encoding="utf-8") as fh:
+                    parts.append(fh.read())
+    with open(os.path.join(ROOT, "dsh_gui_qt.py"), encoding="utf-8") as fh:
+        parts.insert(0, fh.read())
+    return "\n".join(parts)
 
 
 def main() -> int:

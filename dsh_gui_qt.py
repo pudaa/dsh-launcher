@@ -110,6 +110,18 @@ from PySide6.QtWebEngineCore import QWebEngineProfile
 
 from dsh_ui import console as dsh_console
 from dsh_ui import devtools as dsh_devtools
+# 工具与常量（ASSET_DIR / icon_for / resource_report 等）
+from dsh_ui.prelude import *   # noqa: F401,F403
+# 下划线开头的工具 star-import 不带，但 tools/ 里一直在直接取用，
+# 继续从入口导出（保持这些脚本不用改）。
+from dsh_ui.prelude import _asset_dir, _parse_probe_color  # noqa: F401
+from dsh_ui.shell.frame import WindowFrameMixin
+from dsh_ui.shell.panel import PanelMixin
+from dsh_ui.shell.service import ServiceMixin
+from dsh_ui.shell.titlebar import TitlebarMixin
+from dsh_ui.shell.tray import TrayMixin
+from dsh_ui.shell.updates import UpdatesMixin
+from dsh_ui.shell.view import ViewMixin
 from dsh_ui import panel as dsh_panel
 from dsh_ui import theme as dsh_theme
 import dsh_ui.dialogs
@@ -129,51 +141,13 @@ from dsh_host.contract import DshError, ServiceHandle
 from dsh_host.logutil import host_log
 from dsh_host.version import HOST_NAME, HOST_TAGLINE, HOST_VERSION
 
-APP_TITLE = "DSH — DeepSeek Harness"
-SINGLETON_ID = "DSH-Web-singleton"
-
-ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
-def _asset_dir() -> str:
-    """定位 assets 目录。**必须兼容打包后的布局。**
-
-    这个函数存在的理由（2026-09-21 踩坑）
-    -------------------------------------
-    打包命令原先只有 `--windows-icon-from-ico=assets/icon.ico`，
-    那只是把图标塞进 **exe 自身的 PE 资源**（资源管理器看的那个）。
-    而运行时 `QIcon("assets/xxx.ico")` 是去**文件系统**读的 ——
-    Nuitka onefile 不会自动带上 assets/ 目录，于是 QIcon 拿到空对象，
-    `isNull()` 为真，图标切换**静默失效**（回落到 exe 资源里的那个）。
-
-    所以两件事缺一不可：
-      1. 打包命令要有 `--include-data-dir=assets=assets`
-      2. 这里要能在"解包目录 / exe 同目录 / 源码目录"里找到 assets
-
-    候选顺序覆盖三种运行形态：源码直跑、onefile 解包、standalone 目录。
-    """
-    bases: list[str] = []
-    try:
-        bases.append(os.path.dirname(os.path.abspath(__file__)))
-    except NameError:                                          # pragma: no cover
-        pass
-    # Nuitka 打包后 __compiled__ 存在；frozen 覆盖其他打包器
-    if getattr(sys, "frozen", False) or "__compiled__" in globals():
-        bases.append(os.path.dirname(os.path.abspath(sys.argv[0])))
-    bases.append(os.getcwd())
-    for b in bases:
-        p = os.path.join(b, "assets")
-        if os.path.isdir(p):
-            return p
-    # 全都找不到就返回首个候选下的 assets —— 后续 os.path.isfile 判空即可。
-    # 不要在这里抛异常：图标缺失不该阻止应用启动。
-    return os.path.join(bases[0] if bases else ".", "assets")
 
 
-ASSET_DIR = _asset_dir()
+
 
 #: 早期内置的单色图标，仅作兜底
-ICON_PATH = os.path.join(ASSET_DIR, "icon.ico")
 
 # 随标题栏深浅切换的两套图标。
 #
@@ -182,16 +156,8 @@ ICON_PATH = os.path.join(ASSET_DIR, "icon.ico")
 #
 # 两份 ico 由 tools/make_icons.py 从 assets/deepseek.svg 生成，
 # 每个文件内含 16~256 共 9 个尺寸——单尺寸 ICO 在小图标下会糊。
-ICON_FOR_DARK_BG = os.path.join(ASSET_DIR, "icon-light.ico")
-ICON_FOR_LIGHT_BG = os.path.join(ASSET_DIR, "icon-dark.ico")
 
 
-def icon_for(dark_bg: bool) -> QIcon:
-    """按底色深浅挑图标。两套都找不到就退回内置单色图标。"""
-    path = ICON_FOR_DARK_BG if dark_bg else ICON_FOR_LIGHT_BG
-    if not os.path.isfile(path):
-        path = ICON_PATH
-    return QIcon(path) if os.path.isfile(path) else QIcon()
 
 
 #: 环境变量：设成文件路径时，应用只做资源自检、写报告、退出。
@@ -206,104 +172,15 @@ def icon_for(dark_bg: bool) -> QIcon:
 RESOURCE_CHECK_ENV = selfupdate.SELFTEST_ENV
 
 
-def resource_report() -> tuple[str, bool]:
-    """检查运行环境里的资源与能力是否齐备。返回 (报告文本, 是否通过)。
-
-    只做纯粹的自检，不涉及业务逻辑。
-    """
-    packaged = ("__compiled__" in globals()) or bool(getattr(sys, "frozen", False))
-    lines = [
-        f"{HOST_NAME} 产物自检",
-        "  sys.frozen       = %s" % getattr(sys, "frozen", False),
-        "  __compiled__     = %s" % ("__compiled__" in globals()),
-        "  __file__         = %s" % globals().get("__file__", "(无)"),
-        "  argv[0]          = %s" % (sys.argv[0] if sys.argv else "(无)"),
-        "  sys.executable   = %s" % getattr(sys, "executable", "(无)"),
-        "  ASSET_DIR        = %s" % ASSET_DIR,
-        "  ASSET_DIR 存在    = %s" % os.path.isdir(ASSET_DIR),
-    ]
-    ok = True
-    for label, p in (("icon.ico ", ICON_PATH),
-                     ("icon-light", ICON_FOR_DARK_BG),
-                     ("icon-dark ", ICON_FOR_LIGHT_BG)):
-        exists = os.path.isfile(p)
-        size = os.path.getsize(p) if exists else 0
-        ic = QIcon(p) if exists else QIcon()
-        loadable = not ic.isNull()
-        if not (exists and loadable):
-            ok = False
-        lines.append("  %s  存在=%-5s 大小=%-7d 可加载=%s  %s"
-                     % (label, exists, size, loadable, p))
-
-    # --- 自更新可用性 ---
-    # 这条专门防一个会静默失效的坑：Nuitka 不设 sys.frozen，
-    # 若 running_as_exe() 只看 frozen，打包版会被判成"源码运行" →
-    # 自更新菜单项被禁用 → 功能直接死掉。必须在产物上验。
-    try:
-        supported, reason = selfupdate.self_update_supported()
-        exe = selfupdate.current_exe()
-    except Exception as e:                                     # noqa: BLE001
-        supported, reason, exe = False, "%s: %s" % (type(e).__name__, e), "?"
-    lines.append("  自更新可用        = %s%s"
-                 % (supported, ("  (%s)" % reason) if reason else ""))
-    lines.append("  current_exe      = %s" % exe)
-    if packaged and not supported:
-        ok = False
-        lines.append("  ↑ 打包版里自更新应当可用，否则菜单项会被禁用")
-    if packaged and not exe.lower().endswith(".exe"):
-        ok = False
-        lines.append("  ↑ 打包版里 current_exe 应指向 .exe")
-
-    # --- 内联 SVG 图标链路 ---
-    # 控制面板的图标是**内联 SVG**，靠 PySide6.QtSvg 在运行时渲染。
-    # 这是本项目第一次在打包产物里用到 QtSvg：如果打包时 QtSvg 的库没被收进去，
-    # 源码里一切正常、打出来的 exe 却起不来（或图标全部空白）。
-    # 资源树里有没有 SVG 文件是看不出来的（我们本来就不读文件），所以只能
-    # **真的渲染一个图标**来验。
-    try:
-        from dsh_ui import icons as dsh_icons
-        probe_name = "circle-check"
-        ratio = dsh_icons.ink_ratio(probe_name, 48, "#ffffff")
-        good = 0.02 < ratio < 0.60
-        icon_ok = not dsh_icons.missing([probe_name])
-        lines.append("  图标数            = %d" % len(dsh_icons.SVG))
-        lines.append("  SVG 渲染上色比例   = %.3f（%s）"
-                     % (ratio, "正常" if good else "异常"))
-        if not (good and icon_ok):
-            ok = False
-            lines.append("  ↑ QtSvg 渲染异常：打包时可能漏收了 QtSvg 的库")
-    except Exception as e:                                     # noqa: BLE001
-        ok = False
-        lines.append("  内联图标不可用     = %s: %s" % (type(e).__name__, e))
-        lines.append("  ↑ 面板图标会全部空白；多半是打包漏收了 PySide6.QtSvg")
-
-    lines.append("  结论             = %s" % ("通过" if ok else "**失败**"))
-    return "\n".join(lines), ok
 
 
 #: 主题跟踪的"变色"容差。小于这个差值不动手——避免因渐变/抗锯齿噪声
 #  反复重设 DWM 属性（既无意义，也会让标题栏偶尔闪）。
-THEME_CHANGE_TOL = 6
 
 #: 主题跟踪每秒允许的最大检查次数上限的间隔（毫秒）。配置值低于它会被抬到它，
 #  防止有人把 theme_watch_ms 设成 50 之类把渲染进程变成忙轮询。
-_THEME_WATCH_MIN_MS = 1500
 
 
-def _parse_probe_color(value) -> tuple[int, int, int] | None:
-    """把 JS 探针返回的 "r,g,b" 解析成元组。解析失败返回 None。"""
-    if not isinstance(value, str):
-        return None
-    parts = value.split(",")
-    if len(parts) != 3:
-        return None
-    try:
-        rgb = tuple(int(p) for p in parts)
-    except ValueError:
-        return None
-    if any(c < 0 or c > 255 for c in rgb):
-        return None
-    return rgb
 
 
 # ---------------------------------------------------------------- 主题色探针
@@ -321,58 +198,10 @@ def _parse_probe_color(value) -> tuple[int, int, int] | None:
 # · 取不到就返回 null，让 Python 侧降级到像素截图。
 #
 # 为什么不用像素截图作为唯一来源：见 _sample_titlebar_color 的 docstring。
-_JS_THEME_PROBE = r"""
-(function () {
-  function parse(c) {
-    var m = /rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*([\d.]+))?\s*\)/
-              .exec(c || '');
-    if (!m) { return null; }
-    var a = (m[4] === undefined) ? 1 : parseFloat(m[4]);
-    if (!(a > 0.5)) { return null; }          // 半透明及以上不算"看得见的底色"
-    return [parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10)];
-  }
-  function effectiveBg(el) {
-    var guard = 0;
-    while (el && el.nodeType === 1 && guard++ < 64) {
-      var c = parse(getComputedStyle(el).backgroundColor);
-      if (c) { return c; }
-      el = el.parentElement;
-    }
-    return null;
-  }
-  var W = window.innerWidth, H = window.innerHeight;
-  if (W < 4 || H < 4) { return null; }
-  var ys = [0.015, 0.03, 0.05, 0.08];
-  var xs = [0.03, 0.15, 0.3, 0.45, 0.6, 0.75, 0.9, 0.97];
-  var counts = {}, best = null, bestN = 0;
-  for (var i = 0; i < ys.length; i++) {
-    var y = Math.max(1, Math.round(H * ys[i]));
-    for (var j = 0; j < xs.length; j++) {
-      var x = Math.max(1, Math.round(W * xs[j]));
-      var c = effectiveBg(document.elementFromPoint(x, y));
-      if (!c) { continue; }
-      var k = c.join(',');
-      counts[k] = (counts[k] || 0) + 1;
-      if (counts[k] > bestN) { bestN = counts[k]; best = c; }
-    }
-  }
-  return best ? best.join(',') : null;
-})();
-"""
 
 
 # ------------------------------------------------------------------ 服务规划
 
-def requested_service_port() -> int:
-    """这次启动要用哪个端口去连/接管服务。
-
-    **优先用更新重启时旧实例通过命令行传进来的实际端口。**
-    理由：新实例靠 config 里的端口去探测并接管已有服务，但旧实例可能是
-    "端口被占、改用系统分配"启动的，config 里存的不一定是实际端口——
-    那样新实例会另起一个服务，把旧服务变成孤儿。由旧实例把实际端口
-    直接告诉它，这条路才可靠。
-    """
-    return selfupdate.attach_port_from_argv() or int(config.get("port") or 0)
 
 
 
@@ -446,24 +275,25 @@ LOADING_HTML = """
 MEM_SAMPLE_MS = 60_000
 #: mem.log 的单文件上限；超了就只保留最后一段重写（不滚动归档，
 #: 因为这份日志的价值全在"最近几小时"）。
-MEM_LOG_MAX_BYTES = 2 * 1024 * 1024
 #: 网页进程 PrivateBytes 超过它就在日志里写一条"可以重新加载页面"的提示。
 #: **只提示，不自动重载**——自动重载会打断正在跑的对话，代价比省内存大。
-MEM_WEB_WARN_MB = 1200
 
 #: 手动「重新加载页面」连按判定窗口（秒）。窗口内第二次按 = 重建视图：
 #: 软重载治不了"合成表面丢失"（2026-10-24 实测），重建一定治得了。
-MANUAL_RESET_WINDOW_S = 20
 
 #: 页面重建（换掉整个 QWebEngineView）的防循环窗口与次数。
 #: 2026-10-24 现场：页面 DOM 活着但合成表面丢失，reload 无效，只有换视图
 #: 才能恢复。但"重建→还是坏→再重建"会变成每 30 秒重载一次页面，所以给
 #: 上限：窗口内超过次数就停止，明确告知用户重启应用。
-SURFACE_RESET_WINDOW_S = 120
-SURFACE_RESET_LIMIT = 2
 
 
-class MainWindow(QMainWindow):
+class MainWindow(WindowFrameMixin, ViewMixin, TitlebarMixin, TrayMixin,
+                 ServiceMixin, UpdatesMixin, PanelMixin, QMainWindow):
+    """主窗口。
+
+    按职责拆成七个 mixin（`dsh_ui/shell/`）：每个分支只放方法，状态全部在
+    下面的 `__init__` 里初始化。改"更新"不必先滚过"标题栏取色"。
+    """
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
@@ -549,659 +379,39 @@ class MainWindow(QMainWindow):
         # 不参与任何启动决策，绝不能拖慢首屏。
         self._start_mem_watch()
 
-    def _launch_startup(self):
-        # 重入守卫：切换来源、面板「自动准备运行环境」都会走到这里。没有守卫时
-        # 两个 StartupWorker 会并发 launch/wait_ready —— 多一个没人管的服务，
-        # 或者 attach 到同一个服务后 `_on_ready` 再跑一遍。`_swap_service` 和
-        # `_check_update` 都有同类守卫，只有启动这条没有（2026-10-20 体检补上）。
-        if self.starter is not None and self.starter.isRunning():
-            return
-        if self.starter is not None:
-            self.starter.deleteLater()
-        self.starter = StartupWorker(requested_service_port(),
-                                     bool(config.get("port_auto_fallback")),
-                                     config.service_log())
-        self.starter.progress.connect(self._set_tip)
-        self.starter.ready.connect(self._on_ready)
-        self.starter.failed.connect(self._on_failed)
-        self.starter.needs_setup.connect(self._on_needs_setup)
-        self.starter.start()
 
     # ----------------------------------------------------------- 界面
 
-    def _build_loading_page(self):
-        page = QWidget()
-        page.setObjectName("loadingPage")
-        lay = QVBoxLayout(page)
-        lay.setContentsMargins(0, 0, 0, 0)
-        bar = QProgressBar()
-        bar.setRange(0, 0)
-        bar.setTextVisible(False)
-        bar.setFixedHeight(3)
-        # 必须留引用：加载页在 StackAll 里**一直可见**，indeterminate 进度条的
-        # 动画定时器也会一直跑。2026-10-24 实测这不只是白烧 CPU——它还是
-        # 「打开原生 <select> 弹层后 Web 视图停止呈现」的触发条件（把加载页
-        # 换成静止版就不复现）。所以 Web 视图露出来之后必须把它停下来。
-        self.progress = bar
-        self.tip = QLabel("正在启动 DSH 服务…")
-        self.tip.setObjectName("loadingTip")
-        self.tip.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.tip.setWordWrap(True)
-        lay.addWidget(bar)
-        lay.addStretch(1)
-        lay.addWidget(self.tip)
-        lay.addStretch(1)
-        # 深色界面下不要让启动瞬间先闪一片系统白
-        dsh_theme.style_loading_page(page)
-        self.loading_page = page
-        self.stack.addWidget(page)
 
-    def _set_tip(self, text: str):
-        self.tip.setText(text)
 
-    def _loading_busy(self, busy: bool) -> None:
-        """加载页动画的开关。
 
-        StackAll 下加载页始终处于 show 状态，所以 indeterminate 进度条
-        （range 0..0）的动画**会一直跑**，即使 Web 视图早就盖在它上面。
-        两个后果：
-          1. 白烧一个定时器（项目纪律：没在用就不占资源）；
-          2. 2026-10-24 实测：这个持续重绘是「打开原生弹层后 Web 视图停止
-             呈现」的触发条件——把加载页换成静止版就复现不出来。
-        所以视图露出来后调 busy=False（定成静止的 0/1 空条），需要再显示
-        加载页时（换来源/重启服务/重新准备环境）调 busy=True 恢复动画。
-        """
-        bar = getattr(self, "progress", None)
-        if bar is None:
-            return
-        try:
-            if busy:
-                bar.setRange(0, 0)
-            else:
-                bar.setRange(0, 1)
-                bar.setValue(0)
-        except RuntimeError:
-            pass
-
-    def _ensure_webview(self):
-        if self.view is not None:
-            return
-        self.profile = QWebEngineProfile("dsh-profile", self)
-        # `DSH_PROFILE_DIR` 只给自测/排查用：让一次冒烟测试不去碰用户正在用的
-        # profile 目录。踩过的坑（2026-10-20）：前一个探针进程还留着一个
-        # QtWebEngineProcess 握着 profile 的缓存锁，冒烟测试这边就一路报
-        # "Unable to move the cache: 拒绝访问 (0x5)"，然后启动链路超时——
-        # 看起来像产品缺陷，其实是两个进程抢同一个缓存目录。
-        self.profile.setPersistentStoragePath(
-            os.environ.get("DSH_PROFILE_DIR") or config.profile_dir())
-        # 下载必须自己接（2026-10-21 老大报"点下载 session 没反应"）：
-        # QtWebEngine 对没人处理的 downloadRequested **静默取消**，而前端
-        # `a.download` 的 click 早就同步返回了 —— 不报错、不落盘、什么都不发生。
-        # 父对象给 profile：换来源/迁移数据重建 profile 时一起回收，不会残留。
-        self.downloads = dsh_devtools.DownloadManager(
-            self.profile,
-            choose_path=self._ask_download_path,
-            notify=self._download_notify,
-            log=host_log,
-            parent=self.profile,
-        )
-        # 拦截器**不在关闭时挂载**：挂上之后每个请求都会回调进 Python
-        # （图片、字体、轮询都算），"关闭状态只读一个布尔值"也是有成本的。
-        # 关闭时干脆不挂，开关打开时再挂（见 _apply_dev_mode）。
-        dev_on = bool(config.get("dev_mode"))
-        self.recorder.net_enabled = dev_on
-        self.interceptor = dsh_devtools.RequestRecorder(self.recorder, self.profile)
-        if dev_on:
-            self.profile.setUrlRequestInterceptor(self.interceptor)
-        self.view = QWebEngineView(self)
-        # 页面策略（外链出口 + 控制台采集）在 ShellPage 里，不写在界面方法里：
-        # 这样它可以脱离主窗口单独测（见 dsh_devtools.selftest_checks）。
-        self.page = dsh_devtools.ShellPage(
-            self.profile, self.view,
-            base_url=lambda: self.handle.url if self.handle else "",
-            recorder=self.recorder,
-            open_external=self._open_external_url,
-            view=self.view,
-            capture_console=dev_on,
-            notify=self._page_notify,
-            # 最后一级恢复：换掉整个 Web 视图（只有界面层能做到）
-            hard_recover=self._reset_webview,
-        )
-        self.view.setPage(self.page)
-        # 右键交还给网页自己处理。
-        #
-        # 默认情况下 QWebEngineView 会在**每一次**右键时弹出 Qt 自己的
-        # 标准菜单（刷新 / 保存网页 / 前进后退…），而且它是在 widget 层生成的，
-        # **网页里 preventDefault 拦不住** —— 结果是网页自己的右键菜单被它盖住。
-        # （老大实测反馈："弹出来的好像是 PySide6 的右键菜单"。）
-        #
-        # NoContextMenu 只是让 Qt 不出这个菜单；右键的鼠标事件**照常转发给
-        # Chromium**，所以网页里自己的 contextmenu 处理与 DOM 菜单都会正常工作。
-        self.view.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
-        self.stack.addWidget(self.view)
-        # StackAll 下新加的页会被顶到最上层。加载页必须继续盖在 Web 视图
-        # 上面，直到前端真的画出东西（见 _reveal_when_rendered）——否则
-        # 用户会先看到 Web 视图自己的白色/空白底面。
-        if self.loading_page is not None:
-            self.stack.setCurrentWidget(self.loading_page)
-            self._loading_busy(True)
 
     # ----------------------------------------------------------- 标题栏自适应
 
-    def _apply_titlebar(self, rgb):
-        """把取到的主色上到标题栏。
 
-        四个属性一起设，少一个就会出现违和的细节：
-          CAPTION_COLOR  底色
-          TEXT_COLOR     标题文字色——不设的话浅底上会白字（读不了）
-          BORDER_COLOR   最外圈 1px 边框，见下面「边框」一节
-          DARK_MODE      影响系统绘制的关闭按钮/边框高光
 
-        边框**不能直接给底色**（2026-10-24 修）
-        --------------------------------------
-        早先是把标题栏底色原样传给边框，想让边框和标题栏融为一体。
-        但界面本身是白的，取色结果就是 `#ffffff`，边框跟着变纯白 —— 盖在
-        另一个纯白应用上时窗口边界彻底消失（实测对比度 1.00，即完全同色）。
-        改成走 `dwm.border_shade()`：同族、只差一点明度，亮底压暗、暗底提亮。
-        依据与实测数据见该函数的 docstring。
-        """
-        if not dwm.available() or rgb is None:
-            return
-        mute = float(config.get("titlebar_mute") or 0.0)
-        # 用降饱和（往**自身灰度**拉）而不是往固定深灰 blend：
-        # 后者会把纯白拉成灰色，浅色主题下观感明显违和。
-        # 详见 dwm.desaturate 的 docstring。
-        bg = dwm.desaturate(rgb, mute) if mute else rgb
-        fg = dwm.contrast_text(bg)
-        dark = dwm.is_dark(bg)
-        edge = dwm.border_shade(bg)
-        self._last_titlebar_rgb = rgb
-
-        ok = dwm.set_caption_color(self, bg)
-        dwm.set_text_color(self, fg)
-        dwm.set_border_color(self, edge)
-        dwm.set_dark_mode(self, dark)
-        # 图标要跟着底色走：深色标题栏配白图标，否则黑图标看不见。
-        # 用 try 包住——图标设置失败绝不能影响上色这个主功能。
-        try:
-            self._set_theme_icon(dark)
-        except Exception as e:                                   # noqa: BLE001
-            host_log("切换主题图标失败（不影响上色）：%s: %s"
-                     % (type(e).__name__, e))
-        if ok:
-            host_log("标题栏上色：底色 %s 边框 %s（取自界面 %s）文字 %s"
-                     % (dwm.to_hex(bg), dwm.to_hex(edge),
-                        dwm.to_hex(rgb), dwm.to_hex(fg)))
-
-        # 这个 `dark` 就是"界面当前是深是浅"的既有判定结果，别处（控制面板）直接复用，
-        # 不要在面板里再判一次——两处判断迟早会不一致。同时记住，下次启动能直接用。
-        self._theme_dark = bool(dark)
-        config.set(last_theme_dark=bool(dark))
-        panel = getattr(self, "_panel", None)
-        if panel is not None:
-            panel.apply_theme("dark" if dark else "light")
-        # 开发者窗口也跟主题走（同一套官方令牌，不另调色）
-        dev = getattr(self, "_devwin", None)
-        if dev is not None:
-            dev.apply_theme("dark" if dark else "light")
-        insp = getattr(self, "_inspector", None)
-        if insp is not None:
-            try:
-                insp.apply_theme("dark" if dark else "light")
-            except RuntimeError:
-                pass        # 窗口已销毁
-        # 托盘菜单是独立弹窗，不吃窗口样式表，主题变了要重新套一遍
-        menu = getattr(self, "_menu", None)
-        if menu is not None:
-            dsh_theme.apply_menu(menu, dsh_theme.palette_now())
-
-    def _set_theme_icon(self, dark_bg: bool) -> None:
-        """按标题栏深浅切换窗口/托盘图标。
-
-        用实例属性记住上次的状态，避免每次重设——重设窗口图标会让
-        任务栏图标闪一下，而且托盘图标重建代价更高。
-        """
-        if getattr(self, "_icon_dark_bg", "unset") == dark_bg:
-            return
-        ic = icon_for(dark_bg)
-        if ic.isNull():
-            return
-        self._icon_dark_bg = dark_bg
-        self.setWindowIcon(ic)
-        app = QApplication.instance()
-        if app is not None:
-            try:
-                app.setWindowIcon(ic)
-            except Exception:                                      # noqa: BLE001
-                pass
-        tray = getattr(self, "tray", None)
-        if tray is not None:
-            try:
-                tray.setIcon(ic)
-            except Exception:                                      # noqa: BLE001
-                pass
-
-    def _sample_titlebar_color(self, attempt: int = 0):
-        """取界面主题色，给标题栏上色。**三层降级**。
-
-        为什么必须降级（2026-09-21 实机教训）
-        -------------------------------------
-        原实现只有一层：`self.view.grab()`。但这是**不可靠**的来源 ——
-        QWebEngineView 的网页在独立渲染进程/合成器里画，
-        `QWidget.grab()` 不保证能拿到那些像素。实测在某些环境下它返回
-        的是 widget 自身的空白背景（整片纯色），取出来的"主题色"是
-        空白色，标题栏反而被染成一片灰白。
-
-        所以按可靠性排序依次尝试，任一层成功即止：
-
-          L1  JS 读计算样式    最准——直接拿到界面真正的背景色，
-                               与合成方式无关。用的都是标准 DOM API
-                               （elementFromPoint + getComputedStyle
-                               + 向上找非透明祖先），**不依赖 DSH 的
-                               私有类名或层级结构**，所以不违反分层铁律。
-          L2  GDI PrintWindow  向系统要窗口真实像素（已验证可靠）。
-                               截客户区顶部，兼做纯色校验。
-          L3  view.grab()      兜底。同样做纯色校验，纯色则判失败。
-
-        三层都失败就保持系统默认标题栏——**不要拿一个不可信的颜色上色**。
-
-        为什么只取一次
-        --------------
-        定时器触发一次，不做持续监听：界面主题在使用中基本不变，
-        而持续截图会拖慢界面。
-
-        为什么要延迟
-        ------------
-        `loadFinished` 只代表 DOM 就绪，样式与首绘可能还没完成，
-        这时取到的是空白页颜色。所以等一段固定时间再取。
-        """
-        if not config.get("adaptive_titlebar") or not dwm.available():
-            return
-        if self.view is None:
-            return
-        self._tb_attempt = attempt
-        self._probe_trace = []
-        try:
-            self.view.page().runJavaScript(_JS_THEME_PROBE,
-                                           self._on_js_theme_color)
-        except Exception as e:                                   # noqa: BLE001
-            host_log("标题栏取色异常（JS）：%s: %s" % (type(e).__name__, e))
-            self._sample_by_pixels()
 
     #: 各层取色失败的记录，用一次日志把"为什么没上色"讲清楚
-    _probe_trace: list = []
     #: 当前是第几次尝试（用于退避重试）
-    _tb_attempt: int = 0
 
-    def _on_js_theme_color(self, value):
-        """L1 回调。value 形如 "30,32,36"，取不到是 None。"""
-        rgb = _parse_probe_color(value)
-        if rgb:
-            host_log("标题栏取色：来源=JS 计算样式 %s" % dwm.to_hex(rgb))
-            self._apply_titlebar(rgb)
-            return
-        self._probe_trace.append("JS 未取到")
-        self._sample_by_pixels()
 
-    def _sample_by_pixels(self):
-        """L2 GDI PrintWindow -> L3 view.grab()。"""
-        # --- L2：窗口真实像素 ---
-        try:
-            rgb = dwm.capture_window_top(int(self.winId()))
-            if rgb:
-                host_log("标题栏取色：来源=窗口像素 %s" % dwm.to_hex(rgb))
-                self._apply_titlebar(rgb)
-                return
-            self._probe_trace.append("窗口像素未取到（纯色或截取失败）")
-        except Exception as e:                                   # noqa: BLE001
-            self._probe_trace.append("窗口像素异常 %s" % type(e).__name__)
 
-        # --- L3：控件截图兜底 ---
-        try:
-            rgb = self._grab_view_color()
-            if rgb:
-                host_log("标题栏取色：来源=控件截图 %s" % dwm.to_hex(rgb))
-                self._apply_titlebar(rgb)
-                return
-            self._probe_trace.append("控件截图未取到（纯色）")
-        except Exception as e:                                   # noqa: BLE001
-            self._probe_trace.append("控件截图异常 %s" % type(e).__name__)
-
-        host_log("标题栏取色三层均失败，保持系统默认标题栏：%s"
-                 % "；".join(self._probe_trace))
-        # 多半是页面还没画出来（loadFinished 早于首绘）。退避后重试，
-        # 而不是立刻放弃或死等。
-        self._schedule_titlebar_probe(self._tb_attempt + 1)
-
-    def _grab_view_color(self):
-        """L3：截 QWebEngineView 取色。截不到有效内容返回 None。
-
-        两段式判断：**空白判定看整幅**，取色只看顶部一条。
-        不能只拿顶部一条判空白——真实界面的顶部可能就是一条纯色工具栏，
-        那完全正常，据此判"没渲染"会误杀。
-
-        性能：只拷顶部 6%，不整图 toBytes()（整图 1200x800 是 5.7MB、
-        4K 是 33MB）。constBits 的 memoryview 需先 cast("B")——默认
-        视图元素是 4 字节结构体，按字节切会算错元素数。
-        """
-        img = self.view.grab().toImage().convertToFormat(
-            QImage.Format.Format_RGBA8888)
-        w, h = img.width(), img.height()
-        if w <= 0 or h <= 0:
-            return None
-        mv = img.constBits()
-        if isinstance(mv, (bytes, bytearray)):
-            mv = memoryview(mv)
-        elif getattr(mv, "itemsize", 1) != 1:
-            mv = mv.cast("B")
-        stride = img.bytesPerLine()      # 不一定等于 w*4（行可能对齐填充）
-        pad = max(0, int(w * 0.02))
-        x0, span = pad, max(1, w - pad * 2)
-
-        def _rows(y0, n, step=1):
-            """取第 y0 行起的 n 行（左右各让开 pad），紧排成 RGB 缓冲。"""
-            return b"".join(
-                bytes(mv[y * stride + x0 * 4: y * stride + (x0 + span) * 4])
-                for y in range(y0, min(y0 + n, h), step))
-
-        # 先判整幅是否一片纯色（没渲染出来的控件背景就是整片同色）。
-        # 按行抽样——逐行全转在 4K 下要搬 33MB，而"是否空白"只需
-        # 有代表性的采样。上限约 96 行，代价与分辨率解耦。
-        step_y = max(1, h // 96)
-        full = _rows(0, h, step=step_y)
-        sampled = len(range(0, h, step_y))
-        if not full or dwm.flat_ratio(full, span, sampled) >= dwm.FLAT_RATIO:
-            return None
-
-        rows = max(1, int(h * 0.06))
-        top = _rows(0, rows)          # 取色这一条要逐行，保证准确
-        if not top:
-            return None
-        return dwm.dominant_color(top, span, len(top) // (span * 4))
 
     # ----------------------------------------------------------- 托盘
 
-    def _build_tray(self):
-        """托盘菜单。
 
-        分组原则（2026-09-20 重构）
-        --------------------------
-        按"用户想做什么"分组，而不是按"我们的模块怎么划分"分组：
-
-          1. 显示主窗口
-          2. 环境/运行     准备运行环境
-          3. DSH 本身      检查 DSH 更新 / 预览计划 / 回归稳定版 / 回滚
-          4. 桌面壳        检查桌面壳更新 / 关于
-          5. 系统          打开日志目录 / 退出
-
-        DSH 更新与桌面壳更新**必须分开**：用户看到"有更新"时得知道
-        换的是 DSH 还是这个窗口程序，否则会以为更新完界面就该变。
-
-        关于「停止后台服务」被移除
-        --------------------------
-        它和「退出」语义不同（一个停服务留窗口，一个关窗口），但用户点它的
-        意图几乎都是"我要结束这一切"。两个入口殊途同归，只会让人犹豫。
-        现在只保留「退出」，且退出时**默认连带停止后台服务**——
-        想单独留服务的人可以用「仅退出窗口」的替代操作。
-        """
-        self.tray = QSystemTrayIcon(self.windowIcon(), self)
-        # 菜单是系统弹窗，默认样式与 DSH 差得最远（直角、系统字体、灰分隔线）。
-        # 圆角要靠 WA_TranslucentBackground；dsh_theme.Menu 还会在每次显示时
-        # 清掉 QWindows11Style 装上的、会被窗口裁掉右下的投影。
-        menu = dsh_theme.Menu()
-        self._menu = menu
-
-        act_show = QAction("显示主窗口", self)
-        act_show.triggered.connect(self._show_main)
-
-        # 页面白掉 / 卡住时的自救入口。2026-10-20 那次登录白屏证明：
-        # 一旦主视图被导航到空白页，没有刷新入口就只能重启整个应用。
-        self.act_reload = QAction("重新加载页面", self)
-        self.act_reload.triggered.connect(self._reload_page)
-
-        # 只在环境确实缺东西时才可用——平时不给一个点了没反应的菜单项
-        self.act_setup = QAction("准备运行环境…", self)
-        self.act_setup.setEnabled(False)
-        self.act_setup.triggered.connect(self._prepare_env)
-
-        # --- DSH 相关 ---
-        self.act_check = QAction("检查 DSH 更新…", self)
-        self.act_check.triggered.connect(lambda: self._check_update(manual=True))
-
-        self.act_prev = QAction("加入预览计划", self)
-        self.act_prev.setCheckable(True)
-        self.act_prev.setChecked(bool(config.get("prerelease_opt_in")))
-        self.act_prev.triggered.connect(self._toggle_prerelease)
-
-        self.act_stable = QAction("回归稳定版", self)
-        self.act_stable.triggered.connect(self._go_stable)
-
-        self.act_rollback = QAction("回滚 DSH 到上一版本", self)
-        self.act_rollback.triggered.connect(self._rollback)
-
-        # --- 鲸坞自身 ---
-        self.act_host_check = QAction(f"检查{HOST_NAME}更新…", self)
-        self.act_host_check.triggered.connect(lambda: self._check_host_update(manual=True))
-        # 开发运行时自更新不可用，直接不给点，避免"点了报错说不行"
-        supported, _reason = selfupdate.self_update_supported()
-        if not supported:
-            self.act_host_check.setEnabled(False)
-            self.act_host_check.setText(f"检查{HOST_NAME}更新…（仅打包版可用）")
-
-        self.act_about = QAction(f"关于{HOST_NAME}", self)
-        self.act_about.triggered.connect(self._show_about)
-
-        # 控制面板：托盘 menu 装不下的东西都在这里（状态、后续的引导与连接）
-        self.act_panel = QAction("控制面板…", self)
-        self.act_panel.triggered.connect(self._open_panel)
-
-        # 标题栏自适应：视觉偏好因人而异，给一个关掉的开关
-        self.act_titlebar = QAction("标题栏跟随界面配色", self)
-        self.act_titlebar.setCheckable(True)
-        self.act_titlebar.setChecked(bool(config.get("adaptive_titlebar")))
-        self.act_titlebar.setEnabled(dwm.available())
-        if not dwm.available():
-            self.act_titlebar.setText("标题栏跟随界面配色（系统不支持）")
-        self.act_titlebar.triggered.connect(self._toggle_titlebar)
-
-        # --- 系统 ---
-        act_logs = QAction("打开日志目录", self)
-        act_logs.triggered.connect(
-            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(config.log_dir())))
-
-        self.act_quit = QAction("退出", self)
-        self.act_quit.triggered.connect(self._quit)
-
-        # 托盘只留"必要且一步到位"的项：打开、检查更新、看日志、退出。
-        #
-        # 设置类与版本管理类的项都搬到控制面板了（加入预览计划 / 回归稳定版 /
-        # 回滚 / 标题栏跟随配色 / 准备运行环境）。理由：托盘 menu 放不了说明文字，
-        # "回滚到上一版本"这种有风险的动作应该带上下文，而不是藏在二级菜单里
-        # 点一下就执行。
-        #
-        # 上面那些 QAction 仍然保留（面板走同一套回调，`_refresh_menu` 也还在
-        # 更新它们的文字与可用性），只是不再挂进菜单。
-        menu.addAction(act_show)
-        menu.addAction(self.act_reload)
-
-        # 快捷键挂在主窗口上：托盘菜单里的项只有在菜单打开时才响应按键，
-        # 而"页面白了我按 F5"必须随时生效。留着引用，否则 Python 侧被 GC
-        # 会连带删掉 C++ 的 QShortcut。
-        self._reload_shortcuts = []
-        for key in (QKeySequence.Refresh, QKeySequence("Ctrl+R")):
-            sc = QShortcut(key, self)
-            sc.activated.connect(self._reload_page)
-            self._reload_shortcuts.append(sc)
-        menu.addAction(self.act_panel)
-        menu.addSeparator()
-        menu.addAction(self.act_check)
-        menu.addAction(self.act_host_check)
-        menu.addSeparator()
-        menu.addAction(act_logs)
-        menu.addAction(self.act_about)
-        menu.addSeparator()
-        menu.addAction(self.act_quit)
-
-        self.tray.setContextMenu(menu)
-        self.tray.setToolTip(f"{APP_TITLE}\n{HOST_NAME} v{HOST_VERSION}")
-        self.tray.activated.connect(
-            lambda reason: self._show_main()
-            if reason == QSystemTrayIcon.ActivationReason.DoubleClick else None)
-        self.tray.messageClicked.connect(self._on_tray_message_clicked)
-        self.tray.show()
-        self._refresh_menu()
-
-    def _refresh_menu(self):
-        """按当前版本状态调整菜单可用性——不做无意义的可点项。"""
-        info = self.update_info
-        cur = self.handle.install.version if self.handle else None
-        is_remote = bool(self.handle is not None
-                         and getattr(self.handle, "remote", ""))
-
-        if is_remote:
-            # 远程会话期间，"更新 / 回滚 / 回归稳定版 / 加预览 / 准备环境"动的
-            # 都是**本机这份** DSH，跟窗口里显示的那台机器毫无关系。留着可点
-            # 等于骗人按下去——用户会以为自己在升级远端。一律禁用并写明原因。
-            for act in (self.act_check, self.act_prev, self.act_stable,
-                        self.act_rollback, self.act_setup):
-                act.setEnabled(False)
-            self.act_stable.setText("（远程会话中不可用）")
-            self.act_rollback.setText("（远程会话中不可用）")
-            self.act_check.setText("检查 DSH 更新（远程会话中不可用）")
-        else:
-            # 回到本地会话：把上面禁掉的那几项放开，再按各自状态细化
-            for act in (self.act_check, self.act_prev, self.act_setup):
-                act.setEnabled(True)
-            self.act_check.setText("检查 DSH 更新…")
-            if info:
-                self.act_stable.setEnabled(info.action == "downgrade")
-                self.act_stable.setText(
-                    f"回归稳定版 {info.stable}" if info.action == "downgrade"
-                    else "已是稳定版")
-            else:
-                # 还没拿到通道信息时不知道该回到哪个版本，宁可不给点
-                self.act_stable.setEnabled(False)
-                self.act_stable.setText("回归稳定版")
-
-            prev = config.get("previous_version")
-            rollback_ok = bool(prev and cur and prev != cur)
-            self.act_rollback.setEnabled(rollback_ok)
-            self.act_rollback.setText(
-                f"回滚 DSH 到 {prev}" if rollback_ok else "回滚 DSH 到上一版本")
-
-        if self.host_release:
-            self.act_host_check.setText(f"更新{HOST_NAME}到 {self.host_release.version}…")
-        else:
-            self.act_host_check.setText(
-                f"检查{HOST_NAME}更新…" if selfupdate.self_update_supported()[0]
-                else f"检查{HOST_NAME}更新…（仅打包版可用）")
 
     # ----------------------------------------------------------- 启动回调
 
-    def _on_ready(self, handle):
-        self.handle = handle
-        is_remote = bool(getattr(handle, "remote", ""))
-        if is_remote:
-            host_log("会话就绪：远程 %s · 隧道端口 %s" % (handle.remote, handle.port))
-        else:
-            host_log("服务就绪：%s | 端口 %s | 来源 %s"
-                     % (handle.install.describe(), handle.port, handle.install.source))
-        self._ensure_webview()
-        # UniqueConnection：`_on_ready` 会被 StartupWorker 与 `_swap_service.done`
-        # 反复调用（换来源、迁移数据后重启服务）。不加这个，一次加载会触发 N 条
-        # 渲染探针链 + N 条取色链（取色带整窗位图回读，最贵的一项）。
-        self.view.loadFinished.connect(self._on_view_loaded,
-                                       Qt.ConnectionType.UniqueConnection)
-        self.view.load(QUrl(handle.url))
-        QTimer.singleShot(15000, self, self._force_reveal)
-        self._refresh_menu()
-        if is_remote:
-            # 远程不做版本复验、不查更新：那台机器上的 DSH 是它自己的事，
-            # 我们既改不了也不该替它下判断。界面上的"DSH 版本"会显示"未知"。
-            return
-        # 版本复验放到后台：启动路径采信了缓存里的版本号，这里补一次真实核对。
-        # 对不上（用户在壳之外装了别的版本）时更新显示并提示，但不挡首屏。
-        self._reverify = VersionReverifyWorker(handle.install.version)
-        self._reverify.changed.connect(self._on_version_changed)
-        self._reverify.start()
-        if config.get("check_update_on_start"):
-            QTimer.singleShot(3000, lambda: self._check_update(manual=False))
 
-    def _on_version_changed(self, fresh):
-        """后台复验发现实际版本与界面此前显示的不一致。"""
-        shown = self.handle.install.version if self.handle else "?"
-        host_log("版本复验：界面显示 %s，实际 %s" % (shown, fresh.version))
-        if self.handle:
-            # 只换元数据。服务是用同一份 bin_js 拉起来的，版本号变了不代表
-            # 需要重启——重启反而会打断用户正在做的事。
-            self.handle.install = fresh
-            contract.save_state(self.handle)
-        self._refresh_menu()
-        self._info("检测到 DSH 版本与界面显示的不一致。\n\n"
-                   "此前显示　%s\n"
-                   "实际版本　%s\n\n"
-                   f"通常意味着 DSH 在{HOST_NAME}之外被升级或降级过"
-                   "（例如手动执行过 npm install -g）。\n"
-                   "显示已按实际版本更新。"
-                   % (shown, fresh.version))
-        # 当前版本变了，之前算出的"有没有新版"就不再成立，重新算一次
-        self._check_update(manual=False)
 
-    def _on_view_loaded(self, ok: bool):
-        """页面加载完成回调。
-
-        标题栏取色在这里触发，而**不是**等一个固定时长。
-        早期实现是 `singleShot(4000, ...)` 死等 4 秒，老大反馈
-        "加载完网页后有明显延迟"——正是这 4 秒。
-
-        现在改成"立刻试一次 + 失败退避重试"：既然有了空白检测
-        （见 dwm.FLAT_RATIO），就能区分"页面还没画出来"和"页面本身是纯色"，
-        于是在页面真正渲染完成的那一刻就上色，通常 1 秒内完成。
-        """
-        if ok:
-            self._reveal_when_rendered()
-        if ok and config.get("adaptive_titlebar") and dwm.available():
-            self._schedule_titlebar_probe(0)
-            self._start_theme_watch()
 
     #: 前端首屏渲染探针。返回 "1"/"0" 两个**字符串**：
     #  实测 PySide6 6.11 对 array/object 的返回值一律给空串（见 memory 里的坑），
     #  布尔虽然没踩到，但统一走字符串最省心。
-    JS_RENDERED = ("(function(){try{var b=document.body;"
-                   "return (b&&b.children.length>0&&(b.textContent||'').length>40)"
-                   "?'1':'0';}catch(e){return '0';}})()")
 
-    def _reveal_when_rendered(self, tries: int = 0) -> None:
-        """等前端真的画出内容，再把加载页换成 Web 视图。
 
-        `loadFinished` 只代表 **HTML 到了**。DSH 是 SPA，此刻 `#root` 还是空的，
-        立刻切过去就是一片白——这正是"页面加载完了却要愣一下"的来源。
-        这里用一个很便宜的 DOM 探针轮询（只读 children/textContent，不读布局），
-        最多等约 1.8 秒；超时也切——宁可看到白，也不能永远卡在加载页。
-        """
 
-        def decided(value) -> None:
-            if str(value).strip() == "1" or tries >= 12:      # 12 × 150ms ≈ 1.8s
-                # StackAll 下这一步只是把 Web 视图 raise 到最上层，
-                # 不改变任何一页的可见性/尺寸，所以不会触发重新排版。
-                self._show_webpage()
-            else:
-                QTimer.singleShot(
-                    150, lambda: self._reveal_when_rendered(tries + 1))
-
-        try:
-            self.page.runJavaScript(self.JS_RENDERED, decided)
-        except Exception:                                      # noqa: BLE001
-            self._show_webpage()
-
-    def _show_webpage(self) -> None:
-        """把 Web 视图露出来，并把加载页的动画停掉（见 _loading_busy）。"""
-        self.stack.setCurrentIndex(1)
-        self._loading_busy(False)
-
-    def _force_reveal(self) -> None:
-        """兜底：等不到前端首绘也切过去——宁可看到白，也不能永远卡加载页。"""
-        self._show_webpage()
 
     # ---------------------------------------------------- 主题跟踪（低频）
     #
@@ -1219,477 +429,45 @@ class MainWindow(QMainWindow):
     # 代价核算：默认 8 秒一次，每次一次 JS 往返。相对于 DSH 自己在跑的
     # 推理流，这个开销可以忽略。想彻底关掉把 theme_watch_ms 设成 0。
 
-    def _start_theme_watch(self):
-        """按配置启动/停止主题跟踪。"""
-        ms = int(config.get("theme_watch_ms") or 0)
-        if ms > 0:
-            ms = max(ms, _THEME_WATCH_MIN_MS)
-        if not config.get("adaptive_titlebar") or ms <= 0:
-            timer = getattr(self, "_theme_timer", None)
-            if timer is not None:
-                timer.stop()
-            return
-        timer = getattr(self, "_theme_timer", None)
-        if timer is None:
-            timer = QTimer(self)
-            timer.timeout.connect(self._theme_watch_tick)
-            self._theme_timer = timer
-        # 已在跑就只保证节拍正确，不重启倒计时——避免频繁 start()
-        # 反复重置计时器。
-        if not timer.isActive() or timer.interval() != ms:
-            timer.start(ms)
-            host_log("主题跟踪：每 %d ms 检查一次（仅读计算样式，无截图）" % ms)
 
-    def _theme_watch_tick(self):
-        """跟踪 tick：只看 L1，且没变就什么都不做。"""
-        if not config.get("adaptive_titlebar") or self.view is None:
-            timer = getattr(self, "_theme_timer", None)
-            if timer is not None:
-                timer.stop()
-            return
-        # 最小化/隐藏时不看——省掉无谓的渲染进程往返
-        if self.isMinimized() or not self.isVisible():
-            return
-        try:
-            self.view.page().runJavaScript(_JS_THEME_PROBE,
-                                           self._on_watch_color)
-        except Exception:                                       # noqa: BLE001
-            pass
 
-    def _on_watch_color(self, value):
-        """跟踪回调：与上次上色用的颜色比对，变了才动。"""
-        rgb = _parse_probe_color(value)
-        if rgb is None:
-            return
-        last = getattr(self, "_last_titlebar_rgb", None)
-        if last is not None and all(
-                abs(rgb[i] - last[i]) <= THEME_CHANGE_TOL for i in range(3)):
-            return                       # 没变——大多数 tick 走这里
-        host_log("标题栏：检测到界面配色变化 %s → %s"
-                 % (dwm.to_hex(last) if last else "(无)", dwm.to_hex(rgb)))
-        self._apply_titlebar(rgb)
 
     #: 标题栏取色的重试节奏（毫秒）。首次很快，之后逐步退避，
     #  累计约 7.7 秒 —— 足够覆盖冷启动的样式计算与首绘，
     #  而正常情况第一次就成功，用户感知不到等待。
-    _TB_RETRY_MS = (250, 400, 600, 900, 1300, 1800, 2400)
 
-    def _schedule_titlebar_probe(self, attempt: int):
-        """安排第 attempt 次取色。"""
-        if not config.get("adaptive_titlebar") or not dwm.available():
-            return
-        if attempt >= len(self._TB_RETRY_MS):
-            host_log("标题栏取色：重试 %d 次仍未取到，放弃（保持系统默认）"
-                     % attempt)
-            return
-        QTimer.singleShot(self._TB_RETRY_MS[attempt],
-                          lambda a=attempt: self._sample_titlebar_color(a))
 
-    def _on_failed(self, msg: str):
-        host_log("启动失败：%s" % msg.replace("\n", " | ")[:600])
-        # 启动失败是硬失败：托盘气泡容易错过，改走应用内提示
-        self._set_tip("启动失败")
-        self._warn("DSH 启动失败。\n\n" + msg)
 
-    def _on_needs_setup(self, rep):
-        """缺 Node / 缺 DSH：这不是"启动失败"，而是"还没准备好"，走引导。"""
-        host_log("环境自检未通过：%s | broken=%s"
-                 % (rep.detail or "(无说明)", rep.broken))
-        self._set_tip("需要先准备运行环境")
-        self.act_setup.setEnabled(True)
-        self._show_main()
-        dlg = OnboardingDialog(self, rep)
-        dlg.exec()
-        ok = dlg.succeeded           # 先取出来：下面要延迟销毁这个对话框
-        dlg.deleteLater()
-        if ok:
-            host_log("环境准备完成，重新启动服务")
-            self.act_setup.setEnabled(False)
-            self._set_tip("环境已就绪，正在启动…")
-            self.stack.setCurrentIndex(0)
-            self._loading_busy(True)
-            self._launch_startup()
-        else:
-            self._set_tip("运行环境尚未就绪。可从托盘菜单「准备运行环境」重试。")
-            self.tray.showMessage(
-                "DSH", "运行环境尚未就绪。可从托盘菜单「准备运行环境」重试。",
-                QSystemTrayIcon.MessageIcon.Information, 6000)
 
-    def _prepare_env(self):
-        self.stack.setCurrentIndex(0)
-        self._loading_busy(True)
-        self._set_tip("正在检查运行环境…")
-        self._launch_startup()
 
     # ----------------------------------------------------------- 服务控制
 
-    def _stop_service(self) -> int:
-        """停止后台服务，返回终止的进程数。
-
-        不再是菜单项（见 _quit 的说明），改为退出流程内部调用。
-        保留成独立方法是为了让"停服务"和"退窗口"两件事在代码里仍然分开——
-        将来若要恢复成两个入口，直接挂回菜单即可。
-
-        `self.handle` 为空时（启动还没就绪、或启动失败）退到 `service.json`
-        里记的端口：那种情况下进程是**已经起来了**的，不按端口反查就只能干看着
-        它常驻。`stop()` 对映像名做了校验，误杀别的程序的概率很低（2026-10-20 体检）。
-        """
-        # 远程会话：停的是隧道（和可选的远端进程），没有本地 node 进程可杀。
-        # 这里不能落到下面的 `contract.stop()`——那会按端口去杀本机进程，
-        # 而那个端口是我们自己的隧道监听端口，杀了等于砍掉自己的转发。
-        if self._remote is not None or (self.handle is not None
-                                        and getattr(self.handle, "remote", "")):
-            self._stop_remote()
-            self.handle = None
-            return 1
-
-        if self.handle is not None:
-            port = self.handle.port or 0
-        else:
-            state = contract.load_state() or {}
-            try:
-                port = int(state.get("port") or config.get("port") or 0)
-            except (TypeError, ValueError):
-                port = 0
-        n = contract.stop(self.handle, port=port)
-        if n:
-            contract.save_state(None)
-        return n
 
     # ----------------------------------------------------------- 用户可见反馈
 
-    def _info(self, text: str):
-        """应用内提示。
 
-        手动操作的结果**必须**落在应用内。托盘气泡有两个致命问题：
-        用户视线在鼠标位置而气泡在屏幕角落，容易错过；系统「通知」设置
-        还可能直接把它拦掉。两条叠加，用户看到的就是"点了没反应"。
-        """
-        self._show_main()
-        dsh_theme.MessageDialog.info(self, "DSH", text)
 
-    def _warn(self, text: str):
-        self._show_main()
-        dsh_theme.MessageDialog.warn(self, "DSH", text)
 
-    def _check_update(self, manual: bool):
-        if getattr(self, "_checking", False):
-            if manual:
-                # 静默吞掉点击是最糟的反馈——明确告诉用户正在查
-                self._info("正在检查更新，请稍候。")
-            return
-        self._checking = True
-        if manual:
-            self.act_check.setEnabled(False)
-            self.act_check.setText("检查中…")
-            host_log("手动检查更新")
-        self._checker = CheckWorker()
-        self._checker.found.connect(lambda info: self._on_check(info, manual))
-        self._checker.failed.connect(lambda msg: self._on_check_failed(msg, manual))
-        self._checker.done.connect(self._on_check_done)
-        self._checker.start()
 
-    def _on_check(self, info, manual: bool):
-        self.update_info = info
-        self._refresh_menu()
-        if manual:
-            # 手动检查：无论有没有更新，结果都要明确给出来
-            if info.has_action:
-                self._show_update_dialog(info.target)
-            else:
-                # 说"已是最新"必须附带一句预览通道的情况。否则用户会以为官方没发新版——
-                # 0.1.7-rc.1/rc.2 就是这么被漏掉的（当时只看了 alpha 通道）。
-                newer = info.newer_preview()
-                hint = ("\n\n预览通道上已有更新的 %s。\n"
-                        "要获取它，请在托盘菜单里勾选「加入预览计划」。" % newer
-                        ) if newer else ""
-                lower = info.preview_below_current()
-                if lower:
-                    # 典型场景：已装 0.2.1-rc.2，尝鲜通道 0.2.1-alpha.5。
-                    # 预览计划取最高预览版，不降级；不解释一句用户会以为漏检。
-                    hint += ("\n\n说明　　%s 低于已安装版本（alpha < beta < rc）。\n"
-                             "　　　　预览计划取预览通道最高版，不会自动降级。"
-                             % "、".join("%s %s" % (n, v) for n, v in lower))
-                self._info("当前已是最新版本。\n\n"
-                           "已安装　　　DSH %s\n"
-                           "检查通道　　%s\n"
-                           "稳定通道　　%s\n"
-                           "候选通道　　%s\n"
-                           "尝鲜通道　　%s%s"
-                           % (info.current,
-                              updater.channel_label(info.channel),
-                              info.stable or "（未知）",
-                              info.next or "（未知）",
-                              info.alpha or "（未知）",
-                              hint))
-            return
-        if info.has_action:
-            self.tray.showMessage("DSH 更新", info.summary() + "（点击查看）",
-                                  QSystemTrayIcon.MessageIcon.Information, 10000)
 
-    def _on_check_failed(self, msg: str, manual: bool):
-        if manual:
-            self._warn("检查更新失败。\n\n" + msg + "\n\n"
-                       "常见原因：网络不可达、npm 源配置异常。\n"
-                       "详细记录见日志目录下的 host.log。")
 
-    def _on_check_done(self):
-        self._checking = False
-        self.act_check.setEnabled(True)
-        self.act_check.setText("检查更新…")
 
-    def _on_tray_message_clicked(self):
-        if self.update_info and self.update_info.has_action:
-            self._show_update_dialog(self.update_info.target)
 
-    def _toggle_prerelease(self, checked: bool):
-        config.set(prerelease_opt_in=bool(checked))
-        self.act_prev.setChecked(bool(checked))
-        host_log("预览计划 → %s" % ("开" if checked else "关"))
-        # 切换通道后立刻给结果：走手动检查路径，所以会有应用内反馈
-        self._check_update(manual=True)
 
-    def _go_stable(self):
-        target = self.update_info.stable if self.update_info else None
-        if not target:
-            self._info("还没有取到稳定版版本号。\n\n请先点「检查更新」，"
-                       "拿到结果后再试「回归稳定版」。")
-            return
-        config.set(prerelease_opt_in=False)
-        self.act_prev.setChecked(False)
-        host_log("回归稳定版 %s" % target)
-        self._show_update_dialog(target)
 
-    def _rollback(self):
-        prev = config.get("previous_version")
-        if prev:
-            self._show_update_dialog(prev)
 
-    def _reinstall_dsh(self):
-        """按当前版本重装一遍 DSH。
-
-        存在理由：`npm install -g` 可能只升主包，把精确版本的子依赖留在旧版。
-        那种状态下版本号完全正常，但界面会报接口 404 / 账号信息读不出来——
-        用户没有任何办法自己判断，只能重装。这个入口就是那条路，
-        而且把"先卸载再装"和"子依赖校验"都收在 updater 里，不需要用户懂 npm。
-        """
-        if not self.handle or not getattr(self.handle, "install", None):
-            self._info("DSH 还没运行起来。先让它启动，再来重装。")
-            return
-        inst = self.handle.install
-        dlg = ReinstallDialog(self, inst.version, self.handle)
-        accepted = dlg.exec() == QDialog.DialogCode.Accepted
-        new_handle = dlg.new_handle if accepted else None
-        dlg.deleteLater()            # 带整篇更新日志的对话框，不释放会一直挂着
-        if new_handle:
-            self.handle = new_handle
-            self._ensure_webview()
-            self.stack.setCurrentIndex(1)
-            self.view.load(QUrl(self.handle.url))
-
-    def _show_update_dialog(self, target: str):
-        if not self.handle:
-            return
-        info = self.update_info
-        if not info or info.target != target:
-            # 手工指定一个目标版本（回滚 / 回归稳定版）时，按目标落在哪个通道标注。
-            # 不要用 "alpha" in target 这种字符串嗅探——rc 版本会因此被误判成稳定版。
-            if info and info.stable == target:
-                channel = "latest"
-            elif info and info.next == target:
-                channel = "next"
-            else:
-                channel = "alpha"
-            info = updater.UpdateInfo(
-                current=self.handle.install.version,
-                stable=self.update_info.stable if self.update_info else target,
-                next=self.update_info.next if self.update_info else None,
-                alpha=self.update_info.alpha if self.update_info else None,
-                target=target,
-                channel=channel,
-                # 手工回滚的目标可能比已装版本低：必须标成 downgrade，
-                # 否则对话框会把"降级"说成"更新"、也不给旧版兼容性警告。
-                action=updater.action_for(self.handle.install.version, target),
-            )
-        dlg = UpdateDialog(self, info, self.handle)
-        accepted = dlg.exec() == QDialog.DialogCode.Accepted
-        new_handle = dlg.new_handle if accepted else None
-        dlg.deleteLater()            # 带整篇更新日志的对话框，不释放会一直挂着
-        if new_handle:
-            self.handle = new_handle
-            self._ensure_webview()
-            self.stack.setCurrentIndex(1)
-            self.view.load(QUrl(self.handle.url))
-            self.update_info = None
-            self._refresh_menu()
-            QTimer.singleShot(2000, lambda: self._check_update(manual=False))
 
     # ----------------------------------------------------------- 桌面壳更新
 
-    def _check_host_update(self, manual: bool):
-        """检查桌面壳自身更新。与 DSH 检查完全独立。"""
-        if getattr(self, "_host_checking", False):
-            if manual:
-                self._info(f"正在检查{HOST_NAME}更新，请稍候。")
-            return
-        self._host_checking = True
-        if manual:
-            self.act_host_check.setEnabled(False)
-            self.act_host_check.setText("检查中…")
-            host_log(f"手动检查{HOST_NAME}更新")
 
-        self._host_checker = HostCheckWorker()
-        self._host_checker.found.connect(
-            lambda rel, note: self._on_host_check(rel, note, manual))
-        self._host_checker.failed.connect(
-            lambda msg: self._on_host_check_failed(msg, manual))
-        self._host_checker.done.connect(self._on_host_check_done)
-        self._host_checker.start()
 
-    def _on_host_check(self, rel, note: str, manual: bool):
-        self.host_release = rel
-        self._refresh_menu()
-        if not manual:
-            if rel:
-                self.tray.showMessage(
-                    f"{HOST_NAME}更新", f"{HOST_NAME}有新版本 v{rel.version}（点击查看）",
-                    QSystemTrayIcon.MessageIcon.Information, 10000)
-            return
-        if not rel:
-            self._info(f"{HOST_NAME}{note}")
-            return
-        self._show_host_update_dialog(rel)
 
-    def _on_host_check_failed(self, msg: str, manual: bool):
-        if getattr(self, "_host_checking", False) and not manual:
-            return
-        if manual:
-            self._warn(f"检查{HOST_NAME}更新失败。\n\n" + msg + "\n\n"
-                       f"{HOST_NAME}更新从 GitHub 获取，网络不可达时属正常现象。\n"
-                       "不影响 DSH 本身的更新（那条走 npm 通道）。")
 
-    def _on_host_check_done(self):
-        self._host_checking = False
-        self.act_host_check.setEnabled(True)
-        self._refresh_menu()
 
-    def _show_host_update_dialog(self, rel):
-        dlg = HostUpdateDialog(self, rel)
-        result = dlg.exec()
-        dlg.deleteLater()            # 带整篇更新日志的对话框，不释放会一直挂着
-        if result == HostUpdateDialog.RESTART_NOW:
-            self._relaunch_after_update()
 
-    def _relaunch_after_update(self):
-        """新版本**已经替换到位**，这里只负责"拉起新实例 + 自己退出"。
 
-        顺序不能错，每一步都有理由：
 
-        1. **先释放单实例锁。** 新实例如启动时发现管道还连得上，会把自己当成
-           重复实例直接退出——用户看到的是"点了重启，什么都没发生"。
-           实测 `QLocalServer.close()` 之后新进程就连不上了；判定依据是
-           "能否连上那根管道"，不是"有没有同名进程"。
-        2. **再拉起新实例，成功后才退出。** 起不来就留在原地报错，
-           而不是把自己关掉、把用户丢在一个空桌面前。
-        3. **不停后台服务。** 把当前服务的端口随命令行传给新实例去接管，
-           省掉"停服务 → 重新启动 → 等就绪"的七八秒。新窗口几乎立刻可用。
-        4. **直接 `os._exit`，不走 `_quit()`。** 那里会连带停服务，
-           而服务正是我们要留给新实例接管的。代价是跳过 Qt 收尾——
-           此时任何"优雅退出"都会把服务一起带走。
-        """
-        try:
-            target = selfupdate.current_exe()
-        except Exception:                                        # noqa: BLE001
-            target = ""
-        port = self.handle.port if self.handle else 0
 
-        srv = getattr(self, "_singleton_server", None)
-        if srv is not None:
-            srv.close()
-        QLocalServer.removeServer(SINGLETON_ID)
-
-        try:
-            selfupdate.relaunch(target, attach_port=port)
-        except selfupdate.SelfUpdateError as e:
-            host_log("更新重启失败：%s" % e)
-            dsh_theme.MessageDialog.error(
-                self, "无法启动新版本",
-                "%s\n\n当前版本仍可继续使用。" % e)
-            return
-
-        host_log(f"{HOST_NAME}更新：已拉起新实例（接管端口 {port or '自动分配'}），"
-                 "本进程退出")
-        self.tray.hide()
-        os._exit(0)
-
-    def _show_about(self):
-        supported, reason = selfupdate.self_update_supported()
-        text = (
-            f"{HOST_NAME}  v{HOST_VERSION}\n\n"
-            f"{HOST_TAGLINE}。\n"
-            f"项目地址：https://github.com/{selfupdate.HOST_REPO}\n\n"
-            f"{HOST_NAME}更新　{'可用' if supported else '不可用'}\n"
-            f"　{('从 GitHub Release 拉取新版本并自动替换。' if supported else reason)}\n\n"
-            f"DSH 更新　走官方 npm 通道，与{HOST_NAME}更新互不影响。\n"
-        )
-        dsh_theme.MessageDialog.about(self, f"关于{HOST_NAME}", text)
-
-    def _open_panel(self):
-        """打开控制面板。
-
-        面板只被创建一次，之后是 show/raise —— 反复开关不该重复构造整个界面。
-        面板与主窗口之间走 `dsh_panel.PanelHost` 这个窄接口：面板不认识 MainWindow，
-        所以主窗口内部怎么改都不会连累它。
-        """
-        if getattr(self, "_panel", None) is None:
-            host = dsh_panel.PanelHost(
-                install=lambda: self.handle.install if self.handle else None,
-                handle=lambda: self.handle,
-                host_release=lambda: self.host_release,
-                # 主题复用标题栏取色的既有判定，面板不自己判
-                theme=lambda: "dark" if self._theme_dark else "light",
-                open_path=lambda p: QDesktopServices.openUrl(QUrl.fromLocalFile(p))
-                if p else self._info("还没有可打开的目录。"),
-                open_web=self._open_in_browser,
-                log_dir=config.log_dir,
-                flag=self._panel_flag,
-                set_flag=self._panel_set_flag,
-                action=self._panel_action,
-                # 远程：连接/断开必须由主窗口做（它管隧道生命周期和收尾），
-                # 面板只拿到"发指令"和"读状态"两件事。
-                remote_hosts=remote.load_hosts,
-                remote_save=remote.save_hosts,
-                remote_connect=self._panel_remote_connect,
-                remote_disconnect=self._panel_remote_disconnect,
-                remote_state=self._panel_remote_state,
-            )
-            self._panel = dsh_panel.ControlPanel(host, parent=None)
-        self._panel.show()
-        self._panel.raise_()
-        self._panel.activateWindow()
-        # 面板可能停在上次看的那一页，回来时刷新一下底部状态条
-        self._panel.refresh_statusbar()
-
-    def _open_in_browser(self):
-        """用系统浏览器打开当前的 DSH 地址。"""
-        if self.handle and self.handle.url:
-            QDesktopServices.openUrl(QUrl(self.handle.url))
-        else:
-            self._info("服务还没就绪，暂时没有可打开的地址。")
-
-    def _page_notify(self, msg: str) -> None:
-        """页面监护（渲染进程退出/白屏自动恢复）给用户的一句话。
-
-        托盘气泡是这里唯一不打断操作的形式——自动恢复本身已经做了恢复，
-        通知只是解释"刚才闪了一下/刷新了一下"是什么原因。
-        """
-        host_log("页面监护：%s" % msg)
-        tray = getattr(self, "tray", None)
-        if tray is not None and tray.isVisible():
-            try:
-                tray.showMessage("DSH 页面", msg)
-            except Exception:                                   # noqa: BLE001
-                pass
 
     # ------------------------------------------------------------- 内存采样
     #
@@ -1703,206 +481,19 @@ class MainWindow(QMainWindow):
 
     #: JS 侧内存探针：Chromium 的 `performance.memory` 是非标准接口，取不到就
     #: 只报 DOM 节点数。返回值必须是字符串——PySide6 对 object 一律给空串。
-    JS_MEM_PROBE = ("(function(){try{var m=performance.memory||{};"
-                    "return JSON.stringify({h:m.usedJSHeapSize||0,"
-                    "t:m.totalJSHeapSize||0,"
-                    "n:document.getElementsByTagName('*').length});}"
-                    "catch(e){return '';}})()")
 
-    def _start_mem_watch(self) -> None:
-        if not hasattr(procmem, "snapshot"):
-            return
-        if self._mem_timer is not None:
-            return
-        t = QTimer(self)
-        t.setInterval(MEM_SAMPLE_MS)
-        t.timeout.connect(self._mem_tick)
-        t.start()
-        self._mem_timer = t
 
-    def _mem_tick(self) -> None:
-        try:
-            snap = procmem.snapshot()
-        except Exception as e:                                 # noqa: BLE001
-            host_log("内存采样失败：%s: %s" % (type(e).__name__, e))
-            return
-        page = getattr(self, "page", None)   # __init__ 里到 _ensure_webview 之前还没有它
-        if page is None:
-            self._write_mem(snap, "")
-            return
-        try:
-            page.runJavaScript(
-                self.JS_MEM_PROBE,
-                lambda v: self._write_mem(snap, v))
-        except RuntimeError:
-            # 视图正在销毁/重建（换来源、迁移数据），这一轮就只记进程数据
-            self._write_mem(snap, "")
 
-    def _write_mem(self, snap: dict, js_raw) -> None:
-        series = procmem.summary_line_from(snap) if hasattr(
-            procmem, "summary_line_from") else ""
-        parts = [series] if series else []
-        data = dsh_devtools._as_json(js_raw) if isinstance(js_raw, str) else None
-        if isinstance(data, dict):
-            h = data.get("h") or 0
-            t = data.get("t") or 0
-            n = data.get("n")
-            if h:
-                parts.append("JS 堆 %.0f/%.0f MB"
-                             % (h / 1048576.0, t / 1048576.0))
-            if isinstance(n, int) and n >= 0:
-                parts.append("DOM %d 节点" % n)
-        web = (snap.get("groups") or {}).get("webengine") or {}
-        if (web.get("private") or 0) >= MEM_WEB_WARN_MB:
-            parts.append("网页进程已超过 %d MB，可「重新加载页面」释放"
-                         % MEM_WEB_WARN_MB)
-        line = "%s  %s" % (time.strftime("%Y-%m-%d %H:%M:%S"),
-                           " ｜ ".join(parts))
-        path = os.path.join(config.log_dir(), "mem.log")
-        try:
-            if os.path.isfile(path) and os.path.getsize(path) > MEM_LOG_MAX_BYTES:
-                # 只留最后一段：这份日志的价值在"最近几小时"
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
-                    tail = f.read().splitlines()[-400:]
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write("\n".join(tail) + "\n")
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-        except OSError:
-            pass
 
-    def _ask_download_path(self, suggested: str) -> str:
-        """网页要下载文件时问一句存哪。返回空串 = 用户取消。
 
-        为什么弹框而不是直接丢进"下载"文件夹：这是用户主动点的动作，
-        官方桌面端（Electron）的默认行为也是弹保存框；而且 DSH 导出的
-        session 包可能几十 MB，事后让人去翻文件夹找它不合适。
-        """
-        start_dir = QStandardPaths.writableLocation(
-            QStandardPaths.StandardLocation.DownloadLocation)
-        if not start_dir:
-            start_dir = os.path.expanduser("~")
-        path, _ = QFileDialog.getSaveFileName(
-            self, "保存下载文件", os.path.join(start_dir, suggested))
-        return path or ""
 
-    def _download_notify(self, msg: str) -> None:
-        """下载的开始 / 完成 / 失败各给一句话（托盘气泡，不打断操作）。"""
-        host_log("下载：%s" % msg)
-        tray = getattr(self, "tray", None)
-        if tray is not None and tray.isVisible():
-            try:
-                tray.showMessage("DSH 下载", msg,
-                                 QSystemTrayIcon.MessageIcon.Information, 4000)
-            except Exception:                                   # noqa: BLE001
-                pass
-
-    def _open_external_url(self, url):
-        """把页面里的异源链接交给系统默认浏览器。
-
-        为什么不自己开一个 QWebEngineView：那等于为一次点击再加 100~300MB
-        的渲染进程；系统浏览器本来就是为看网页存在的，还带用户自己的
-        登录态与扩展。老大明确要求优先走系统浏览器。
-
-        链接里的令牌一律打码后再进日志——日志会长期留在磁盘上。
-        """
-        qurl = url if isinstance(url, QUrl) else QUrl(str(url or ""))
-        shown = dsh_devtools.redact(qurl.toString())
-        if not QDesktopServices.openUrl(qurl):
-            host_log("系统浏览器未能打开：%s" % shown)
-            self._warn("链接没能交给系统浏览器：\n%s" % shown)
-        else:
-            host_log("外链交给系统浏览器：%s" % shown)
 
     # ------------------------------------------------------ 开发者模式
 
-    def _toggle_dev_mode(self, on: bool):
-        """开关开发者模式。
 
-        开：挂上网络记录，并直接打开 **Chromium 自带的开发者工具**
-            （Elements / Console / Network / Sources 全都在里面，老大明确要求用现成的）。
-        关：停止记录并收起我们自己那些窗口，但**不清空**已记录的内容（误关还能再看）。
-        """
-        config.set(dev_mode=bool(on))
-        self._apply_dev_mode(bool(on))
-        host_log("开发者模式 → %s" % ("开" if on else "关"))
-        if on:
-            self._open_inspector()
-        else:
-            for win in (self._inspector, self._devwin):
-                if win is not None:
-                    win.close()
 
-    def _apply_dev_mode(self, on: bool) -> None:
-        """按开关接线：控制台采集、请求拦截器、终端 fd 采集。
 
-        **关闭时必须真的停下来**，而不是"挂在那里但不记录"：
-        - 不接管 fd、不起读线程、不写 console.log（dsh_console.shutdown）；
-        - 不挂请求拦截器（挂上就代表每个请求都要回调进 Python）；
-        - 页面不再收集 console 消息。
-        这样"关闭开发者模式"在任务管理器里应当看不出差别。
 
-        不碰任何窗口：自测可以直接调它验证资源状态。
-        """
-        page = getattr(self, "page", None)
-        if page is not None:
-            page.set_capture_console(bool(on))
-        self.recorder.net_enabled = bool(on)
-
-        if on:
-            dsh_console.install()
-            if self.profile is not None and self.interceptor is not None:
-                self.profile.setUrlRequestInterceptor(self.interceptor)
-        else:
-            if self.profile is not None:
-                self.profile.setUrlRequestInterceptor(None)
-            dsh_console.shutdown()
-
-    def _open_inspector(self):
-        """打开 Chromium 开发者工具（窗口关闭即释放那个渲染实例）。"""
-        if self.view is None or getattr(self, "page", None) is None:
-            self._info("DSH 界面还没加载好，稍后再试。")
-            return
-        if self._inspector is not None:
-            self._inspector.show()
-            self._inspector.raise_()
-            self._inspector.activateWindow()
-            return
-        try:
-            self._inspector = dsh_devtools.InspectorWindow(
-                self.page, "dark" if self._theme_dark else "light")
-        except Exception as e:                                 # noqa: BLE001
-            self._inspector = None
-            host_log("开发者工具打不开：%s: %s" % (type(e).__name__, e))
-            self._warn("开发者工具打不开：%s: %s" % (type(e).__name__, e))
-            return
-        self._inspector.destroyed.connect(self._on_inspector_gone)
-        self._inspector.show()
-        self._inspector.raise_()
-        self._inspector.activateWindow()
-        host_log("已打开开发者工具（Chromium DevTools）")
-
-    def _on_inspector_gone(self, *_a):
-        self._inspector = None
-
-    def _open_dev_window(self):
-        """打开轻量日志窗口（只创建一次，之后是 show/raise）。
-
-        它是给"工具没开时也想回看报错"用的：控制台与请求记录**常开**，
-        而 DevTools 只能看到它自己打开之后的控制台。布局页只是坐标快照，
-        不要拿它替代 Elements。
-        """
-        if self.view is None or getattr(self, "page", None) is None:
-            self._info("DSH 界面还没加载好，稍后再试。")
-            return
-        if self._devwin is None:
-            self._devwin = dsh_devtools.DevWindow(
-                page=self.page, recorder=self.recorder,
-                theme="dark" if self._theme_dark else "light",
-                open_inspector=self._open_inspector)
-        self._devwin.show()
-        self._devwin.raise_()
-        self._devwin.activateWindow()
 
     # ---- 控制面板的适配层 ----
     #
@@ -1910,569 +501,41 @@ class MainWindow(QMainWindow):
     # **一律复用托盘那套既有方法**，不另写一份——否则两边行为迟早分叉。
     # 托盘菜单项虽然不再显示，但 QAction 还在，勾选/可用性状态依旧同步。
 
-    def _panel_flag(self, name: str) -> bool:
-        return {
-            "prerelease_opt_in": bool(config.get("prerelease_opt_in")),
-            "adaptive_titlebar": bool(config.get("adaptive_titlebar")),
-            "dev_mode": bool(config.get("dev_mode")),
-            "webengine_hw_accel": bool(config.get("webengine_hw_accel")),
-        }.get(name, False)
 
-    def _panel_set_flag(self, name: str, value: bool) -> None:
-        if name == "prerelease_opt_in":
-            self._toggle_prerelease(bool(value))
-        elif name == "adaptive_titlebar":
-            self._toggle_titlebar(bool(value))
-        elif name == "dev_mode":
-            self._toggle_dev_mode(bool(value))
-        elif name == "webengine_hw_accel":
-            # Chromium 只读一次 flags（在任何 PySide6 导入之前），所以只能
-            # 落盘 + 提示重启，运行中切换没有意义。
-            config.set(webengine_hw_accel=bool(value))
-            host_log("硬件加速渲染 → %s（重启应用后生效）"
-                     % ("开" if value else "关"))
 
     # ---------------------------------------------------- 页面重建（自愈）
 
-    def _reset_webview(self, manual: bool = False) -> None:
-        """换掉整个 Web 视图（ShellPage 兜底请求，或用户连按"重新加载"）。
 
-        必须**异步**：ShellPage 的调用点就在那个页对象的定时器槽里，同步
-        把它 deleteLater + 跑 DeferredDelete 等于在自己的调用栈上删自己。
-        排到下一轮事件循环再换。
-        """
-        if self._reset_pending:
-            return
-        self._reset_pending = True
-        QTimer.singleShot(0, self, lambda: self._reset_webview_now(manual))
-
-    def _reset_webview_now(self, manual: bool = False) -> None:
-        """销毁并重建 QWebEngineView / ShellPage，保留 profile 与登录态。
-
-        适用场景（2026-10-24 用户现场）：页面 DOM 正常、JS 心跳正常，但
-        Web 视图不再呈现任何帧——整窗透出下面垫着的加载页，原生 select
-        弹层还残留着；reload 无效，用户把窗口关到托盘再打开才恢复。
-        进程内等价手段就是换一个视图（= 新合成表面），再载回入口地址。
-        """
-        self._reset_pending = False
-        if self.handle is None or self.view is None:
-            return
-        now = time.monotonic()
-        self._surface_resets = [t for t in self._surface_resets
-                                if now - t < SURFACE_RESET_WINDOW_S]
-        # 用户主动连按"重新加载"不受自动重建的限流约束——那是明确意图，
-        # 而且 rate limit 的本意只是防自动循环。
-        if not manual and len(self._surface_resets) >= SURFACE_RESET_LIMIT:
-            # 同一轮异常里别每 45 秒弹一次托盘气泡
-            if now - getattr(self, "_reset_blocked_at", 0.0) > 600:
-                self._reset_blocked_at = now
-                host_log("页面重建：%d 秒内已重建 %d 次，停止自动重建"
-                         % (SURFACE_RESET_WINDOW_S, SURFACE_RESET_LIMIT))
-                self._page_notify("页面渲染持续异常，已暂停自动重建。请重启应用。")
-            return
-        self._surface_resets.append(now)
-        host_log("页面重建：销毁并重建 Web 视图（保留 profile 与登录态）")
-        old = self.view
-        self.view = None
-        self.page = None
-        # 这两个窗口缓存着旧 page，不关掉它们会握着已删对象
-        if getattr(self, "_devwin", None) is not None:
-            self._devwin.close()
-            self._devwin.deleteLater()
-            self._devwin = None
-        if getattr(self, "_inspector", None) is not None:
-            self._inspector.close()
-            self._inspector = None
-        if old is not None:
-            try:
-                self.stack.removeWidget(old)
-                old.deleteLater()
-            except RuntimeError:
-                pass
-        # 让旧视图/旧页面的延迟删除真正执行，别让旧合成表面继续挂着
-        QApplication.processEvents()
-        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
-        try:
-            self._ensure_webview()
-            if self.handle is not None and self.view is not None:
-                self.view.loadFinished.connect(
-                    self._on_view_loaded,
-                    Qt.ConnectionType.UniqueConnection)
-                self.view.load(QUrl(self.handle.url))
-        except Exception as e:                                 # noqa: BLE001
-            host_log("页面重建失败：%s: %s" % (type(e).__name__, e))
-            self._page_notify("页面重建失败：%s" % e)
 
     # ---------------------------------------------------- 运行方式与数据目录
 
-    def _drop_webview(self) -> None:
-        """释放 WebEngine 实例。
 
-        删/搬数据目录前**必须**先做这一步：Windows 上 WebEngine 进程会锁住
-        profile 目录里的缓存文件，不释放就删不掉、也复制不完整。
 
-        两个调试窗口也一起关掉（2026-10-20 体检）：`DevWindow` 与
-        `InspectorWindow` 都缓存着 `self.page`，视图没了它们就成了"握着已删对象"
-        的窗口——`_open_dev_window` 又只在 `_devwin is None` 时创建，于是
-        迁一次数据之后轻量日志窗口就永久坏了（点布局/环境页直接 RuntimeError）。
-        """
-        try:
-            if getattr(self, "_devwin", None) is not None:
-                self._devwin.close()
-                self._devwin.deleteLater()
-                self._devwin = None
-            if getattr(self, "_inspector", None) is not None:
-                self._inspector.close()      # WA_DeleteOnClose，会自己销毁
-                self._inspector = None
-            if self.view is not None:
-                self.stack.removeWidget(self.view)
-                self.view.deleteLater()
-                self.view = None
-                self.page = None
-            if self.profile is not None:
-                # 下载处理器挂在 profile 上，profile 释放后它也没有意义了
-                self.downloads = None
-                self.profile.deleteLater()
-                self.profile = None
-        except Exception:                                      # noqa: BLE001
-            pass
-        # `deleteLater()` 是异步的：`processEvents()` 在本地循环里**不处理**
-        # DeferredDelete，所以光靠它并不保证 profile 已经释放、目录句柄已经关掉。
-        # 显式把排队中的删除事件跑掉，后面的 rmtree/copytree 才不会撞上"文件被占用"。
-        QApplication.processEvents()
-        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
-    def _swap_service(self, note: str = "") -> None:
-        """按当前配置重启后台服务（来源 / 数据目录变了之后）。"""
-        if getattr(self, "_swapping", False):
-            self._info("正在重启服务，请稍候。")
-            return
-        self._swapping = True
-        self.stack.setCurrentIndex(0)
-        self._loading_busy(True)
-        self._set_tip("正在按新配置重启服务…")
-        w = ServiceSwapWorker(self.handle, config.service_log())
-        self._swap_worker = w
 
-        def done(ok: bool, detail: str, handle) -> None:
-            self._swapping = False
-            if ok and handle is not None:
-                if note:
-                    host_log(note)
-                self._on_ready(handle)
-            else:
-                host_log("重启服务失败：%s" % detail)
-                self._warn("服务没有起来：\n\n%s\n\n可到「状态检测」页查看详情。" % detail)
 
-        w.done.connect(done)
-        w.start()
 
-    def _run_data_task(self, task: str, title: str, headline: str, hint: str,
-                       **kw) -> tuple[bool, object]:
-        """起一个 DataTaskWorker，用模态进度窗等它跑完。
-
-        模态是刻意的：这期间主窗口不可操作，而底下的服务/WebEngine 已经被
-        我们停掉释放了——让用户还能点点点只会得到一堆"连不上"。
-        """
-        w = DataTaskWorker(task, None, **kw)
-        dlg = DataTaskDialog(self, title, headline, hint, w)
-        self._data_worker = w          # 持有引用，别让 GC 在 run() 中途收走
-        try:
-            w.start()
-            dlg.exec()
-            w.wait(5000)               # 兜底：线程活着退出会让 Qt abort
-        finally:
-            w.deleteLater()
-            self._data_worker = None
-        return dlg.ok, dlg.result_payload
-
-    def _switch_source(self, mode: str) -> None:
-        """切换 DSH 来源。私有未就绪时先复制一份现有安装。"""
-        if str(config.get("dsh_source") or "auto") == mode:
-            return
-        if mode == "private" and not provision.private_ready():
-            inst = self.handle.install if self.handle else None
-            if inst is None:
-                self._info("还没有可用的 DSH。先到「本机部署」准备运行环境。")
-                return
-            if not dsh_theme.MessageDialog.ask(
-                    self, "准备私有副本",
-                    "会在应用自己的数据目录里放一份 DSH（约 250 MB），"
-                    "与命令行里那份互不影响。\n\n"
-                    "现在把当前安装（%s）复制过去，通常几十秒。" % inst.version,
-                    "复制并启用", "取消"):
-                return
-            ok, payload = self._run_data_task(
-                "private", "准备私有副本",
-                "正在把 %s 复制到应用的数据目录。" % inst.version,
-                "约 250 MB、上千个文件。复制在后台进行，界面不会假死；"
-                "中途请不要关闭窗口——留下半个副本比没有更难收拾。",
-                install=inst)
-            if not ok:
-                self._warn("准备私有副本失败：\n\n%s"
-                           % ((payload or {}).get("error") or "详见日志"))
-                return
-        config.set(dsh_source=mode)
-        self._swap_service("运行方式切换为 %s" % mode)
-
-    def _migrate_data(self) -> None:
-        # 这里的 breakdown() 只为了弹窗里那句"共 N 个文件"；它带 3 秒预算，
-        # 不会像复制本身那样几十秒。真正的重活全在后台线程里。
-        info = storage.breakdown()
-        target = QFileDialog.getExistingDirectory(
-            self, "选择新的数据目录（建议空目录）", info["root"])
-        if not target:
-            return
-        if not dsh_theme.MessageDialog.ask(
-                self, "迁移数据目录",
-                "把数据从\n%s\n搬到\n%s\n\n"
-                "先停止后台服务，复制完成后自动重启。共 %d 个文件（%s）。"
-                % (info["root"], target, info["files"],
-                   storage.str_of_bytes(info["bytes"])),
-                "开始迁移", "取消"):
-            return
-        old = info["root"]
-        self._stop_service()
-        self._drop_webview()
-        ok, payload = self._run_data_task(
-            "migrate", "迁移数据目录",
-            "正在把数据复制到\n%s" % target,
-            "复制完成后会核对文件数，再清理旧目录。整个过程在后台进行，"
-            "界面不会再出现「未响应」。",
-            target=target, old=old)
-        if not ok:
-            err = (payload or {}).get("error") or "详见日志。原目录未被改动。"
-            self._warn("迁移失败：\n\n%s" % err)
-            self._swap_service()
-            return
-        new_root = (payload or {}).get("root") or target
-        self._swap_service("数据目录迁移到 %s" % new_root)
-        self._info("数据已搬到：\n%s\n\n旧目录里没有删干净的部分可以手动清理。"
-                   % new_root)
-
-    def _clear_cache(self) -> None:
-        info = storage.breakdown()
-        if not dsh_theme.MessageDialog.ask(
-                self, "清理缓存",
-                "删除浏览器缓存、日志与登录态（约 %s）。\n\n"
-                "设置和 DSH 安装不受影响；清理后需要重新登录 DSH。"
-                % storage.str_of_bytes(info["bytes"]),
-                "清理", "取消"):
-            return
-        self._stop_service()
-        self._drop_webview()
-        ok, payload = self._run_data_task(
-            "clear_cache", "清理缓存",
-            "正在删除浏览器缓存、日志与登录态。",
-            "删除在后台进行；完成后会自动重启服务，需要重新登录 DSH。")
-        if not ok:
-            self._warn("清理失败：\n\n%s" % ((payload or {}).get("error")
-                                            or "详见日志"))
-            self._swap_service()
-            return
-        p = payload or {}
-        self._swap_service("已清理缓存：%d 个文件（%s）"
-                           % (p.get("files", 0),
-                              storage.str_of_bytes(p.get("bytes", 0))))
-
-    def _clear_all(self) -> None:
-        info = storage.breakdown()
-        if not dsh_theme.MessageDialog.ask(
-                self, "清空全部数据",
-                f"删除{HOST_NAME}的全部数据（%s，%d 个文件）：设置、登录态、日志，"
-                "以及私有 DSH 安装。\n\n这个操作不可撤销。"
-                % (storage.str_of_bytes(info["bytes"]), info["files"]),
-                "全部清空", "取消"):
-            return
-        self._stop_service()
-        self._drop_webview()
-        ok, payload = self._run_data_task(
-            "clear_all", "清空全部数据",
-            f"正在删除{HOST_NAME}的全部数据。",
-            "删除在后台进行，完成后需要退出应用重新启动。")
-        if not ok:
-            self._warn("清空未完成：\n\n%s" % ((payload or {}).get("error")
-                                              or "详见日志"))
-            return
-        n = (payload or {}).get("files", 0)
-        self._warn("已清空全部数据（%d 个文件）。\n\n"
-                   "退出应用后重新启动，会回到首次运行的引导流程。" % n)
 
     # ----------------------------------------------------------- 远程会话
 
-    def _panel_remote_state(self) -> dict:
-        return dict(self._remote_state)
 
-    def _push_remote_state(self) -> None:
-        """把远程状态推给面板（面板没开过就什么都不做）。"""
-        panel = getattr(self, "_panel", None)
-        if panel is None:
-            return
-        try:
-            panel.refresh_remote()
-        except Exception as e:                                   # noqa: BLE001
-            host_log("刷新远程状态失败：%s: %s" % (type(e).__name__, e))
 
-    def _panel_remote_connect(self, host_obj) -> None:
-        """面板点了某台主机的「连接」。"""
-        worker = self._remote_worker
-        if worker is not None and worker.isRunning():
-            self._info("正在连接中，请稍候。")
-            return
-        if self._remote is not None:
-            # 换主机 = 先断旧的。断开要在后台做（可能要等远端进程退出），
-            # 但它有超时上限，这里同步等一小会儿可接受。
-            self._stop_remote()
-        self._remote_host = host_obj
-        self._remote_state = {"host_id": host_obj.id, "name": host_obj.name,
-                              "stage": "正在连接 SSH…", "connected": False,
-                              "error": ""}
-        self._push_remote_state()
 
-        # 远程与本地服务互斥：本地那份先停掉，否则两个 DSH 抢同一套界面状态，
-        # 状态栏、菜单、退出收尾全得分叉判断。停本地是秒级的，用户感觉不到。
-        if self.handle is not None and not getattr(self.handle, "remote", ""):
-            host_log("切换远程：先停本地服务")
-            try:
-                self._stop_service()
-            except Exception as e:                               # noqa: BLE001
-                host_log("停本地服务失败：%s: %s" % (type(e).__name__, e))
 
-        w = RemoteConnectWorker(host_obj)
-        w.stage.connect(self._on_remote_stage)
-        w.ready.connect(self._on_remote_ready)
-        w.failed.connect(self._on_remote_failed)
-        self._remote_worker = w
-        w.start()
 
-    def _on_remote_stage(self, text: str) -> None:
-        self._remote_state["stage"] = text
-        self._push_remote_state()
 
-    def _on_remote_ready(self, session, url: str) -> None:
-        host_obj = self._remote_host
-        self._remote = session
-        self._remote_state.update({"connected": True, "stage": "", "error": ""})
-        self._push_remote_state()
 
-        endpoint = getattr(session, "endpoint", None)
-        tunnel = getattr(session, "tunnel", None)
-        local_port = getattr(tunnel, "local_port", 0) or 0
-        name = host_obj.name if host_obj else "远程"
-        # 远端装的是哪个版本我们不知道，也不该猜。写"未知"是诚实的；
-        # 界面上"DSH 版本"那一行会显示它，而不是拿本地的版本号冒充。
-        inst = contract.DshInstall(node="", bin_js="", pkg_root="", prefix="",
-                                   npm_cli=None, version="未知",
-                                   source="远程 · %s" % name)
-        handle = ServiceHandle(
-            install=inst,
-            pid=int(getattr(endpoint, "pid", 0) or 0),
-            host="127.0.0.1", requested_port=local_port, port=local_port,
-            url=url, token=getattr(endpoint, "token", ""),
-            log_path=config.service_log(), started_at=time.time(),
-            remote=name)
-        host_log("远程会话就绪：%s · 远端端口 %s · 隧道端口 %s"
-                 % (name, getattr(endpoint, "port", "?"), local_port))
-        self._on_ready(handle)
 
-    def _on_remote_failed(self, kind: str, message: str) -> None:
-        self._remote_state.update({"connected": False, "stage": "",
-                                   "error": message})
-        self._push_remote_state()
-        hint = remote.KIND_HINTS.get(kind, "")
-        text = message if (not hint or hint in message) else (message + "\n\n" + hint)
-        host_log("远程连接失败（%s）：%s" % (kind, message.splitlines()[0][:120]))
-        self._warn("远程连接失败。\n\n" + text)
 
-    def _panel_remote_disconnect(self) -> None:
-        worker = self._remote_worker
-        if worker is not None and worker.isRunning():
-            self._info("正在连接中，暂时不能断开。")
-            return
-        self._stop_remote()
-
-    def _stop_remote(self, stop_remote_side: bool | None = None) -> None:
-        """收掉远程会话。
-
-        `stop_remote_side` 为 None 时交给主机自己的设置（保留/停止/每次询问），
-        其中"每次询问"在这里按**保留**处理——退出流程里不该弹窗拦人。
-        想"停掉远端"的交互必须由调用方明确传入 True。
-        """
-        session, self._remote = self._remote, None
-        if session is not None:
-            try:
-                session.close(stop_remote=stop_remote_side)
-                host_log("远程会话已断开")
-            except Exception as e:                               # noqa: BLE001
-                host_log("断开远程会话失败：%s: %s" % (type(e).__name__, e))
-        self._remote_host = None
-        self._remote_state = {}
-        self._push_remote_state()
-
-    def _panel_action(self, name: str) -> None:
-        if name == "check_update":
-            self._check_update(manual=True)
-        elif name == "go_stable":
-            self._go_stable()
-        elif name == "rollback":
-            self._rollback()
-        elif name == "provision":
-            self._prepare_env()
-        elif name == "reinstall_dsh":
-            self._reinstall_dsh()
-        elif name == "use_private":
-            self._switch_source("private")
-        elif name == "use_system":
-            self._switch_source("system")
-        elif name == "migrate_data":
-            self._migrate_data()
-        elif name == "clear_cache":
-            self._clear_cache()
-        elif name == "clear_all":
-            self._clear_all()
-        elif name == "open_devtools":
-            self._open_inspector()
-        elif name == "open_devlog":
-            self._open_dev_window()
-
-    def _toggle_titlebar(self, checked: bool):
-        """开关标题栏自适应配色。"""
-        config.set(adaptive_titlebar=bool(checked))
-        self.act_titlebar.setChecked(bool(checked))
-        host_log("标题栏跟随界面配色 → %s" % ("开" if checked else "关"))
-        if checked:
-            if not dwm.available():
-                self._info("当前系统不支持（需要 Windows 11）。")
-                return
-            # 立刻取一次，不然要等到下次启动才看到效果
-            self._sample_titlebar_color()
-        else:
-            dwm.reset(self)
-            # 标题栏交还系统了，图标也要跟着回到系统主题——
-            # 否则深色界面配白图标、浅色系统标题栏配白图标，又是一片糊。
-            self._set_theme_icon(dwm.system_uses_dark())
-        # 开关关闭时 _start_theme_watch 内部会停掉定时器
-        self._start_theme_watch()
 
     # ----------------------------------------------------------- 窗口行为
 
-    def _reload_page(self):
-        """把主视图重新加载回 DSH 首页。
 
-        刻意**不用** `view.reload()`：页面已经跑偏时（例如被 `window.open`
-        的 about:blank 顶掉），reload 只会把空白页再加载一遍。这里始终回到
-        handle 里那个带 token 的地址。
 
-        2026-10-20：登录流程把主窗口换成空白页，当时应用里没有任何刷新入口，
-        只能重启。这个入口就是为那次事故加的。
-        """
-        if not self.handle:
-            self._info("服务还没就绪，稍等一下再试。")
-            return
-        try:
-            now = time.monotonic()
-            self._manual_reloads = [t for t in self._manual_reloads
-                                    if now - t < MANUAL_RESET_WINDOW_S]
-            if self._manual_reloads:
-                # 第二次按：软重载试过了还是不行，直接换视图（一定有效）
-                host_log("手动重新加载：%d 秒内再次触发，改为重建 Web 视图"
-                         % MANUAL_RESET_WINDOW_S)
-                self._reset_webview(manual=True)
-                return
-            self._manual_reloads.append(now)
-            self._ensure_webview()
-            self.view.load(QUrl(self.handle.url))
-            self._show_webpage()
-            host_log("手动重新加载页面：%s"
-                     % str(self.handle.url).split("token=")[0])
-            # 2026-10-24：用户点"重新加载"往往就是因为页面已经白了。原生弹层
-            # 造成的停帧 update() 一次就恢复（实测），先轻后重。
-            try:
-                self.view.update()
-                QTimer.singleShot(300, self.view, self.view.repaint)
-                QTimer.singleShot(1200, self.view, self.view.update)
-            except RuntimeError:
-                pass
-        except Exception as e:                                 # noqa: BLE001
-            host_log("重新加载失败：%s: %s" % (type(e).__name__, e))
-
-    def _show_main(self):
-        self.showNormal()
-        self.raise_()
-        self.activateWindow()
-
-    def _quit(self):
-        """退出应用。
-
-        退出时**连带停止后台服务**——这是重构后的默认行为。
-
-        理由：「停止后台服务」与「退出」原本是两个菜单项，语义不同
-        （一个停服务留窗口、一个关窗口留服务），但用户点它们时的意图
-        几乎都是"我要结束这一切"。留两个入口只会让人犹豫点哪个。
-        现在只保留「退出」，并且它做的是"把这件事完整结束掉"。
-
-        代价：想在关掉窗口后继续跑 DSH 后台任务的人失去了入口。
-        对桌面壳的目标用户（用图形界面干活的人）这个代价可以接受——
-        真需要常驻服务的人本来就会用命令行。
-
-        远程连接进行中**拒绝退出**：`RemoteConnectWorker` 里的 SSH 调用是阻塞的
-        （远端冷启动最长 90 秒），把它丢下就退出，Qt 会因为线程还活着而 abort，
-        表现是"点了退出，程序直接消失，日志一段都没刷出来"。连接本身有超时上限，
-        等它结束只是一两分钟的事。
-        """
-        worker = self._remote_worker
-        if worker is not None and worker.isRunning():
-            self._info("正在建立远程连接，请等它结束再退出。\n\n"
-                       "（远端冷启动最多需要一两分钟，界面上有进度。）")
-            return
-        host_log("用户退出，连带停止后台服务")
-        # 先收尾面板的后台线程。线程在解释器退出时还活着会让 Qt 直接 abort，
-        # 而 abort 会丢掉未刷出的日志缓冲——那会让"退出"变成一件莫名其妙的事。
-        panel = getattr(self, "_panel", None)
-        if panel is not None:
-            try:
-                if not panel.shutdown():
-                    host_log("警告：面板的后台检测线程未在超时内结束")
-            except Exception as e:                               # noqa: BLE001
-                host_log("退出时收尾面板失败：%s: %s" % (type(e).__name__, e))
-        # 主窗口自己的后台任务同理，而且更危险：启动线程半路被丢下还会继续把
-        # 服务拉起来，于是退出后留下一个孤儿 node.exe（2026-10-20 体检补上）。
-        left = self._join_workers()
-        if left:
-            host_log("警告：后台任务未在超时内结束：%s" % "、".join(left))
-        try:
-            n = self._stop_service()
-            host_log("已停止后台服务（%d 个进程）" % n)
-        except Exception as e:                                   # noqa: BLE001
-            host_log("退出时停止服务失败：%s: %s" % (type(e).__name__, e))
-        self.tray.hide()
-        QApplication.quit()
 
     #: 退出时要等它收尾的后台任务（属性名）。面板自己的线程由 panel.shutdown() 管。
-    _WORKERS = ("starter", "_reverify", "_checker", "_host_checker",
-                "_swap_worker", "_data_worker", "_remote_worker")
 
-    def _join_workers(self, timeout_ms: int = 4000) -> list:
-        """等主窗口的后台线程收尾，返回超时没等到的属性名。
 
-        `wait()` 只等、不打断 `run()` 里的同步代码——这正是我们要的：
-        等服务探测/启动走到一个安全点，再把它停掉。总预算按线程数叠加，
-        实际退出路径上通常一个都不需要等。
-        """
-        left = []
-        for name in self._WORKERS:
-            w = getattr(self, name, None)
-            if w is not None and w.isRunning() and not w.wait(timeout_ms):
-                left.append(name)
-        return left
-
-    def closeEvent(self, event):
-        event.ignore()
-        self.hide()
-        if not self._tray_hint_shown:
-            self.tray.showMessage("DSH", "应用已最小化到托盘，后台服务仍在运行",
-                                  QSystemTrayIcon.MessageIcon.Information, 5000)
-            self._tray_hint_shown = True
 
 
 # ------------------------------------------------------------------ 单实例

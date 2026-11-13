@@ -1,6 +1,7 @@
 """面板与主窗口之间的窄接口，以及引导用的外部链接。"""
 from __future__ import annotations
 from .styles import *          # noqa: F401,F403
+from .widgets import CheckResult, STATE_BAD, STATE_OK, STATE_UNKNOWN, STATE_WARN  # noqa: F401
 
 import os
 import threading

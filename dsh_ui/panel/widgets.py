@@ -12,6 +12,8 @@ import threading
 import time
 from string import Template
 
+from shiboken6 import isValid
+
 from PySide6.QtCore import (QAbstractAnimation, QEvent, Property, QEasingCurve,
                             QPointF, QPropertyAnimation, QRectF, QSize, Qt,
                             QThread, QTimer, QUrl, Signal)
@@ -544,6 +546,8 @@ class CheckResult:
         self.key, self.name, self.value, self.state, self.hint = \
             key, name, value, state, hint
 
+_valid = isValid
+
 _HINT_WATCH = {int(QEvent.Type.Resize), int(QEvent.Type.Show)}
 
 
@@ -648,11 +652,15 @@ class ScrollHint(QWidget):
             self.setVisible(True)
 
     def eventFilter(self, obj, ev) -> bool:                        # noqa: N802
-        # 整数比较，理由同 `dsh_ui/web/page.py` 的 PopupRepaintGuard：
-        # `ev.type()` 与枚举成员比较会走 PySide6 的隐式转换，遇到未知事件值
-        # 会抛异常，而 eventFilter 里的异常最终只会变成一条看不懂的 SystemError。
-        if int(ev.type()) in _HINT_WATCH:
-            self._sync()
+        # 整数比较 + 有效性判断，理由同 `dsh_ui/web/page.py` 的 PopupRepaintGuard。
+        # 这里的过滤器挂在 viewport 上，窗口销毁阶段仍可能收到事件。
+        if not _valid(self) or not _valid(obj):
+            return False
+        try:
+            if int(ev.type()) in _HINT_WATCH:
+                self._sync()
+        except (RuntimeError, AttributeError, TypeError, SystemError):
+            return False
         return False
 
     def paintEvent(self, _e) -> None:                              # noqa: N802

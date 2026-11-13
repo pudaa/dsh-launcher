@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 from dsh_ui.web.recorder import *     # noqa: F401,F403
+from dsh_ui.web.recorder import _as_json  # noqa: F401  (主窗口直接取用)
 from dsh_ui.web.page import *         # noqa: F401,F403
 from dsh_ui.web.downloads import *    # noqa: F401,F403
 from dsh_ui.devtools.window import *  # noqa: F401,F403

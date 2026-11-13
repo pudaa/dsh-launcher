@@ -1,6 +1,7 @@
 """WebEngine 页面子类、弹层补帧守卫、外链与剪贴板策略。"""
 from __future__ import annotations
 from .recorder import *          # noqa: F401,F403
+from .recorder import _as_json   # noqa: F401  (import * 不带下划线名)
 
 import html
 import json
@@ -10,6 +11,8 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+
+from shiboken6 import isValid
 
 from PySide6.QtCore import (QEvent, QObject, QRegularExpression, Qt, QTimer,
                              QUrl)
@@ -527,6 +530,8 @@ class ShellPage(QWebEnginePage):
             pass
 
 #: 需要补帧的事件类型（整数形式，见 eventFilter 里的说明）。
+_valid = isValid
+
 _POPUP_WATCH = {
     int(QEvent.Type.Show), int(QEvent.Type.Hide), int(QEvent.Type.Close),
     int(QEvent.Type.WindowActivate), int(QEvent.Type.WindowDeactivate),
@@ -557,34 +562,33 @@ class PopupRepaintGuard(QObject):
             app.installEventFilter(self)
 
     def eventFilter(self, obj, ev):                       # noqa: N802
-        # **按整数比较，不要直接和 QEvent.Type 成员比。**
-        # `ev.type()` 在 PySide6 里可能与枚举做隐式转换；一旦遇到枚举表里没有的
-        # 事件值（Qt 新增的事件类型、第三方控件自定义事件），转换会抛异常，
-        # 而这个异常发生在 C++ 的 eventFilter 回调里、又会因为 stderr 已失效
-        # 而变成一条 "EnumType.__call__ returned a result with an exception set"
-        # + "lost sys.stderr" 的无头报错（2026-11-13 老大真机遇到）。
-        # 先转成 int 就绕开了整条转换路径。
-        t = int(ev.type())
-        if t in _POPUP_WATCH:
-            try:
-                if not obj.isWindow():
-                    return False
-                # 注意：Qt.WindowType 不是位标志！Popup 的值本身含 Window 位
-                # （Popup = 0x9），所以 windowType() & Popup 对**所有顶层窗口**
-                # 都为真。必须用 WindowType_Mask 先取窗口类别再比较。
-                # 同样按整数算：`windowType()` 返回值与枚举做 & / != 都会走
-                # PySide6 的转换路径，没有必要去冒那个险。
-                kind = int(obj.windowType()) & int(Qt.WindowType.WindowType_Mask)
-                if kind != int(Qt.WindowType.Popup):
-                    return False
-            except (RuntimeError, AttributeError):
+        # 这个过滤器装在 **QApplication** 上，会收到全进程的事件——包括解释器
+        # 退出阶段（atexit 里 Qt 对象已半销毁、事件还在投递）的那些。
+        # 那种时候 `ev.type()` 会在失效对象上炸掉，而异常发生在 C++ 回调里，
+        # PySide6 只能打一条 "EnumType.__call__ returned a result with an
+        # exception set" + "lost sys.stderr"，还带 14 层递归（打印本身又触发
+        # 事件）——2026-11-13 老大真机反复看到的就是它。
+        # 两道防线：先判对象有效，再整体兜住任何异常，一律当作"不处理"。
+        if not _valid(self) or not _valid(obj):
+            return False
+        try:
+            if int(ev.type()) not in _POPUP_WATCH:
                 return False
-            # 实测（delay=0，probe_popup_run.py --scenario popup-hook）：
-            # 在 Show 的同一拍补一帧就足以让「停帧」根本不发生；再补两拍
-            # 吸收弹层尺寸确定、关闭后的重排。
-            self._schedule(0)
-            self._schedule(60)
-            self._schedule(260)
+            if not obj.isWindow():
+                return False
+            # 同样按整数算：`windowType()` 与枚举做 & / != 都会走 PySide6 的
+            # 转换路径，没有必要去冒那个险。
+            kind = int(obj.windowType()) & int(Qt.WindowType.WindowType_Mask)
+            if kind != int(Qt.WindowType.Popup):
+                return False
+        except (RuntimeError, AttributeError, TypeError, SystemError):
+            return False
+        # 实测（delay=0，probe_popup_run.py --scenario popup-hook）：
+        # 在 Show 的同一拍补一帧就足以让「停帧」根本不发生；再补两拍
+        # 吸收弹层尺寸确定、关闭后的重排。
+        self._schedule(0)
+        self._schedule(60)
+        self._schedule(260)
         return False
 
     def _schedule(self, delay_ms: int) -> None:
