@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="docs/images/hero-banner.webp" alt="鲸坞：深色背景上的产品名与一句话定位——DeepSeek Harness 的桌面客户端" width="100%">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/hero-banner.webp">
+    <img src="docs/images/hero-banner-light.webp" alt="鲸坞：DeepSeek Harness 的桌面客户端" width="100%">
+  </picture>
 </p>
 
 <p align="center">
@@ -109,13 +112,16 @@ GitHub Actions 会运行自测、构建 exe、创建 Release。工作流校验 t
 
 ## 界面
 
-截图都是真实窗口，不是效果图。背景与标题由本地模型生成，配色取自 DSH 官方的设计令牌
-（深色底 `#151517`、强调色 `#679efe`）。
+截图都是真实窗口，不是效果图。背景与标题由本地模型生成，配色取自 DSH 官方的设计令牌——
+浅色底 `#ffffff` / `#4176e6`，深色底 `#151517` / `#679efe`。页面随系统明暗自动切换配图。
 
 ### 主界面
 
 <p align="center">
-  <img src="docs/images/card-main.webp" alt="主窗口：左侧图标栏，中间是「探索未至之境」与输入框，标题栏是本程序的" width="100%">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/card-main.webp">
+    <img src="docs/images/card-main-light.webp" alt="主窗口：左侧图标栏，中间是「探索未至之境」与输入框" width="100%">
+  </picture>
 </p>
 
 一个原生窗口，里面就是完整的 DSH。没有地址栏、没有标签页，也不需要先开浏览器。
@@ -123,7 +129,10 @@ GitHub Actions 会运行自测、构建 exe、创建 Release。工作流校验 t
 ### 控制面板 · 概览
 
 <p align="center">
-  <img src="docs/images/card-overview.webp" alt="控制面板概览页：版本与来源、后台服务状态、按进程树归拢的内存占用" width="100%">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/card-overview.webp">
+    <img src="docs/images/card-overview-light.webp" alt="控制面板概览页：版本与来源、后台服务状态、按进程树归拢的内存占用" width="100%">
+  </picture>
 </p>
 
 三块内容按"最常问的问题"排：
@@ -138,7 +147,10 @@ GitHub Actions 会运行自测、构建 exe、创建 Release。工作流校验 t
 ### 控制面板 · 运行方式
 
 <p align="center">
-  <img src="docs/images/card-runmode.webp" alt="控制面板运行方式页：私有安装与命令行共用两种模式，以及远程主机列表" width="100%">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/card-runmode.webp">
+    <img src="docs/images/card-runmode-light.webp" alt="控制面板运行方式页：私有安装与命令行共用两种模式，以及远程主机列表" width="100%">
+  </picture>
 </p>
 
 - **私有安装** 与命令行那份互不影响：升级只动它，不会因为终端里的 `npm` 操作变成

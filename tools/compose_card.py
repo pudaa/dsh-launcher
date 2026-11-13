@@ -29,7 +29,7 @@ _APP = None
 
 def compose(bg_path: str, shot_path: str, out_path: str,
             top_ratio: float = 0.185, side_ratio: float = 0.075,
-            bottom_ratio: float = 0.035) -> None:
+            bottom_ratio: float = 0.035, light: bool = False) -> None:
     global _APP
     if QGuiApplication.instance() is None:
         _APP = QGuiApplication(sys.argv[:1])
@@ -60,12 +60,25 @@ def compose(bg_path: str, shot_path: str, out_path: str,
     p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
 
     # 一圈柔和的外发光，让浅色窗口从深色背景里"浮"起来
-    # 发光弱一点：太亮会像霓虹灯，只是让浅色窗口和深色背景有过渡就够了
-    for i in range(14, 0, -1):
-        alpha = int(4 + (14 - i) * 1)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(103, 158, 254, alpha))
-        p.drawRoundedRect(QRectF(x - i, y - i, sw + i * 2, sh + i * 2), 14 + i, 14 + i)
+    # 两种底子需要不同的"浮起"手段：
+    #   · 深色底：浅色窗口本身对比足够，一层极淡的蓝光就够，且呼应强调色；
+    #   · 浅色底：白窗口在白背景上没有边界，必须靠**灰色投影**拉开层次，
+    #     否则整张图会糊成一片（这是深色版的做法直接套过来最容易翻车的地方）。
+    p.setPen(Qt.PenStyle.NoPen)
+    if light:
+        # 用官方浅色主题的强调色 #4176e6 做一层很淡的光晕，而不是灰影。
+        # 灰影在近白背景上会显得脏，而且和整套配色不属于同一个色系；
+        # 淡蓝既能把白窗口的边界托出来，又和背景边缘的那几条蓝线呼应。
+        for i in range(16, 0, -1):
+            alpha = int(2 + (16 - i) * 1)
+            p.setBrush(QColor(65, 118, 230, alpha))
+            p.drawRoundedRect(QRectF(x - i, y - i, sw + i * 2, sh + i * 2),
+                              14 + i, 14 + i)
+    else:
+        for i in range(14, 0, -1):
+            alpha = int(4 + (14 - i) * 1)
+            p.setBrush(QColor(103, 158, 254, alpha))
+            p.drawRoundedRect(QRectF(x - i, y - i, sw + i * 2, sh + i * 2), 14 + i, 14 + i)
 
     path = QPainterPath()
     path.addRoundedRect(QRectF(x, y, sw, sh), 14, 14)
@@ -73,7 +86,7 @@ def compose(bg_path: str, shot_path: str, out_path: str,
     p.setClipPath(path)
     p.drawImage(x, y, shot)
     p.restore()
-    p.setPen(QPen(QColor(255, 255, 255, 38), 1))
+    p.setPen(QPen(QColor(15, 23, 42, 46) if light else QColor(255, 255, 255, 38), 1))
     p.setBrush(Qt.BrushStyle.NoBrush)
     p.drawRoundedRect(QRectF(x, y, sw, sh), 14, 14)
 
@@ -85,5 +98,5 @@ def compose(bg_path: str, shot_path: str, out_path: str,
 if __name__ == "__main__":
     a = sys.argv[1:]
     if len(a) < 3:
-        raise SystemExit("用法：compose_card.py <bg.png> <shot.png> <out.png>")
-    compose(a[0], a[1], a[2])
+        raise SystemExit("用法：compose_card.py <bg> <shot> <out> [light]")
+    compose(a[0], a[1], a[2], light=(len(a) > 3 and a[3] == "light"))
