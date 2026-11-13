@@ -29,12 +29,12 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup,
                                QWidget)
 
 
-import dsh_console
+from dsh_ui import console as dsh_console
 from dsh_host import config, procmem
 from dsh_host.logutil import host_log
 # 字体与调色板是面板那套设计令牌，开发者窗口沿用同一个来源，
 # 免得两个窗口的等宽字体各写各的。
-from dsh_panel import FONT, palette
+from dsh_ui.panel import FONT, palette
 
 
 
@@ -44,6 +44,13 @@ from dsh_panel import FONT, palette
 
 
 
+
+
+LEVEL_NAMES = {
+    QWebEnginePage.JavaScriptConsoleMessageLevel.InfoMessageLevel: "info",
+    QWebEnginePage.JavaScriptConsoleMessageLevel.WarningMessageLevel: "warning",
+    QWebEnginePage.JavaScriptConsoleMessageLevel.ErrorMessageLevel: "error",
+}
 
 
 def _mono() -> str:

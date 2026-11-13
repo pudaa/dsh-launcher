@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (QComboBox, QDialog, QFrame,
                                QSizePolicy, QStackedWidget, QToolButton,
                                QVBoxLayout, QWidget)
 
-import dsh_icons as icons
+from dsh_ui import icons
 from dsh_host import (compat, config, contract, dwm, netenv, procmem, provision,
                       remote, storage, updater)
 from dsh_host.logutil import host_log
@@ -87,6 +87,64 @@ class PanelHost:
 
     def set_flag(self, name: str, value: bool) -> None:
         self._set_flag(name, bool(value))
+
+def local_checks(host: "PanelHost") -> list[CheckResult]:
+    """本机可立即得出的检测项——**不联网**，所以可以自动跑。"""
+    out: list[CheckResult] = []
+    inst = host.install()
+
+    node = (inst.node if inst else None) or contract.find_node()
+    if node:
+        rc, ver, _ = contract.run_capture([node, "--version"], timeout=20)
+        txt = ver.strip().splitlines()[0] if rc == 0 and ver.strip() else "无法读取版本"
+        out.append(CheckResult("node", "Node.js 运行环境", txt,
+                               STATE_OK if rc == 0 else STATE_WARN, node))
+    else:
+        out.append(CheckResult("node", "Node.js 运行环境", "未安装", STATE_BAD,
+                               "DSH 需要 Node.js 才能运行。可到「本机部署」查看怎么装。"))
+
+    if inst and inst.npm_cli:
+        out.append(CheckResult("npm", "npm 包管理器", "就绪", STATE_OK, inst.npm_cli))
+    else:
+        out.append(CheckResult("npm", "npm 包管理器", "未找到", STATE_WARN,
+                               "更新 DSH 需要 npm。"))
+
+    if inst:
+        out.append(CheckResult("dsh", "DeepSeek Harness",
+                               f"{inst.version} · {inst.source}", STATE_OK,
+                               inst.pkg_root))
+    else:
+        out.append(CheckResult("dsh", "DeepSeek Harness", "未安装", STATE_BAD,
+                               "可到「本机部署」查看怎么装。"))
+
+    home = contract.resolve_home()
+    if home and os.path.isdir(home):
+        fp = contract.home_fingerprint(home)
+        out.append(CheckResult(
+            "home", "用户数据目录",
+            ("（内容较多，未全部统计）" if fp.truncated else fp.describe()),
+            STATE_OK, home))
+        writable = os.access(home, os.W_OK)
+        out.append(CheckResult("home_w", "数据目录可写",
+                               "可写" if writable else "不可写",
+                               STATE_OK if writable else STATE_BAD,
+                               "会话记录与登录状态存在这里"))
+    else:
+        out.append(CheckResult("home", "用户数据目录", home or "未定位",
+                               STATE_WARN, "首次启动 DSH 时才会创建"))
+        out.append(CheckResult("home_w", "数据目录可写", "未检测", STATE_UNKNOWN))
+
+    h = host.handle()
+    if h and h.port:
+        alive = contract.tcp_open(h.host or "127.0.0.1", h.port, timeout=1.0)
+        out.append(CheckResult("svc", "后台服务",
+                               f"运行中 · 端口 {h.port}" if alive else "已停止",
+                               STATE_OK if alive else STATE_WARN, h.url or ""))
+    else:
+        out.append(CheckResult("svc", "后台服务", "未启动", STATE_WARN,
+                               "打开主窗口会自动启动"))
+    return out
+
 
 def guide_links() -> dict:
     """引导用的网址与命令。

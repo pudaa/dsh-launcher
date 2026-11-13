@@ -13,7 +13,7 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (QDialog, QHBoxLayout, QLabel, QPlainTextEdit,
                                QProgressBar, QPushButton, QVBoxLayout, QWidget)
 
-import dsh_theme
+from dsh_ui import theme as dsh_theme
 from dsh_host import config, contract, provision, selfupdate, updater
 from dsh_host.logutil import host_log
 from dsh_host.version import HOST_NAME, HOST_VERSION

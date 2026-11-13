@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (QComboBox, QDialog, QFrame,
                                QSizePolicy, QStackedWidget, QToolButton,
                                QVBoxLayout, QWidget)
 
-import dsh_icons as icons
+from dsh_ui import icons
 from dsh_host import (compat, config, contract, dwm, netenv, procmem, provision,
                       remote, storage, updater)
 from dsh_host.logutil import host_log
@@ -501,7 +501,7 @@ class RemoteHostDialog(QDialog):
 
         # dsh_theme 反过来 import 了本模块（它要用 FONT 和 palette），
         # 所以这里只能延迟导入——模块级导入会成环。
-        from dsh_theme import style_dialog
+        from dsh_ui.theme import style_dialog
         style_dialog(self, pal)
 
     def _pick_alias(self, index: int) -> None:
@@ -543,6 +543,9 @@ class CheckResult:
                  state: str = STATE_UNKNOWN, hint: str = ""):
         self.key, self.name, self.value, self.state, self.hint = \
             key, name, value, state, hint
+
+_HINT_WATCH = {int(QEvent.Type.Resize), int(QEvent.Type.Show)}
+
 
 class ScrollHint(QWidget):
     """浮动滚动指示条。
@@ -645,7 +648,10 @@ class ScrollHint(QWidget):
             self.setVisible(True)
 
     def eventFilter(self, obj, ev) -> bool:                        # noqa: N802
-        if ev.type() in (QEvent.Type.Resize, QEvent.Type.Show):
+        # 整数比较，理由同 `dsh_ui/web/page.py` 的 PopupRepaintGuard：
+        # `ev.type()` 与枚举成员比较会走 PySide6 的隐式转换，遇到未知事件值
+        # 会抛异常，而 eventFilter 里的异常最终只会变成一条看不懂的 SystemError。
+        if int(ev.type()) in _HINT_WATCH:
             self._sync()
         return False
 

@@ -108,10 +108,10 @@ from PySide6.QtWidgets import (
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEngineProfile
 
-import dsh_console
-import dsh_devtools
-import dsh_panel
-import dsh_theme
+from dsh_ui import console as dsh_console
+from dsh_ui import devtools as dsh_devtools
+from dsh_ui import panel as dsh_panel
+from dsh_ui import theme as dsh_theme
 import dsh_ui.dialogs
 import dsh_ui.workers
 from dsh_host import (config, contract, dwm, lifecycle, procmem, provision,
@@ -261,7 +261,7 @@ def resource_report() -> tuple[str, bool]:
     # 资源树里有没有 SVG 文件是看不出来的（我们本来就不读文件），所以只能
     # **真的渲染一个图标**来验。
     try:
-        import dsh_icons
+        from dsh_ui import icons as dsh_icons
         probe_name = "circle-check"
         ratio = dsh_icons.ink_ratio(probe_name, 48, "#ffffff")
         good = 0.02 < ratio < 0.60

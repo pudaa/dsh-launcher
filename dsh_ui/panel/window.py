@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (QComboBox, QDialog, QFrame,
                                QSizePolicy, QStackedWidget, QToolButton,
                                QVBoxLayout, QWidget)
 
-import dsh_icons as icons
+from dsh_ui import icons
 from dsh_host import (compat, config, contract, dwm, netenv, procmem, provision,
                       remote, storage, updater)
 from dsh_host.logutil import host_log

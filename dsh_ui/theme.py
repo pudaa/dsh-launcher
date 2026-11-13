@@ -29,9 +29,9 @@ from PySide6.QtWidgets import (QDialog, QFrame, QGraphicsDropShadowEffect,
                                QHBoxLayout, QLabel, QMenu, QPushButton,
                                QTextBrowser, QVBoxLayout, QWidget)
 
-import dsh_icons as icons
+from dsh_ui import icons
 from dsh_host import config
-from dsh_panel import FONT, palette
+from dsh_ui.panel.styles import FONT, palette
 
 #: 字号阶梯（px）。取自官方组件里出现频率最高的几档：
 #: 14/22 用于设置项与正文标题，13 用于常规正文，12/18 用于说明文字，11 用于角标。

@@ -464,7 +464,7 @@ def host_update_checks() -> list[str]:
     #     这里同时钉两头：控件要有自己的追加方法，两个对话框里不许再出现旧方法名。
     import inspect
 
-    import dsh_theme
+    from dsh_ui import theme as dsh_theme
     leaks = [cls.__name__ for cls in (g.UpdateDialog, g.HostUpdateDialog)
              if "appendPlainText" in inspect.getsource(cls)]
     probe = dsh_theme.NotesView()
@@ -493,7 +493,7 @@ def host_update_checks() -> list[str]:
               f"  closeEvent={hasattr(getattr(g, 'ReinstallDialog', None), 'closeEvent')}"
               f"  动作接线={'reinstall_dsh' in inspect.getsource(g.MainWindow._panel_action)}")
 
-    import dsh_devtools as _dt
+    from dsh_ui import devtools as _dt
     from PySide6.QtCore import QUrl as _QUrl
     from PySide6.QtWebEngineCore import (QWebEnginePage as _WEP,
                                          QWebEngineProfile as _QWEP)
@@ -1123,8 +1123,8 @@ def theme_checks() -> list[str]:
         if not ok:
             failures.append(name)
 
-    import dsh_panel
-    import dsh_theme
+    from dsh_ui import panel as dsh_panel
+    from dsh_ui import theme as dsh_theme
     from PySide6.QtWidgets import (QGraphicsDropShadowEffect, QMenu,
                                    QMessageBox)
 
@@ -1277,7 +1277,7 @@ def popup_repaint_checks() -> list[str]:
         if not ok:
             failures.append(name)
 
-    import dsh_devtools
+    from dsh_ui import devtools as dsh_devtools
     from PySide6.QtCore import QEvent
     from PySide6.QtWidgets import QLabel, QMenu
     from PySide6.QtTest import QTest
@@ -1329,10 +1329,9 @@ def terminal_checks() -> list[str]:
         if not ok:
             failures.append(name)
 
-    import dsh_console
-    import dsh_devtools
-    import dsh_theme
-
+    from dsh_ui import console as dsh_console
+    from dsh_ui import devtools as dsh_devtools
+    from dsh_ui import theme as dsh_theme
     buf = dsh_console.ConsoleBuffer()
     buf.append_text("INFO 启动完成\n")
     buf.append_text("[ERROR:CONSOLE(1)] boom 失败\n")
@@ -1411,16 +1410,17 @@ def health_checks() -> list:
                         chunks.append(fh.read())
         return "\n".join(chunks)
 
+    # 2026-11-13：根目录只剩下入口一个 .py，其余都进了 dsh_ui 包，
+    # 源码断言改成按包读取（同一天早些时候踩过"拆分后断言静默失效"）。
     gui = read("dsh_gui_qt.py") + "\n" + read_pkg(
         "dsh_ui", skip=("panel", "web", "devtools"))
-    panel = read("dsh_panel.py") + "\n" + read_pkg(os.path.join("dsh_ui", "panel"))
-    dev = (read("dsh_devtools.py")
-           + "\n" + read_pkg(os.path.join("dsh_ui", "web"))
+    panel = read_pkg(os.path.join("dsh_ui", "panel"))
+    dev = (read_pkg(os.path.join("dsh_ui", "web"))
            + "\n" + read_pkg(os.path.join("dsh_ui", "devtools")))
-    console = read("dsh_console.py")
+    console = read(os.path.join("dsh_ui", "console.py"))
     storage = read(os.path.join("dsh_host", "storage.py"))
     procmem_src = read(os.path.join("dsh_host", "procmem.py"))
-    theme = read("dsh_theme.py")
+    theme = read(os.path.join("dsh_ui", "theme.py"))
 
     # ① 关掉最后一个窗口不能退出进程（否则绕过 _quit，服务变孤儿）
     check("关窗口不退出进程（退出只走 _quit）",
@@ -1635,7 +1635,7 @@ def main() -> int:
     print()
 
     print("== 控制面板（无边框固定尺寸 / 图标 / 页签 / 像素级底色）==")
-    import dsh_panel
+    from dsh_ui import panel as dsh_panel
     state["panel_failures"] = dsh_panel.selftest_checks()
     print()
 
@@ -1644,12 +1644,12 @@ def main() -> int:
     print()
 
     print("== 开发者模式（外链出口策略 / 记录器）==")
-    import dsh_devtools
+    from dsh_ui import devtools as dsh_devtools
     state["devtools_failures"] = dsh_devtools.selftest_checks()
     print()
 
     print("== 终端输出采集（切行 / 环形 / 打码）==")
-    import dsh_console
+    from dsh_ui import console as dsh_console
     state["console_failures"] = dsh_console.selftest_checks()
     print()
 
@@ -1756,7 +1756,7 @@ def main() -> int:
 
         # --- 资源纪律：开发者模式关闭时不该有任何采集在跑 ---
         # 老大的硬要求："没启用就不该占资源"。这里逐项验证接线而不是"标志位"。
-        import dsh_console
+        from dsh_ui import console as dsh_console
         from PySide6.QtWebEngineCore import QWebEnginePage as _Page
 
         err_lvl = _Page.JavaScriptConsoleMessageLevel.ErrorMessageLevel

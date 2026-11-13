@@ -28,12 +28,12 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup,
                                QWidget)
 
 
-import dsh_console
+from dsh_ui import console as dsh_console
 from dsh_host import config, procmem
 from dsh_host.logutil import host_log
 # 字体与调色板是面板那套设计令牌，开发者窗口沿用同一个来源，
 # 免得两个窗口的等宽字体各写各的。
-from dsh_panel import FONT, palette
+from dsh_ui.panel import FONT, palette
 
 
 WATCHDOG_INTERVAL_MS = 15000
@@ -526,6 +526,13 @@ class ShellPage(QWebEnginePage):
         except Exception:                                      # noqa: BLE001
             pass
 
+#: 需要补帧的事件类型（整数形式，见 eventFilter 里的说明）。
+_POPUP_WATCH = {
+    int(QEvent.Type.Show), int(QEvent.Type.Hide), int(QEvent.Type.Close),
+    int(QEvent.Type.WindowActivate), int(QEvent.Type.WindowDeactivate),
+}
+
+
 class PopupRepaintGuard(QObject):
     """原生弹层出现/消失时，给 Web 视图补一帧。
 
@@ -550,17 +557,25 @@ class PopupRepaintGuard(QObject):
             app.installEventFilter(self)
 
     def eventFilter(self, obj, ev):                       # noqa: N802
-        t = ev.type()
-        if t in (QEvent.Type.Show, QEvent.Type.Hide, QEvent.Type.Close,
-                 QEvent.Type.WindowActivate, QEvent.Type.WindowDeactivate):
+        # **按整数比较，不要直接和 QEvent.Type 成员比。**
+        # `ev.type()` 在 PySide6 里可能与枚举做隐式转换；一旦遇到枚举表里没有的
+        # 事件值（Qt 新增的事件类型、第三方控件自定义事件），转换会抛异常，
+        # 而这个异常发生在 C++ 的 eventFilter 回调里、又会因为 stderr 已失效
+        # 而变成一条 "EnumType.__call__ returned a result with an exception set"
+        # + "lost sys.stderr" 的无头报错（2026-11-13 老大真机遇到）。
+        # 先转成 int 就绕开了整条转换路径。
+        t = int(ev.type())
+        if t in _POPUP_WATCH:
             try:
                 if not obj.isWindow():
                     return False
                 # 注意：Qt.WindowType 不是位标志！Popup 的值本身含 Window 位
                 # （Popup = 0x9），所以 windowType() & Popup 对**所有顶层窗口**
                 # 都为真。必须用 WindowType_Mask 先取窗口类别再比较。
-                kind = obj.windowType() & Qt.WindowType.WindowType_Mask
-                if kind != Qt.WindowType.Popup:
+                # 同样按整数算：`windowType()` 返回值与枚举做 & / != 都会走
+                # PySide6 的转换路径，没有必要去冒那个险。
+                kind = int(obj.windowType()) & int(Qt.WindowType.WindowType_Mask)
+                if kind != int(Qt.WindowType.Popup):
                     return False
             except (RuntimeError, AttributeError):
                 return False
