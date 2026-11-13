@@ -678,6 +678,31 @@ def main() -> int:
     win._singleton_server = server
     holder.append(win)
     win.show()
+
+    # 终端里跑（源码调试）时，Ctrl+C 要走**同一条退出流程**，不能让它打断事件循环。
+    #
+    # 为什么（2026-11-13 老大踩到）：Ctrl+C 会在主线程抛 KeyboardInterrupt，
+    # 而那时解释器往往正在执行某个 C++ 回调（例如事件过滤器）。结果是：
+    #   ① 终端里冒出一条「eventFilter 里的 KeyboardInterrupt」——看起来像代码出错；
+    #   ② 事件循环被硬中断，`_quit()` 不执行 → 后台服务不停，留下孤儿 node 进程，
+    #      下次启动还会 attach 到它身上。
+    # 走 `_quit()` 就和点托盘「退出」完全一致：收面板线程、等后台任务、停服务。
+    #
+    # Qt 的事件循环在 C++ 里转，Python 的信号处理器只有在解释器拿到执行权时才跑，
+    # 所以挂一个空转定时器定期把控制权交回来——这是 PySide6 里接 SIGINT 的标准做法。
+    def _on_sigint(*_args):
+        host_log("收到 Ctrl+C，按正常流程退出")
+        QTimer.singleShot(0, win._quit)
+
+    try:
+        import signal as _signal
+        _signal.signal(_signal.SIGINT, _on_sigint)
+        _sig_pump = QTimer(win)
+        _sig_pump.timeout.connect(lambda: None)   # 只为给解释器一个执行机会
+        _sig_pump.start(200)
+    except (ValueError, OSError):                 # 非主线程 / 平台不支持时忽略
+        pass
+
     sys.exit(app.exec())
 
 
