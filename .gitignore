@@ -47,3 +47,6 @@ build/probe-results/
 *.swp
 Thumbs.db
 desktop.ini
+
+# 截图副产物
+panel-*.png
