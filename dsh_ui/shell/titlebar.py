@@ -35,6 +35,11 @@ from dsh_ui import theme as dsh_theme
 from dsh_ui.dialogs import (DataTaskDialog, HostUpdateDialog, OnboardingDialog,
                             ReinstallDialog, UpdateDialog)
 from dsh_ui.prelude import *        # noqa: F401,F403
+# 下划线开头的工具 star-import 不带。取色回调里用到的这两个必须显式导：
+# 缺了会在 runJavaScript 的 C++ 回调里抛 NameError，而 Qt 把异常挂到
+# 下一次回调上，报出来是「eventFilter 里的 NameError」——位置完全误导
+# （2026-11-13 老大真机遇到的正是这个）。
+from dsh_ui.prelude import _parse_probe_color  # noqa: F401
 from dsh_ui.workers import (CheckWorker, DataTaskWorker, DiagnoseWorker, HostCheckWorker,
                             HostUpdateWorker, NotesWorker, ProvisionWorker,
                             RemoteConnectWorker, ServiceSwapWorker, StartupWorker,
