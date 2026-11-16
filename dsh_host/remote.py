@@ -81,7 +81,8 @@ KIND_HINTS = {
                 "也可能是中间人。确认无误后，删掉 known_hosts 里对应的那一行再连。",
     "unreachable": "连不上对方的 SSH。请检查地址、端口和网络。",
     "no_shell": "登录成功，但对方没有可用的 sh。Windows 作为被控端目前不支持。",
-    "no_dsh": "对方机器上没有找到 dsh。请先在那边执行：npm install -g @deepseek-ai/dsh",
+    "no_dsh": "对方机器上没有找到 dsh。请先在那边执行：\n"
+              "npm install -g @deepseek-ai/dsh@latest",
     "start_timeout": "远端 dsh web 启动超时。可能是机器太慢或插件初始化卡住，"
                      "详情见下方日志。",
     "exited": "远端 dsh web 启动后立刻退出了，日志见下方。",

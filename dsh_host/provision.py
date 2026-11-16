@@ -142,7 +142,7 @@ def install_dsh(on_line=None, tag: str = DEFAULT_TAG) -> tuple[bool, str]:
             "当前是「公共安装」模式，而自动安装只能装到应用自己的数据目录"
             "（免管理员、与命令行隔离）。\n\n"
             "两个选择：\n"
-            "· 用命令行安装公共那份：npm install -g @deepseek-ai/dsh\n"
+            "· 用命令行安装公共那份：npm install -g @deepseek-ai/dsh@latest\n"
             "· 或在「运行方式」页切回「自动」，再用这里的自动安装")
 
     node = contract.find_node()
