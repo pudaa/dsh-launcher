@@ -161,6 +161,7 @@ GitHub Actions 会运行自测、构建 exe、创建 Release。工作流校验 t
 
 远程功能仍标「实验」：SSH 链路（探测 / 启动 / **复用已启动实例** / 端口转发 / 令牌访问）
 已在局域网内的真实 Linux 主机上、对真实 DSH 完整验证通过。
+**连不上远端时本地服务不受影响**——只有连接成功之后才会停掉本地那份。
 安装策略与实测记录见 [`docs/remote-install.md`](docs/remote-install.md)。
 
 ## 架构

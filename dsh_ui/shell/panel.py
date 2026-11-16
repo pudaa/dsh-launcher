@@ -226,14 +226,14 @@ class PanelMixin:
                               "error": ""}
         self._push_remote_state()
 
-        # 远程与本地服务互斥：本地那份先停掉，否则两个 DSH 抢同一套界面状态，
-        # 状态栏、菜单、退出收尾全得分叉判断。停本地是秒级的，用户感觉不到。
-        if self.handle is not None and not getattr(self.handle, "remote", ""):
-            host_log("切换远程：先停本地服务")
-            try:
-                self._stop_service()
-            except Exception as e:                               # noqa: BLE001
-                host_log("停本地服务失败：%s: %s" % (type(e).__name__, e))
+        # **本地服务这里不能停。**
+        #
+        # 以前是"先停本地、再连远程"（理由是两者互斥，省一份内存）。代价是：
+        # 远程一旦失败——SSH 不通、远端没装 DSH、隧道建不起来——本地那份已经
+        # 没了，主窗口还指着 127.0.0.1:3080，只能看到 ERR_CONNECTION_REFUSED，
+        # 用户必须重启应用才回得去（2026-11-16 老大实测）。
+        #
+        # 现在改成"连成功之后才停"，失败时本地毫发无损。见 `_on_remote_ready`。
 
         w = RemoteConnectWorker(host_obj)
         w.stage.connect(self._on_remote_stage)
@@ -246,6 +246,19 @@ class PanelMixin:
         self._push_remote_state()
     def _on_remote_ready(self, session, url: str) -> None:
         host_obj = self._remote_host
+
+        # **先停本地，再接管远程**——两个顺序都不能错：
+        #   ① 停本地必须在 `self._remote = session` 之前：`_stop_service()`
+        #      见到 `self._remote` 非空会走"停远程"分支，把刚建好的会话拆掉。
+        #   ② 停本地只发生在这里（连接已成功），失败路径完全不碰本地服务。
+        if self.handle is not None and not getattr(self.handle, "remote", ""):
+            host_log("远程已就绪，停本地服务释放内存")
+            try:
+                self._stop_service()
+            except Exception as e:                               # noqa: BLE001
+                host_log("停本地服务失败（不影响远程使用）：%s: %s"
+                         % (type(e).__name__, e))
+
         self._remote = session
         self._remote_state.update({"connected": True, "stage": "", "error": ""})
         self._push_remote_state()
@@ -277,6 +290,20 @@ class PanelMixin:
         text = message if (not hint or hint in message) else (message + "\n\n" + hint)
         host_log("远程连接失败（%s）：%s" % (kind, message.splitlines()[0][:120]))
         self._warn("远程连接失败。\n\n" + text)
+
+        # 回滚到本地。
+        #
+        # 首次连远程时本地服务是**不停**的（见 `_panel_remote_connect`），所以
+        # 这里通常什么都不用做。但有两种情况会落空：
+        #   · 用户本来连着另一台远程，切到新主机时失败——旧远程已被断开；
+        #   · 本地服务因为别的原因不在了。
+        # 不管哪种，界面都会停在"既没有远程也没有本地"的状态，主窗口只会显示
+        # ERR_CONNECTION_REFUSED，用户得重启应用（2026-11-16 老大实测的场景）。
+        # 所以这里补一次启动：宁可多花几秒，也别把人丢在一个空窗口前。
+        local_missing = self.handle is None or bool(getattr(self.handle, "remote", ""))
+        if self._remote is None and local_missing:
+            host_log("远程不可用且本地服务不在，回滚启动本地服务")
+            QTimer.singleShot(0, self._prepare_env)
     def _panel_remote_disconnect(self) -> None:
         worker = self._remote_worker
         if worker is not None and worker.isRunning():
