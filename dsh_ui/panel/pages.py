@@ -538,6 +538,197 @@ class GeneralPage(BasePage):
         for r in self.toggles.values():
             r.set_palette_colors(pal)
 
+class VersionPage(BasePage):
+    """版本库：多个 DSH 版本共存，切换只改指针。
+
+    为什么值得单独一页（2026-11-16）
+    ------------------------------
+    在此之前"更新"和"回退"都是对唯一那份安装做覆盖：回退等于重新下载
+    （6 分钟 656 个包），而且预发布版本一旦被 npm unpublish 就再也回不去。
+    用户也没法"装了但不用"——点一次更新，旧版当场消失。
+
+    有了版本库，"更新"变成"新增一份"，"回退"变成"切回去"，
+    而切换是一次指针移动。这一页就是把这件事摆出来让人看得见。
+    """
+
+    def build(self) -> None:
+        self.layout_.addWidget(_label("版本", "h1"))
+        self.layout_.addWidget(_label(
+            "每个版本各占一份独立目录，切换不会动到正在用的那份。"
+            "插件装在数据目录里，不随版本变化，但可能因为版本差异而失效。"))
+
+        self.kv_cur = KeyValueRow("当前使用", "—", self.pal)
+        self.kv_src = KeyValueRow("来源", "—", self.pal)
+        c0 = Card("现在", self.pal)
+        c0.add(self.kv_cur)
+        c0.add(self.kv_src)
+        self.layout_.addWidget(c0)
+
+        self.card_list = Card("已安装", self.pal)
+        self.layout_.addWidget(self.card_list)
+
+        self.hint = _label("", "muted")
+        self.hint.setWordWrap(True)
+        self.layout_.addWidget(self.hint)
+        self.refresh()
+
+    # ---- 渲染 ----
+    def _clear(self, card: Card) -> None:
+        """清掉卡片里的内容行，保留标题行。"""
+        while card.body.count() > 1:
+            item = card.body.takeAt(card.body.count() - 1)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+
+    def refresh(self) -> None:
+        from dsh_host import versions
+        self._clear(self.card_list)
+        try:
+            rows = versions.list_installed()
+            active = versions.active_version()
+            enabled = versions.is_enabled()
+        except Exception as e:                                   # noqa: BLE001
+            self.hint.setText("读取版本库失败：%s" % e)
+            return
+
+        self.kv_cur.set(active or "未启用版本库")
+        self.kv_src.set(config.get("dsh_version_prefix") or "（未设置）")
+
+        if not rows:
+            self.card_list.add(_label(
+                "还没有任何版本。导入当前安装，或用下面的「安装新版本」拉一份。", "muted"))
+            self.hint.setText("")
+            return
+
+        plugins = versions.plugin_scan()
+        for row in rows:
+            self.card_list.add(self._row(row, row["version"] == active, plugins))
+        self.hint.setText(
+            "共 %d 个版本，合计 %d MB。" % (len(rows), sum(r["size_mb"] for r in rows))
+            if enabled else "版本库未启用：下拉里选了版本之后才会用它启动。")
+
+    def _row(self, row: dict, is_active: bool, plugins) -> QWidget:
+        from dsh_host import versions
+        w = QWidget()
+        lay = QHBoxLayout(w)
+        lay.setContentsMargins(16, 10, 16, 10)
+        lay.setSpacing(10)
+
+        dot = StatusDot("ok" if is_active else "unknown", 12, self.pal)
+        lay.addWidget(dot)
+
+        # 版本号 + 别名。别名是用户自己的叫法，比对着一串 rc 号回忆有用得多。
+        title = row["version"]
+        alias = row.get("alias") or ""
+        text = ("%s　「%s」" % (title, alias)) if alias else title
+        name = QLabel(text)
+        name.setStyleSheet("color: %s; font-family: %s; font-size: 13px;"
+                           % (self.pal["text"], FONT))
+        lay.addWidget(name)
+
+        meta = QLabel("%d MB" % row["size_mb"])
+        meta.setStyleSheet("color: %s; font-family: %s; font-size: 12px;"
+                           % (self.pal["muted"], FONT))
+        lay.addWidget(meta)
+
+        # 兼容性摘要：只有声明了 engines.dsh 的才算出结论，其余是"未声明"
+        info = versions.plugin_compat(row["version"], plugins)
+        bad, unknown = len(info["bad"]), len(info["unknown"])
+        if bad:
+            tag, color = "%d 个插件声明不兼容" % bad, self.pal["bad"]
+        elif info["checked"]:
+            tag, color = "%d 个插件声明兼容" % len(info["ok"]), self.pal["ok"]
+        else:
+            tag, color = "插件适配未声明", self.pal["muted"]
+        tip = QLabel(tag)
+        tip.setStyleSheet("color: %s; font-family: %s; font-size: 12px;"
+                          % (color, FONT))
+        lay.addWidget(tip)
+        if bad:
+            names = "、".join(p["name"] for p in info["bad"][:3])
+            tip.setToolTip("这些插件声明不支持该版本：%s" % names)
+
+        lay.addStretch(1)
+
+        if row.get("note"):
+            note = QLabel(row["note"][:24])
+            note.setStyleSheet("color: %s; font-family: %s; font-size: 12px;"
+                               % (self.pal["muted"], FONT))
+            lay.addWidget(note)
+
+        btn_alias = QPushButton("别名")
+        btn_alias.setObjectName("ghost")
+        btn_alias.clicked.connect(lambda _=False, r=row: self._edit_alias(r))
+        lay.addWidget(btn_alias)
+
+        if is_active:
+            cur = QLabel("当前使用")
+            cur.setStyleSheet("color: %s; font-family: %s; font-size: 12px;"
+                              % (self.pal["ok"], FONT))
+            lay.addWidget(cur)
+        else:
+            btn = QPushButton("切换")
+            btn.setObjectName("action")
+            btn.clicked.connect(
+                lambda _=False, v=row["version"]: self._switch(v))
+            lay.addWidget(btn)
+            btn_del = QPushButton("删除")
+            btn_del.setObjectName("ghost")
+            btn_del.clicked.connect(
+                lambda _=False, v=row["version"]: self._remove(v))
+            lay.addWidget(btn_del)
+        return w
+
+    # ---- 交互 ----
+    def _switch(self, version: str) -> None:
+        # 交给主窗口：它负责停服务 → 切指针 → 重启，并且知道切失败时怎么收场。
+        self.host.action("activate_version:%s" % version)
+
+    def _remove(self, version: str) -> None:
+        from dsh_host import versions
+        if not self._confirm("删除版本 %s？\n\n目录会被整个删掉，之后要重新下载。" % version):
+            return
+        ok, msg = versions.remove(version)
+        if not ok:
+            self._warn(msg)
+        self.refresh()
+
+    def _edit_alias(self, row: dict) -> None:
+        from dsh_host import versions
+        dlg = QDialog(self)
+        dlg.setWindowTitle("别名与备注")
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(22, 20, 22, 16)
+        lay.setSpacing(10)
+        lay.addWidget(_label("给 %s 起个叫法，方便以后认出来。" % row["version"]))
+        e1 = QLineEdit(row.get("alias") or "")
+        e1.setPlaceholderText("别名，例如「稳定版」")
+        lay.addWidget(e1)
+        e2 = QLineEdit(row.get("note") or "")
+        e2.setPlaceholderText("备注，例如「这版 cost-meter 正常」")
+        lay.addWidget(e2)
+        row_btn = QHBoxLayout()
+        row_btn.addStretch(1)
+        b1 = QPushButton("取消"); b1.setObjectName("ghost")
+        b2 = QPushButton("保存"); b2.setObjectName("action")
+        b2.setDefault(True)
+        row_btn.addWidget(b1); row_btn.addWidget(b2)
+        lay.addLayout(row_btn)
+        b1.clicked.connect(dlg.reject)
+        b2.clicked.connect(dlg.accept)
+        dsh_theme.style_dialog(dlg, self.pal)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            versions.set_alias(row["version"], e1.text(), e2.text())
+            self.refresh()
+
+    def _confirm(self, text: str) -> bool:
+        return dsh_theme.MessageDialog.ask(self, "确认", text, "删除", "取消")
+
+    def _warn(self, text: str) -> None:
+        dsh_theme.MessageDialog.ask(self, "出错了", text, "知道了", "")
+
 class DeployPage(BasePage):
     """本机部署：**引导**，不代劳。
 

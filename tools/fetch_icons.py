@@ -27,7 +27,9 @@ import urllib.request
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUT = os.path.join(ROOT, "dsh_icons.py")
+# 2026-11-16：界面层拆分后图标模块搬到了 dsh_ui/icons.py，
+# 这里没跟着改，--check 一直报"还没有生成"（指向了不存在的根目录文件）。
+OUT = os.path.join(ROOT, "dsh_ui", "icons.py")
 
 CDN = "https://cdn.jsdelivr.net/npm/lucide-static@latest/icons/{}.svg"
 
@@ -40,6 +42,7 @@ ICONS: dict[str, str] = {
     "settings": "常规",
     "activity": "状态检测",
     "info": "关于",
+    "history": "版本",
     # 窗口按钮
     "x": "关闭",
     "minus": "最小化",

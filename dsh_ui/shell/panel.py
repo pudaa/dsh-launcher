@@ -185,6 +185,8 @@ class PanelMixin:
             self._prepare_env()
         elif name == "reinstall_dsh":
             self._reinstall_dsh()
+        elif name.startswith("activate_version:"):
+            self._activate_version(name.split(":", 1)[1])
         elif name == "use_private":
             self._switch_source("private")
         elif name == "use_system":

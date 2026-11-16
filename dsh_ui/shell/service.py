@@ -227,6 +227,33 @@ class ServiceMixin:
         idx = combo.currentIndex()
         return None if idx <= 0 else hosts[idx - 1]
 
+    def _activate_version(self, version: str) -> None:
+        """切到版本库里的另一个版本。
+
+        顺序不能反：**先停服务再切指针**。Windows 上 node_modules 被 node
+        占用时，切换后的启动会读到一半旧的、一半新的模块树——那种失败
+        比"切不过去"难查得多。
+        """
+        from dsh_host import versions
+        cur = versions.active_version()
+        if version == cur:
+            self._info("这已经是当前使用的版本。")
+            return
+        host_log("切换 DSH 版本：%s → %s" % (cur or "(无)", version))
+        try:
+            self._stop_service()
+        except Exception as e:                                   # noqa: BLE001
+            host_log("停服务失败，仍继续切换：%s: %s" % (type(e).__name__, e))
+        ok, msg = versions.activate(version)
+        if not ok:
+            self._warn("切换失败。\n\n" + msg)
+            # 切不过去也要把服务拉回来，否则界面停在空窗口
+            self._prepare_env()
+            return
+        # 切换后必须清掉"启动路径"缓存里那个已就绪标记
+        self._set_tip("正在用 %s 启动…" % version)
+        self._prepare_env()
+
     def _stop_service(self) -> int:
         """停止后台服务，返回终止的进程数。
 

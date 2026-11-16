@@ -98,6 +98,7 @@ class ControlPanel(QWidget):
     PAGES = (
         ("layout-dashboard", "概览", OverviewPage),
         ("plug", "运行方式", RunModePage),
+        ("history", "版本", VersionPage),
         ("package", "本机部署", DeployPage),
         ("settings", "常规", GeneralPage),
         ("activity", "状态检测", StatusPage),

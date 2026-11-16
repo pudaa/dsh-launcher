@@ -141,6 +141,7 @@ def list_installed() -> list[dict]:
             "path": path,
             "size_mb": m.get("size_mb") or dir_size_mb(path),
             "installed_at": m.get("installed_at", ""),
+            "alias": m.get("alias", ""),       # 用户起的别名，如「稳定版」
             "health": m.get("health", ""),     # "" | "ok" | "broken"
             "note": m.get("note", ""),
         })
@@ -283,6 +284,149 @@ def adopt_current(prefix: str) -> tuple[bool, str]:
         })
     save_index(data)
     return activate(ver)
+
+
+def set_alias(version: str, alias: str = "", note: str = "") -> tuple[bool, str]:
+    """给某个版本起别名、写备注。
+
+    为什么需要（2026-11-16 老大提的）：`0.2.2-rc.1` 这种版本号记不住，
+    而用户心里对它们的称呼是"能跑插件那版""上个月稳定的那个"。别名就是
+    把他脑子里的名字落到界面上，不用每次对着版本号回忆。
+
+    `note` 与健康标记共用同一个字段——健康标记本身也是"一句话说明这版怎么样"，
+    再开一个字段只会让用户面对两个输入框不知道填哪个。
+    """
+    data = load_index()
+    hit = None
+    for v in data.get("versions", []):
+        if v.get("version") == version:
+            hit = v
+            break
+    if hit is None:
+        hit = {"version": version}
+        data.setdefault("versions", []).append(hit)
+    hit["alias"] = (alias or "").strip()[:24]
+    hit["note"] = (note or "").strip()[:200]
+    save_index(data)
+    return True, ""
+
+
+# ---------------------------------------------------------------- 插件兼容性
+
+def _plugins_root() -> str:
+    """插件装在哪。它们是 DSH_HOME 下的 profile 依赖，不在安装目录里——
+    所以换 DSH 版本不动插件，但插件可能因为 API 变化而报错。"""
+    home = contract.resolve_home() or ""
+    if not home:
+        return ""
+    for name in ("web", "default"):
+        p = os.path.join(home, "profiles", name, "node_modules")
+        if os.path.isdir(p):
+            return p
+    return ""
+
+
+def _semver_module() -> str:
+    """找一个能用的 semver 实现（npm 生态的标准件）。
+
+    不自己写：预发布版本的比较规则（0.2.2-rc.1 < 0.2.2、rc.2 > rc.1）和
+    `||` 组合很容易写错，而写错的结果看起来还很权威。
+    """
+    root = _plugins_root()
+    if root:
+        cand = os.path.join(root, "semver")
+        if os.path.isdir(cand):
+            return cand
+    return ""
+
+
+def plugin_scan() -> list[dict]:
+    """列出已安装的 DSH 插件及其声明的适配范围。
+
+    判据是 package.json 里有 `dsh` 元数据（bundle / patch 等）——这是插件
+    和普通 npm 依赖的区别。`engines.dsh` 可能没有，那就记成未声明。
+    """
+    root = _plugins_root()
+    if not root:
+        return []
+    import glob
+    pats = [os.path.join(root, "*", "package.json"),
+            os.path.join(root, "@*", "*", "package.json")]
+    out = []
+    for pat in pats:
+        for path in glob.glob(pat):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    d = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if "dsh" not in d:
+                continue
+            eng = d.get("engines") or {}
+            out.append({
+                "name": str(d.get("name") or ""),
+                "version": str(d.get("version") or ""),
+                "range": str(eng.get("dsh") or "").strip(),
+            })
+    out.sort(key=lambda x: x["name"])
+    return out
+
+
+def plugin_compat(target: str, plugins: list[dict] | None = None) -> dict:
+    """算这些插件在某个 DSH 版本下**声明层面**是否兼容。
+
+    返回 {"checked": n, "ok": [...], "bad": [...], "unknown": [...]}。
+
+    三态而不是二态：
+      ok      有声明且满足
+      bad     有声明但不满足
+      unknown 没声明 —— **这不是"兼容"**，是"作者没说"。界面上必须是灰的。
+    把 unknown 当 ok 会让用户依据"作者没说"做出错误决定。
+    """
+    plugins = plugins if plugins is not None else plugin_scan()
+    res = {"checked": 0, "ok": [], "bad": [], "unknown": []}
+    declared = [p for p in plugins if p.get("range")]
+    for p in plugins:
+        if not p.get("range"):
+            res["unknown"].append(p)
+    if not declared:
+        return res
+    mod = _semver_module()
+    if not mod:
+        # 没有 semver 就一律报未声明——宁可少说，不要说错
+        res["unknown"] = list(plugins)
+        return res
+
+    import subprocess
+    payload = json.dumps([{"version": target, "range": p["range"]} for p in declared])
+    js = (
+        "const s=require(process.argv[1]);"
+        "const a=JSON.parse(process.argv[2]);"
+        "process.stdout.write(JSON.stringify(a.map(x=>{try{"
+        "return s.satisfies(x.version,x.range,{includePrerelease:true})"
+        "}catch(e){return null}})))"
+    )
+    try:
+        node = contract.resolve_install(verify=False).node
+    except Exception:                                          # noqa: BLE001
+        node = "node"
+    try:
+        p = subprocess.run([node, "-e", js, mod, payload],
+                           capture_output=True, text=True, timeout=20)
+        flags = json.loads((p.stdout or "[]").strip() or "[]")
+    except Exception:                                          # noqa: BLE001
+        res["unknown"] = list(plugins)
+        return res
+
+    for item, flag in zip(declared, flags):
+        if flag is True:
+            res["ok"].append(item)
+        elif flag is False:
+            res["bad"].append(item)
+        else:
+            res["unknown"].append(item)
+    res["checked"] = len(declared)
+    return res
 
 
 def is_enabled() -> bool:
