@@ -173,6 +173,32 @@ class ProvisionWorker(QThread):
         except Exception as e:                                   # noqa: BLE001
             self.done.emit(False, f"{type(e).__name__}: {e}")
 
+class VersionInstallWorker(QThread):
+    """把一个 DSH 版本装进版本库。
+
+    为什么必须放后台：实测装一份要 6 分钟、656 个包。放界面线程就是整窗假死。
+    与"更新"的 worker 分开是有意的——更新会动当前在用的那份，而这个
+    **只往 versions/<版本> 里写**，正在运行的服务完全不受影响。
+    """
+    line = Signal(str)
+    done = Signal(bool, str)
+
+    def __init__(self, version: str, node: str, npm_cli: str | None = None):
+        super().__init__()
+        self.version = version
+        self.node = node
+        self.npm_cli = npm_cli
+
+    def run(self):
+        try:
+            from dsh_host import versions
+            ok, msg = versions.install(self.version, self.node, self.npm_cli,
+                                       on_line=self.line.emit)
+            self.done.emit(ok, msg)
+        except Exception as e:                                   # noqa: BLE001
+            self.done.emit(False, f"{type(e).__name__}: {e}")
+
+
 class CheckWorker(QThread):
     """后台检查更新。
 

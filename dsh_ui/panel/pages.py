@@ -552,7 +552,7 @@ class VersionPage(BasePage):
     """
 
     def build(self) -> None:
-        self.layout_.addWidget(_label("版本", "h1"))
+        self.layout_.addWidget(_label("版本管理", "h1"))
         self.layout_.addWidget(_label(
             "每个版本各占一份独立目录，切换不会动到正在用的那份。"
             "插件装在数据目录里，不随版本变化，但可能因为版本差异而失效。"))
@@ -570,6 +570,29 @@ class VersionPage(BasePage):
         self.summary = _label("", "muted")
         self.summary.setWordWrap(True)
         self.layout_.addWidget(self.summary)
+
+        # --- 安装新版本 ---
+        # 以前只能靠"检查更新"往唯一那份上覆盖。现在装进独立目录，
+        # 装坏了只是多一个目录，删掉即可，正在跑的那份从头到尾没被碰过。
+        c1 = Card("安装新版本", self.pal)
+        row = QWidget()
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(16, 4, 16, 4)
+        lay.setSpacing(8)
+        self.e_version = QLineEdit()
+        self.e_version.setPlaceholderText("版本号或通道：0.2.2-rc.3 / latest / next / alpha")
+        lay.addWidget(self.e_version, 1)
+        self.btn_install = QPushButton("安装")
+        self.btn_install.setObjectName("action")
+        self.btn_install.clicked.connect(self._install)
+        lay.addWidget(self.btn_install)
+        c1.add(row)
+        self.install_hint = _label(
+            "装进独立目录，不影响当前在用的版本。装完可以自己决定要不要切过去。", "muted")
+        self.install_hint.setWordWrap(True)
+        self.install_hint.setContentsMargins(16, 4, 16, 8)
+        c1.add(self.install_hint)
+        self.layout_.addWidget(c1)
         self.refresh()
 
     # ---- 渲染 ----
@@ -658,7 +681,7 @@ class VersionPage(BasePage):
                                % (self.pal["muted"], FONT))
             lay.addWidget(note)
 
-        btn_alias = QPushButton("别名")
+        btn_alias = QPushButton("修改备注")
         btn_alias.setObjectName("ghost")
         btn_alias.clicked.connect(lambda _=False, r=row: self._edit_alias(r))
         lay.addWidget(btn_alias)
@@ -682,6 +705,42 @@ class VersionPage(BasePage):
         return w
 
     # ---- 交互 ----
+    def _install(self) -> None:
+        from dsh_host import contract
+
+        ver = self.e_version.text().strip()
+        if not ver:
+            self._warn("先填一个版本号，或者 latest / next / alpha。")
+            return
+        try:
+            inst = contract.resolve_install(verify=False)
+            node, npm_cli = inst.node, inst.npm_cli
+        except Exception as e:                                   # noqa: BLE001
+            self._warn("找不到 node/npm，无法安装：%s" % e)
+            return
+        if not npm_cli:
+            self._warn("没有找到 npm，无法安装。")
+            return
+
+        self.btn_install.setEnabled(False)
+        self.install_hint.setText("正在安装 %s…（实测约 6 分钟、656 个包）" % ver)
+        self.w_install = VersionInstallWorker(ver, node, npm_cli)
+        self.w_install.line.connect(
+            lambda t: self.install_hint.setText((t or "…")[-120:]))
+        self.w_install.done.connect(self._on_installed)
+        self.w_install.start()
+
+    def _on_installed(self, ok: bool, msg: str) -> None:
+        self.btn_install.setEnabled(True)
+        if ok:
+            self.install_hint.setText("装好了。要切过去的话点上面的「切换」。")
+            self.log("已安装版本 %s" % self.e_version.text().strip())
+        else:
+            self.install_hint.setText("安装失败，详情见日志。")
+            self.log("安装失败：%s" % (msg or "")[-300:])
+            self._warn("安装失败。\n\n" + (msg or "")[-400:])
+        self.refresh()
+
     def _switch(self, version: str) -> None:
         # 交给主窗口：它负责停服务 → 切指针 → 重启，并且知道切失败时怎么收场。
         self.host.action("activate_version:%s" % version)

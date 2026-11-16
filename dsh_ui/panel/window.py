@@ -95,12 +95,18 @@ class ControlPanel(QWidget):
     所以这里用 1px 描边替代。
     """
 
+    # 顺序按"用户会按什么顺序找东西"排（2026-11-16 老大提的）：
+    #   ① 概览/常规 —— 每天进来先看的和常改的，放最上；
+    #   ② 运行方式 → 本机部署 → 版本管理 —— "用哪个 DSH"这一条线，按
+    #      "先决定连哪儿、再装、再管版本"的因果顺序排列；
+    #   ③ 状态检测/关于 —— 出问题才翻的，放最后。
+    # 以前"版本"夹在"运行方式"和"本机部署"中间，把那条线割断了。
     PAGES = (
         ("layout-dashboard", "概览", OverviewPage),
-        ("plug", "运行方式", RunModePage),
-        ("history", "版本", VersionPage),
-        ("package", "本机部署", DeployPage),
         ("settings", "常规", GeneralPage),
+        ("plug", "运行方式", RunModePage),
+        ("package", "本机部署", DeployPage),
+        ("history", "版本管理", VersionPage),
         ("activity", "状态检测", StatusPage),
         ("info", "关于", AboutPage),
     )
