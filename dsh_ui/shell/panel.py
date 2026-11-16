@@ -309,7 +309,15 @@ class PanelMixin:
         if worker is not None and worker.isRunning():
             self._info("正在连接中，暂时不能断开。")
             return
+        was_remote = self._remote is not None
         self._stop_remote()
+        # **断开之后要把本地拉回来。**
+        # 连接远程时本地服务是停掉的（成功后才停），如果断开就结束，
+        # 用户会停在一个既没有远程也没有本地的空窗口上——和"连接失败"
+        # 那个 bug 是同一个坑的另一个入口（2026-11-16 老大追问时发现）。
+        if was_remote:
+            host_log("已断开远程，切回本地服务")
+            self._prepare_env()
     def _stop_remote(self, stop_remote_side: bool | None = None) -> None:
         """收掉远程会话。
 
@@ -327,6 +335,10 @@ class PanelMixin:
         self._remote_host = None
         self._remote_state = {}
         self._push_remote_state()
+        # 远程会话没了，指向它的 handle 也必须清掉——否则界面会继续显示
+        # 那个已经关掉的隧道端口，状态栏、菜单、退出收尾全都对着一个死句柄。
+        if self.handle is not None and getattr(self.handle, "remote", ""):
+            self.handle = None
     def _run_data_task(self, task: str, title: str, headline: str, hint: str,
                        **kw) -> tuple[bool, object]:
         """起一个 DataTaskWorker，用模态进度窗等它跑完。
