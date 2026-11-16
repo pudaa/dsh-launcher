@@ -567,9 +567,9 @@ class VersionPage(BasePage):
         self.card_list = Card("已安装", self.pal)
         self.layout_.addWidget(self.card_list)
 
-        self.hint = _label("", "muted")
-        self.hint.setWordWrap(True)
-        self.layout_.addWidget(self.hint)
+        self.summary = _label("", "muted")
+        self.summary.setWordWrap(True)
+        self.layout_.addWidget(self.summary)
         self.refresh()
 
     # ---- 渲染 ----
@@ -590,22 +590,22 @@ class VersionPage(BasePage):
             active = versions.active_version()
             enabled = versions.is_enabled()
         except Exception as e:                                   # noqa: BLE001
-            self.hint.setText("读取版本库失败：%s" % e)
+            self.summary.setText("读取版本库失败：%s" % e)
             return
 
         self.kv_cur.set(active or "未启用版本库")
         self.kv_src.set(config.get("dsh_version_prefix") or "（未设置）")
 
         if not rows:
-            self.card_list.add(_label(
-                "还没有任何版本。导入当前安装，或用下面的「安装新版本」拉一份。", "muted"))
-            self.hint.setText("")
+            self.card_list.add_text(
+                "还没有任何版本。可以先把当前安装导入成一份副本，之后再装别的版本。")
+            self.summary.setText("")
             return
 
         plugins = versions.plugin_scan()
         for row in rows:
             self.card_list.add(self._row(row, row["version"] == active, plugins))
-        self.hint.setText(
+        self.summary.setText(
             "共 %d 个版本，合计 %d MB。" % (len(rows), sum(r["size_mb"] for r in rows))
             if enabled else "版本库未启用：下拉里选了版本之后才会用它启动。")
 

@@ -41,6 +41,27 @@ from dsh_ui.panel.window import *      # noqa: F401,F403
 
 from PySide6.QtWidgets import QApplication   # noqa: F401  自测用
 
+def _page_of(panel, cls):
+    """按**页面类型**取页，不按索引。
+
+    以前这里全是 `panel.pages.get(4)` 这种写法。加「版本」页时插在索引 2，
+    后面全部错位——自测拿到的是常规页却当成状态检测页断言，报
+    `'GeneralPage' object has no attribute 'rows'`，而真正的问题（页面错位）
+    完全没被提示出来。按类型取，加多少页都不会错。
+    """
+    for p in (panel.pages or {}).values():
+        if isinstance(p, cls):
+            return p
+    return None
+
+
+def _index_of(panel, cls) -> int:
+    for i, item in enumerate(panel.PAGES):
+        if item[2] is cls:
+            return i
+    return 0
+
+
 def selftest_checks() -> list:
     """给 tools/gui_selftest.py 用的纯逻辑断言，返回失败项列表。
 
@@ -168,8 +189,12 @@ def selftest_checks() -> list:
     check("页签数量与定义一致", len(panel.navs) == len(ControlPanel.PAGES),
           "%d 个" % len(panel.navs))
     titles = [n.text().strip() for n in panel.navs]
-    check("页签名正确",
-          titles == ["概览", "运行方式", "本机部署", "常规", "状态检测", "关于"],
+    # 与**定义**比对，而不是把页签名抄一份硬编码。
+    # 抄一份的代价是每加一页都要改测试（加"版本"页时就是这样红了一次），
+    # 而它真正想守的是"导航渲染出来的文字与 PAGES 定义一致"——比对两个来源
+    # 才能验证这一点，抄一份只能验证"我今天还没改过它"。
+    check("页签名与定义一致",
+          titles == [p[1] for p in ControlPanel.PAGES],
           "、".join(titles))
 
     # 部署页必须有「重新安装 DSH」入口：半升级（主包新、子依赖旧）的唯一
@@ -201,7 +226,7 @@ def selftest_checks() -> list:
           and human_mem(0) == "0 MB" and human_mem(None) == "—",
           "%s / %s" % (human_mem(509), human_mem(1645)))
 
-    op = panel.pages.get(0)
+    op = _page_of(panel, OverviewPage)
     check("概览页有内存栏（合计 + 壳/网页/服务三块）",
           op is not None and hasattr(op, "kv_mem_total")
           and set(getattr(op, "mem_rows", {})) == {"host", "webengine", "node"})
@@ -242,14 +267,14 @@ def selftest_checks() -> list:
           mw is not None and mw.isRunning(),
           "worker=%s" % ("None" if mw is None else
                          ("运行中" if mw.isRunning() else "已停")))
-    panel.goto(5)
+    panel.goto(_index_of(panel, StatusPage))
     loop_events(app, 150)
     check("切走概览页后内存采样已停",
           mw is not None and not mw.isRunning(),
           "worker=%s" % ("None" if mw is None else
                          ("运行中" if mw.isRunning() else "已停")))
 
-    sp = panel.pages.get(4)
+    sp = _page_of(panel, StatusPage)
     check("状态检测页覆盖全部预期项",
           sp is not None and set(sp.rows.keys()) == {k for k, _n in CHECK_ROWS},
           "、".join(sp.rows.keys()) if sp is not None else "状态页未构建")
@@ -261,7 +286,7 @@ def selftest_checks() -> list:
     #   ① 切页不等它（耗时远小于 1.2 秒）
     #   ② 它确实在别的线程里跑
     #   ③ 结果回来后会回填到界面上，且 30 秒内复用缓存
-    gp = panel.pages.get(3)
+    gp = _page_of(panel, GeneralPage)
     check("切进常规页不等占用统计（不再卡顿）",
           goto_cost is not None and goto_cost < 0.5,
           "%.3f 秒" % goto_cost if goto_cost is not None else "页面未构建")
@@ -445,7 +470,7 @@ def selftest_checks() -> list:
     check("面板不含 Emoji", not hits, "、".join(hits[:3]))
 
     # --- 设置项从概览迁到「常规」页（2026-10-20 重排）---
-    gp = panel.pages.get(3)
+    gp = _page_of(panel, GeneralPage)
     toggles = getattr(gp, "toggles", {}) if gp is not None else {}
     check("「常规」页承载了更新与外观、开发者开关",
           {"prerelease_opt_in", "dev_mode"} <= set(toggles),
@@ -456,11 +481,11 @@ def selftest_checks() -> list:
           gp is not None and hasattr(gp, "btn_dev")
           and not gp.btn_dev.isEnabled() and not gp.btn_log.isEnabled())
     # 概览只留状态与主操作：不该再出现更新按钮（那是常规页的事）
-    ov = panel.pages.get(0)
+    ov = _page_of(panel, OverviewPage)
     check("概览已瘦身（更新按钮不在概览）",
           ov is not None and not hasattr(ov, "btn_update"))
     # 运行方式页三档齐全
-    rp = panel.pages.get(1)
+    rp = _page_of(panel, RunModePage)
     check("运行方式页给出私有 / 公共两档入口",
           rp is not None and hasattr(rp, "btn_private") and hasattr(rp, "btn_public"))
 
