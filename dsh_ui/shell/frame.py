@@ -167,7 +167,16 @@ class WindowFrameMixin:
             if w is not None and w.isRunning() and not w.wait(timeout_ms):
                 left.append(name)
         return left
-    def _launch_startup(self):
+    def _launch_startup(self, route: bool = True):
+        """启动服务。
+
+        `route=True` 时才看「启动途径」配置（本机 / 远程 / 每次询问）。
+        **从远程切回本地必须传 False**——`_prepare_env()` 走的就是这条路，
+        否则每次断开远程都会重新弹一遍选择面板、或者又被连回远程。
+        """
+        if route and self._apply_start_route():
+            return
+
         # 重入守卫：切换来源、面板「自动准备运行环境」都会走到这里。没有守卫时
         # 两个 StartupWorker 会并发 launch/wait_ready —— 多一个没人管的服务，
         # 或者 attach 到同一个服务后 `_on_ready` 再跑一遍。`_swap_service` 和

@@ -20,7 +20,7 @@ from PySide6.QtWebEngineCore import QWebEngineProfile
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog, QHBoxLayout,
                                QLabel, QMainWindow, QPlainTextEdit, QProgressBar,
-                               QPushButton, QStackedLayout, QStackedWidget,
+                               QComboBox, QPushButton, QStackedLayout, QStackedWidget,
                                QSystemTrayIcon, QVBoxLayout, QWidget)
 
 from dsh_host import (config, contract, dwm, lifecycle, procmem, provision, remote,
@@ -134,7 +134,99 @@ class ServiceMixin:
         self.stack.setCurrentIndex(0)
         self._loading_busy(True)
         self._set_tip("正在检查运行环境…")
-        self._launch_startup()
+        # route=False：**这是"回到本机"，不是一次新的启动**。
+        # 传 True 会去读启动途径配置——从远程断开时又把用户连回远程，
+        # 或者每次断开都弹一遍选择面板。
+        self._launch_startup(route=False)
+    def _apply_start_route(self) -> bool:
+        """按「启动途径」决定先起谁。返回 True 表示已接管，不再起本地。
+
+        为什么要这个（2026-11-16 老大提的场景）：有人打开鲸坞**只是为了连另一台
+        机器**，这时再自动起一份本地服务纯属浪费（600 MB 上下、还要等十几秒）。
+
+        `start_mode`：
+          local  —— 起本机（默认，和以前一致）
+          remote —— 直接连 `start_remote_host` 指定的主机
+          ask    —— 每次启动问一次。使用场景不固定的人用这个
+
+        没配置任何远程主机时一律回退本机——否则用户会卡在一个空的选择面板前。
+        """
+        mode = str(config.get("start_mode") or "local")
+        if mode not in ("remote", "ask"):
+            return False
+        try:
+            hosts = remote.load_hosts()
+        except Exception as e:                                   # noqa: BLE001
+            host_log("读取远程主机失败，改走本机：%s: %s" % (type(e).__name__, e))
+            return False
+        if not hosts:
+            host_log("启动途径配置为 %s，但没有远程主机，改走本机" % mode)
+            return False
+
+        if mode == "ask":
+            picked = self._ask_start_route(hosts)
+            if picked is None:
+                return False                 # 选了本机
+            host = picked
+        else:
+            want = str(config.get("start_remote_host") or "")
+            host = next((h for h in hosts if h.id == want), hosts[0])
+
+        host_log("按启动途径直接连接远程：%s" % host.name)
+        self._set_tip("正在连接 %s…" % host.name)
+        self._panel_remote_connect(host)
+        return True
+
+    def _ask_start_route(self, hosts):
+        """启动时的选择面板。返回 None=本机，SshHost=远程，False=关掉窗口（当本机）。"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("从哪儿开始")
+        dlg.setModal(True)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(24, 22, 24, 18)
+        lay.setSpacing(14)
+
+        title = QLabel("这次要连本机，还是另一台机器？")
+        title.setObjectName("dlgTitle")
+        lay.addWidget(title)
+        hint = QLabel("可以在「运行方式」里把默认值改成固定的，之后就不再问。")
+        hint.setObjectName("dlgHint")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        combo = QComboBox()
+        combo.addItem("本机 · 这台电脑上的 DSH")
+        for h in hosts:
+            combo.addItem("%s · %s" % (h.name, h.display_address))
+        want = str(config.get("start_remote_host") or "")
+        for i, h in enumerate(hosts, start=1):
+            if h.id == want:
+                combo.setCurrentIndex(i)
+                break
+        lay.addWidget(combo)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        btn_cancel = QPushButton("取消")
+        btn_cancel.setObjectName("ghost")
+        btn_ok = QPushButton("开始")
+        btn_ok.setObjectName("action")
+        btn_ok.setDefault(True)
+        row.addWidget(btn_cancel)
+        row.addWidget(btn_ok)
+        lay.addLayout(row)
+
+        btn_ok.clicked.connect(dlg.accept)
+        btn_cancel.clicked.connect(dlg.reject)
+        dsh_theme.style_dialog(dlg, self.panel_palette() if hasattr(self, "panel_palette") else None)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            # 取消不等于"别启动"——把人丢在空窗口前更糟，照常起本机。
+            host_log("启动途径选择被取消，按本机启动")
+            return None
+        idx = combo.currentIndex()
+        return None if idx <= 0 else hosts[idx - 1]
+
     def _stop_service(self) -> int:
         """停止后台服务，返回终止的进程数。
 
