@@ -141,9 +141,11 @@ def list_installed() -> list[dict]:
             "path": path,
             "size_mb": m.get("size_mb") or dir_size_mb(path),
             "installed_at": m.get("installed_at", ""),
-            "alias": m.get("alias", ""),       # 用户起的别名，如「稳定版」
             "health": m.get("health", ""),     # "" | "ok" | "broken"
-            "note": m.get("note", ""),
+            # 备注是**一个**自由文本字段：叫法、注意事项、踩过的坑，都写这儿。
+            # 早期版本这里还分过 alias/note 两项，多余——用户面对两个框
+            # 只会犹豫"我这句话该填哪个"（2026-11-16 老大澄清后合并）。
+            "note": m.get("note") or m.get("alias") or "",
         })
     out.sort(key=lambda x: x.get("installed_at") or "", reverse=True)
     return out
@@ -286,15 +288,12 @@ def adopt_current(prefix: str) -> tuple[bool, str]:
     return activate(ver)
 
 
-def set_alias(version: str, alias: str = "", note: str = "") -> tuple[bool, str]:
-    """给某个版本起别名、写备注。
+def set_note(version: str, note: str = "") -> tuple[bool, str]:
+    """给某个版本写备注。
 
     为什么需要（2026-11-16 老大提的）：`0.2.2-rc.1` 这种版本号记不住，
-    而用户心里对它们的称呼是"能跑插件那版""上个月稳定的那个"。别名就是
-    把他脑子里的名字落到界面上，不用每次对着版本号回忆。
-
-    `note` 与健康标记共用同一个字段——健康标记本身也是"一句话说明这版怎么样"，
-    再开一个字段只会让用户面对两个输入框不知道填哪个。
+    而用户心里对它的称呼是"能跑插件那版""上个月稳定的那个"。一个自由文本
+    就够——叫法、注意事项、上次遇到的问题，都可以写在这一行里。
     """
     data = load_index()
     hit = None
@@ -305,8 +304,8 @@ def set_alias(version: str, alias: str = "", note: str = "") -> tuple[bool, str]
     if hit is None:
         hit = {"version": version}
         data.setdefault("versions", []).append(hit)
-    hit["alias"] = (alias or "").strip()[:24]
-    hit["note"] = (note or "").strip()[:200]
+    hit["note"] = (note or "").strip()[:120]
+    hit.pop("alias", None)          # 旧数据里的别名并入备注，不再单列
     save_index(data)
     return True, ""
 

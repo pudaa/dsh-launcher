@@ -644,8 +644,9 @@ class VersionPage(BasePage):
 
         # 版本号 + 别名。别名是用户自己的叫法，比对着一串 rc 号回忆有用得多。
         title = row["version"]
-        alias = row.get("alias") or ""
-        text = ("%s　「%s」" % (title, alias)) if alias else title
+        # 备注直接跟在版本号后面，用分隔符而不是引号——它是"这句话属于这版"，
+        # 不是一个并列的第二个名字。
+        text = title
         name = QLabel(text)
         name.setStyleSheet("color: %s; font-family: %s; font-size: 13px;"
                            % (self.pal["text"], FONT))
@@ -676,15 +677,15 @@ class VersionPage(BasePage):
         lay.addStretch(1)
 
         if row.get("note"):
-            note = QLabel(row["note"][:24])
+            note = QLabel(row["note"][:28])
             note.setStyleSheet("color: %s; font-family: %s; font-size: 12px;"
                                % (self.pal["muted"], FONT))
             lay.addWidget(note)
 
-        btn_alias = QPushButton("修改备注")
-        btn_alias.setObjectName("ghost")
-        btn_alias.clicked.connect(lambda _=False, r=row: self._edit_alias(r))
-        lay.addWidget(btn_alias)
+        btn_note = QPushButton("修改备注")
+        btn_note.setObjectName("ghost")
+        btn_note.clicked.connect(lambda _=False, r=row: self._edit_note(r))
+        lay.addWidget(btn_note)
 
         if is_active:
             cur = QLabel("当前使用")
@@ -754,20 +755,17 @@ class VersionPage(BasePage):
             self._warn(msg)
         self.refresh()
 
-    def _edit_alias(self, row: dict) -> None:
+    def _edit_note(self, row: dict) -> None:
         from dsh_host import versions
         dlg = QDialog(self)
-        dlg.setWindowTitle("别名与备注")
+        dlg.setWindowTitle("备注")
         lay = QVBoxLayout(dlg)
         lay.setContentsMargins(22, 20, 22, 16)
         lay.setSpacing(10)
-        lay.addWidget(_label("给 %s 起个叫法，方便以后认出来。" % row["version"]))
-        e1 = QLineEdit(row.get("alias") or "")
-        e1.setPlaceholderText("别名，例如「稳定版」")
-        lay.addWidget(e1)
-        e2 = QLineEdit(row.get("note") or "")
-        e2.setPlaceholderText("备注，例如「这版 cost-meter 正常」")
-        lay.addWidget(e2)
+        lay.addWidget(_label("给 %s 写一句备注——叫法、注意事项都行。" % row["version"]))
+        e = QLineEdit(row.get("note") or "")
+        e.setPlaceholderText("例如：稳定版，插件全绿")
+        lay.addWidget(e)
         row_btn = QHBoxLayout()
         row_btn.addStretch(1)
         b1 = QPushButton("取消"); b1.setObjectName("ghost")
@@ -779,7 +777,7 @@ class VersionPage(BasePage):
         b2.clicked.connect(dlg.accept)
         dsh_theme.style_dialog(dlg, self.pal)
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            versions.set_alias(row["version"], e1.text(), e2.text())
+            versions.set_note(row["version"], e.text())
             self.refresh()
 
     def _confirm(self, text: str) -> bool:
