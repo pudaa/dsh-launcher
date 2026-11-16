@@ -329,6 +329,9 @@ class MainWindow(WindowFrameMixin, ViewMixin, TitlebarMixin, TrayMixin,
         # 远程会话（2026-11-12）：SSH 隧道 + 远端 dsh web。
         # 同一时刻只允许一条远程会话，与本地服务互斥——两套 handle 同时活着，
         # 状态栏、菜单、退出的收尾逻辑就得分叉判断，复杂度不值当。
+        # 连远程时 `self.handle` 会被远程句柄覆盖，本地的那个要单独留着——
+        # 否则开了「保留本地服务」也切不回来（断开时找不到本地端口）。
+        self._local_handle = None         # 本地服务句柄（远程模式下仍保留）
         self._remote = None               # remote.RemoteSession
         self._remote_host = None          # remote.SshHost
         self._remote_worker = None        # RemoteConnectWorker

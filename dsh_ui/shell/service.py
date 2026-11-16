@@ -153,6 +153,18 @@ class ServiceMixin:
                                         and getattr(self.handle, "remote", "")):
             self._stop_remote()
             self.handle = None
+            # 开了「保留本地服务」时，本地那份**还在跑**，这里必须接着停掉。
+            # 漏了这一步，用户点「退出」会留下一个 600 MB 的孤儿 node——
+            # Job Object 只在他崩溃/被强杀时兜底，正常退出走的就是这条路径
+            # （2026-11-16 加 keep_local 时差点漏掉）。
+            local = getattr(self, "_local_handle", None)
+            if local is not None and not getattr(local, "remote", ""):
+                n_local = contract.stop(local, port=local.port or 0)
+                if n_local:
+                    contract.save_state(None)
+                self._local_handle = None
+                host_log("退出时一并停止被保留的本地服务（%d 个进程）" % n_local)
+                return 1 + n_local
             return 1
 
         if self.handle is not None:

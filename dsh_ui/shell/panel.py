@@ -251,7 +251,15 @@ class PanelMixin:
         #   ① 停本地必须在 `self._remote = session` 之前：`_stop_service()`
         #      见到 `self._remote` 非空会走"停远程"分支，把刚建好的会话拆掉。
         #   ② 停本地只发生在这里（连接已成功），失败路径完全不碰本地服务。
-        if self.handle is not None and not getattr(self.handle, "remote", ""):
+        #
+        # 但如果用户开了「保留本地服务」，就不停——他宁愿多付 600 MB，
+        # 也要让切回本地是瞬时的（停掉再拉起来实测要 20 秒）。
+        keep_local = bool(config.get("keep_local_service"))
+        if keep_local:
+            # `self.handle` 马上要换成远程的，先把本地这个存起来。
+            self._local_handle = self.handle
+            host_log("远程已就绪；按设置保留本地服务（切回本地不需重启）")
+        elif self.handle is not None and not getattr(self.handle, "remote", ""):
             host_log("远程已就绪，停本地服务释放内存")
             try:
                 self._stop_service()
@@ -315,7 +323,15 @@ class PanelMixin:
         # 连接远程时本地服务是停掉的（成功后才停），如果断开就结束，
         # 用户会停在一个既没有远程也没有本地的空窗口上——和"连接失败"
         # 那个 bug 是同一个坑的另一个入口（2026-11-16 老大追问时发现）。
-        if was_remote:
+        if not was_remote:
+            return
+        local = self._local_handle
+        if local is not None and not getattr(local, "remote", ""):
+            # 开了「保留本地服务」：本地一直在跑，切回视图即可，不用重启。
+            host_log("已断开远程，切回本地服务（本地一直在运行，无需重启）")
+            self._local_handle = None
+            self._on_ready(local)
+        else:
             host_log("已断开远程，切回本地服务")
             self._prepare_env()
     def _stop_remote(self, stop_remote_side: bool | None = None) -> None:
