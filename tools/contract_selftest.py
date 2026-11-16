@@ -755,6 +755,11 @@ def main_lite() -> int:
     failures.extend(_remote.selftest_checks())
 
     print(LINE)
+    print("[L1] 版本库（多版本共存 + 指针切换）")
+    from dsh_host import versions as _versions
+    failures.extend(_versions.selftest_checks())
+
+    print(LINE)
     print("[L0] 退出即回收（Job Object：崩溃/强杀不留孤儿服务）")
     from dsh_host import jobobj as _jobobj
     failures.extend(_jobobj.selftest_checks())

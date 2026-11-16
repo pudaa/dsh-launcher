@@ -331,6 +331,17 @@ def candidate_bin_js(prefer: str | None = None):
     if c and os.path.isfile(c):
         yield "配置文件", c, cfg.get("dsh_node")
 
+    # 1.5 版本库：用户在「版本」页选定的那个版本。
+    # 排在显式覆盖之后、dsh_source 之前——它比"来源偏好"更具体，
+    # 但不该盖过用户手填的 DSH_BIN。
+    vp = str(cfg.get("dsh_version_prefix") or "")
+    if vp:
+        for rel in (("node_modules",), ("lib", "node_modules")):
+            p = os.path.join(vp, *rel, "@deepseek-ai", "dsh", "lib", "bin.js")
+            if os.path.isfile(p):
+                yield "版本库", p, None
+                break
+
     mode = (prefer or config.get("dsh_source") or "auto")
     mode = str(mode).strip().lower()
     if mode not in ("auto", "private", "system"):
@@ -406,6 +417,20 @@ def _load_cache() -> tuple[str, str, str, str] | None:
     except (OSError, ValueError):
         pass
     return None
+
+
+def invalidate_install_cache() -> None:
+    """丢掉"安装位置"缓存。
+
+    **版本库切换指向之后必须调用。** 缓存里记的是上一个版本的 bin_js，
+    不清掉的话 `try_resolve_install()` 会继续返回旧路径——表现是
+    "切了版本但界面/启动还是老的"，而且没有任何报错，极难排查
+    （2026-11-16 做版本库时踩到）。
+    """
+    try:
+        os.remove(_cache_path())
+    except OSError:
+        pass
 
 
 def _save_cache(install: DshInstall) -> None:
