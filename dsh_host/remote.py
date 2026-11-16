@@ -656,7 +656,13 @@ class RemoteDsh:
         if "timeout" in info:
             raise _err("start_timeout", detail=info.get("log") or "")
         if "exited" in info:
-            raise _err("exited", detail=info.get("log") or "")
+            log = info.get("log") or ""
+            # **远端根本没装 dsh** 是首次连接最常见的情况，而原始日志只有一句
+            # `sh: 1: dsh: not found`——用户看不出这是"环境没准备好"还是"我们写错了"。
+            # 2026-11-16 在真实 Linux 机器上实测时确认了这个体验问题。
+            if "not found" in log or "command not found" in log:
+                raise _err("no_dsh", detail=log)
+            raise _err("exited", detail=log)
         raise _err("start_timeout",
                    "远端 dsh web 没有打印出可用地址。", detail=info.get("log") or "")
 
