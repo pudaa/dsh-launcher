@@ -43,7 +43,15 @@ jobs:
           # DSH 0.1.6-alpha.2 的前端需要 Chromium >= 140（Uint8Array.fromBase64 等），
           # 用 6.9.3 打出来的 exe 会让侧边栏文件预览报「文件资源服务不可用」。
           # 详见 docs/file-preview-unavailable-triage.md
-          pip install PySide6==6.11.2
+          #
+          # **必须 6.11.3，不要 6.12**（2026-11-20 定）：
+          #   6.11.3 是 6.11 线终版，也是目前唯一含 QTBUG-142165（ANGLE
+          #   InputLayoutCache 累积损坏 → 长会话 0xc0000005）修复的 PySide6 发行；
+          #   6.12.0 的 Qt6WebEngineCore.dll 构建于 2026-09-27，早于 backport 合入
+          #   的 2026-10-08，崩溃点机器码与 6.11.2 逐字节相同，且 WebEngine 已拆包、
+          #   要连带改打包链路。判定命令：python tools/webengine_fix_check.py
+          #   （退出码 0 = 含修复）。取证见 docs/webengine-angle-crash.md。
+          pip install PySide6==6.11.3
           pip install nuitka==4.2.1
 
       - name: 校验 tag 与源码里的版本号一致
