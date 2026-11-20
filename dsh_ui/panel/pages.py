@@ -128,7 +128,7 @@ class OverviewPage(BasePage):
 
     FLAGS = (
         ("prerelease_opt_in", "加入预览计划",
-         "跟随官方的候选与尝鲜版本线。官方明示预览版可能含破坏性变更。"),
+         "跟官方预览通道，可能含破坏性变更。"),
         ("adaptive_titlebar", "标题栏跟随界面配色",
          "让窗口标题栏跟随 DSH 界面的主色。需要 Windows 11。"),
     )
@@ -152,7 +152,7 @@ class OverviewPage(BasePage):
         # 只留一个主动作。更新、外观、开发者、数据目录都搬去了「常规」——
         # 以前这些全堆在概览里，用户想看个端口都得先划过一屏设置（2026-10-20 重排）。
         c2 = Card("进入工作", self.pal)
-        c2.add_text("更新与外观、开发者选项、数据目录都在「常规」页。")
+        c2.add_text("更新、外观、数据目录在「常规」页。")
         holder = QWidget()
         row = QHBoxLayout(holder)
         row.setContentsMargins(16, 4, 16, 10)
@@ -325,8 +325,6 @@ class GeneralPage(BasePage):
 
     def build(self) -> None:
         self.layout_.addWidget(_label("常规", "h1"))
-        self.layout_.addWidget(_label(
-            "更新、外观、开发者选项，以及数据目录的位置与清理。"))
 
         # --- 更新与外观 ---
         c1 = Card("更新与外观", self.pal)
@@ -401,9 +399,7 @@ class GeneralPage(BasePage):
         # --- 数据目录 ---
         c3 = Card(
             "数据目录", self.pal,
-            help_text="设置、登录状态、日志、私有安装的 DSH 都在这里。"
-                      "删除程序本身不会移除这些数据；更换设备或重装前，"
-                      "可在此迁移到别处或清空。")
+            help_text="设置、登录、日志和私有 DSH 都在这里，删程序不会删它们。")
         self.card_data = c3
         self.kv_root = KeyValueRow("位置", self.host.data_dir(), self.pal)
         self.kv_usage = KeyValueRow("占用", "统计中…", self.pal)
@@ -553,9 +549,7 @@ class VersionPage(BasePage):
 
     def build(self) -> None:
         self.layout_.addWidget(_label("版本管理", "h1"))
-        self.layout_.addWidget(_label(
-            "每个版本各占一份独立目录，切换不会动到正在用的那份。"
-            "插件装在数据目录里，不随版本变化，但可能因为版本差异而失效。"))
+        self.layout_.addWidget(_label("切换不动正在用的那份。"))
 
         self.kv_cur = KeyValueRow("当前使用", "—", self.pal)
         self.kv_src = KeyValueRow("来源", "—", self.pal)
@@ -606,8 +600,7 @@ class VersionPage(BasePage):
         self.btn_install.clicked.connect(self._install)
         lay.addWidget(self.btn_install)
         c1.add(row)
-        self.install_hint = _label(
-            "装进独立目录，不影响当前在用的版本。装完可以自己决定要不要切过去。", "muted")
+        self.install_hint = _label("装完自己决定要不要切。", "muted")
         self.install_hint.setWordWrap(True)
         self.install_hint.setContentsMargins(16, 4, 16, 8)
         c1.add(self.install_hint)
@@ -640,7 +633,7 @@ class VersionPage(BasePage):
 
         if not rows:
             self.card_list.add_text(
-                "还没有任何版本。可以先把当前安装导入成一份副本，之后再装别的版本。")
+                "还没有版本。先把当前安装导入一份，或直接装新的。")
             self.summary.setText("")
             return
 
@@ -816,7 +809,7 @@ class VersionPage(BasePage):
         lay = QVBoxLayout(dlg)
         lay.setContentsMargins(22, 20, 22, 16)
         lay.setSpacing(10)
-        lay.addWidget(_label("给 %s 写一句备注——叫法、注意事项都行。" % row["version"]))
+        lay.addWidget(_label("给 %s 写个备注。" % row["version"]))
         e = QLineEdit(row.get("note") or "")
         e.setPlaceholderText("例如：稳定版，插件全绿")
         lay.addWidget(e)
@@ -853,7 +846,7 @@ class DeployPage(BasePage):
     def build(self) -> None:
         self.layout_.addWidget(_label("本机部署", "h1"))
         self.layout_.addWidget(_label(
-            "这些步骤需要你手动执行；完成后回到「状态检测」页重新检测即可确认。"))
+            "执行后到「状态检测」重新检测。"))
 
         # 代理提示（2026-10-20）：只在真的有风险时出现——设了代理、且
         # DeepSeek 域名没排除。这时账号功能会"半坏不坏"，用户不可能自己想到。
@@ -880,12 +873,8 @@ class DeployPage(BasePage):
         # 只是从"日常入口"降级成"不想自己装时的兜底"，且必须点进这一页才看得到。
         c3 = Card(
             "自动安装", self.pal,
-            help_text="由本程序自动安装 Node.js 与 DeepSeek Harness，"
-                      "装到应用数据目录，与命令行那份互不影响。\n"
-                      "需要联网，过程中会显示进度窗口。")
-        c3.add_text(f"可以让{HOST_NAME}代劳：自动安装 Node.js 与 DeepSeek Harness。"
-                    "装到应用自己的数据目录（和命令行里那份互不影响）。"
-                    "需要联网，中途会弹出进度窗口。")
+            help_text="装到应用数据目录，与命令行那份互不影响。")
+        c3.add_text(f"让{HOST_NAME}代劳，需要联网。")
         holder = QWidget()
         lay = QHBoxLayout(holder)
         lay.setContentsMargins(16, 4, 16, 10)
@@ -902,11 +891,8 @@ class DeployPage(BasePage):
         # 跑到部署页找重装。
         c4 = Card(
             "修复版本不一致", self.pal,
-            help_text="更新后若部分组件仍停留在旧版本，会出现接口报错、"
-                      "账号信息无法加载等症状，版本号看起来却是正常的。\n"
-                      "重新安装会重装全部组件，会话记录、登录状态与设置不受影响。")
-        c4.add_text("若出现接口报错或账号信息无法加载，通常是部分组件仍停留在旧版本。"
-                    "重新安装即可修复，会话记录、登录状态与设置均不受影响。")
+            help_text="症状是接口报错、账号读不出，版本号却正常。")
+        c4.add_text("重装全部组件，数据不受影响。")
         holder2 = QWidget()
         lay2 = QHBoxLayout(holder2)
         lay2.setContentsMargins(16, 4, 16, 10)
@@ -988,9 +974,7 @@ class RunModePage(BasePage):
 
     def build(self) -> None:
         self.layout_.addWidget(_label("运行方式", "h1"))
-        self.layout_.addWidget(_label(
-            "选择本程序使用的 DSH 安装。切换会重启后台服务，"
-            "会话记录与登录状态不受影响。"))
+        self.layout_.addWidget(_label("切换会重启服务，数据不受影响。"))
 
         self.kv_mode = KeyValueRow("当前使用", "—", self.pal)
         self.kv_ver = KeyValueRow("实际版本", "—", self.pal)
@@ -1009,12 +993,10 @@ class RunModePage(BasePage):
         # --- 私有 ---
         c1 = Card(
             "私有安装（推荐）", self.pal,
-            help_text="本程序独占管理这份 DSH，升级只作用于它，"
-                      "不会因为终端里的 npm 操作变成「主程序升了、组件还在旧版」。\n"
-                      "代价是多占用一份磁盘空间。")
+            help_text="本程序独占管理，不受终端 npm 操作影响。代价是多占一份磁盘。")
         self.kv_priv = KeyValueRow("状态", "—", self.pal)
         c1.add(self.kv_priv)
-        c1.add_text("独立安装在应用数据目录，与命令行那份互不影响。")
+        c1.add_text("与命令行那份互不影响。")
         h1 = QWidget()
         r1 = QHBoxLayout(h1)
         r1.setContentsMargins(16, 4, 16, 10)
@@ -1030,12 +1012,10 @@ class RunModePage(BasePage):
         # --- 公共 ---
         c2 = Card(
             "公共安装（与命令行共用）", self.pal,
-            help_text="它与终端里的那份 DSH 是同一套文件。你在终端执行升级时，"
-                      "这里的组件也会随之变化；两边同时改动同一份文件，"
-                      "可能出现版本不一致，表现为界面接口报错。")
+            help_text="与终端里那份是同一套文件，你升级它也变。")
         self.kv_pub = KeyValueRow("状态", "—", self.pal)
         c2.add(self.kv_pub)
-        c2.add_text("使用命令行里的那份 DSH，不额外占用磁盘。")
+        c2.add_text("不额外占用磁盘。")
         h2 = QWidget()
         r2 = QHBoxLayout(h2)
         r2.setContentsMargins(16, 4, 16, 10)
@@ -1063,11 +1043,8 @@ class RunModePage(BasePage):
         # 判不准进程身份）。不标的话，用户会以为是成熟功能。
         card = Card(
             "远程 DSH（实验）", self.pal,
-            help_text="断开会话后，远端 dsh web 的处置按这台主机的设置执行："
-                      "保留（适合跑长任务的服务器）、停止（适合临时连一次的机器），"
-                      "或每次询问。\n"
-                      "认证使用系统 SSH 的密钥或 agent，本程序不保存密码。\n"
-                      "DSH 始终只监听远端本机地址，端口由 SSH 隧道转发，不对外暴露。")
+            help_text="断开的处置按主机设置：保留 / 停止 / 每次询问。\n"
+                      "认证走系统 SSH，本程序不存密码。DSH 只监听远端本机，经 SSH 隧道转发。")
         self.kv_remote = KeyValueRow("当前连接", "未连接", self.pal)
         card.add(self.kv_remote)
 
@@ -1100,8 +1077,7 @@ class RunModePage(BasePage):
         row.addStretch(1)
         card.add(holder)
 
-        card.add_text("远端服务的去留按主机设置执行。DSH 只监听远端本机，"
-                      "端口经 SSH 隧道转发。")
+        card.add_text("远端服务去留按主机设置。DSH 只监听远端本机。")
         return card
 
     def _rebuild_hosts(self) -> None:
