@@ -5,6 +5,7 @@
 from __future__ import annotations
 from .styles import *          # noqa: F401,F403
 from .styles import _css, _label  # noqa: F401  (import * 不带下划线名)
+from dsh_ui import theme as dsh_theme   # style_dialog / style_combo / MessageDialog
 from .widgets import *         # noqa: F401,F403
 from .workers import *         # noqa: F401,F403
 from .host import *            # noqa: F401,F403  (guide_links)
@@ -987,6 +988,7 @@ class RunModePage(BasePage):
         # （配好之后每次只是连一下）。放最后要滚两屏才够到，等于藏起来。
         self.layout_.addWidget(self._build_remote_card())
         self._rebuild_hosts()
+        self.layout_.addWidget(self._build_start_card())
 
         # --- 私有 ---
         c1 = Card(
@@ -1074,6 +1076,54 @@ class RunModePage(BasePage):
         card.add(holder)
 
         return card
+
+    def _build_start_card(self) -> Card:
+        """「启动时先起谁」。没配远程主机时后两项不能选。"""
+        card = Card("启动时", self.pal)
+        row = QWidget()
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(16, 4, 16, 10)
+        lay.setSpacing(8)
+        combo = QComboBox()
+        combo.addItem("先起本机", "local")
+        combo.addItem("直接连远程", "remote")
+        combo.addItem("每次询问", "ask")
+        hosts = self.host.remote_hosts() or []
+        if not hosts:
+            # 没有可用主机时，"连远程"和"每次询问"都是死选项——禁用比
+            # 选了之后启动失败好。
+            for i in (1, 2):
+                item = combo.model().item(i)
+                if item is not None:
+                    item.setEnabled(False)
+        cur = str(config.get("start_mode") or "local")
+        combo.setCurrentIndex({"local": 0, "remote": 1, "ask": 2}.get(cur, 0))
+        combo.currentIndexChanged.connect(
+            lambda i: self._on_start_mode(combo.itemData(i)))
+        lay.addWidget(combo)
+        lay.addStretch(1)
+        card.add(row)
+        # 面板是独立窗口，不继承应用级 QSS，所以这里要把外框写上——
+        # 不然它会退化成"纯文字 + 一个小箭头"（截图确认）。
+        combo.setStyleSheet(
+            "QComboBox { background: %(card)s; color: %(text)s;"
+            " border: 1px solid %(line)s; border-radius: 6px;"
+            " padding: 5px 26px 5px 10px; font-family: %(font)s; font-size: 13px; }"
+            "QComboBox:hover { border-color: %(muted)s; }"
+            % {"card": self.pal["card"], "text": self.pal["text"],
+               "line": self.pal["line"], "muted": self.pal["muted"], "font": FONT})
+        dsh_theme.style_combo(combo, self.pal)
+        self.combo_start = combo
+        return card
+
+    def _on_start_mode(self, mode: str) -> None:
+        if not mode:
+            return
+        config.set(start_mode=mode)
+        if mode == "remote" and not config.get("start_remote_host"):
+            hosts = self.host.remote_hosts() or []
+            if hosts:
+                config.set(start_remote_host=hosts[0].id)
 
     def _rebuild_hosts(self) -> None:
         while self._hosts_lay.count():
