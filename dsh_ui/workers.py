@@ -351,6 +351,39 @@ class UpdateWorker(QThread):
 
         try:
             inst = contract.resolve_install()
+            # **版本库启用时走无损路径**：装到 versions/<目标>，再切指针。
+            #
+            # 老路径（update_to）是"停服务 → 覆盖当前那份 → 重启"：装到一半
+            # 出错，用户手里那份已经没了。版本库路径下，装失败只是多一个
+            # 不完整目录，正在用的那份从头到尾没被碰过——这是版本管理最大的
+            # 收益，比"能选版本"本身更重要（2026-11-16 做 P3 时接上）。
+            from dsh_host import versions as _v
+            if _v.is_enabled():
+                old_ver = inst.version
+                stop_service()
+                ok, detail = _v.install(self.target, inst.node, inst.npm_cli,
+                                        on_line=self.line.emit)
+                if not ok:
+                    self.line.emit("安装失败，正在用原来的版本恢复服务…")
+                    # 没切指针，resolve 仍然指向旧版本，直接拉起来即可
+                    start_service()
+                    self.done.emit(False, detail, box.get("handle"))
+                    return
+                _ok2, msg2 = _v.activate(self.target)
+                if not _ok2:
+                    self.line.emit("切换失败：%s；仍用原版本" % msg2)
+                    start_service()
+                    self.done.emit(False, msg2, box.get("handle"))
+                    return
+                # 记一笔"上一个版本"，让回滚有目标（它现在在版本库里，
+                # 回滚就是切回去，不用重新下载）
+                config.set(previous_version=old_ver, last_good_version=self.target)
+                self.line.emit("已切到 %s，重启服务…" % self.target)
+                start_service()
+                self.done.emit(True, "已安装 %s 并切换" % self.target,
+                               box.get("handle"))
+                return
+
             ok, detail = updater.update_to(inst, self.target, stop_service,
                                            start_service, on_line=self.line.emit,
                                            fresh=self.fresh)

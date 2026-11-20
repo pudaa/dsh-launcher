@@ -122,9 +122,25 @@ class UpdatesMixin:
         host_log("回归稳定版 %s" % target)
         self._show_update_dialog(target)
     def _rollback(self):
+        """回滚到上一个版本。
+
+        **版本库里有就直接切过去，不重新下载。**
+        以前这里一律走更新对话框（= `npm install -g <旧版>`），实测要 6 分钟
+        656 个包；而预发布版本一旦被 npm unpublish，那条路根本走不通——
+        用户明明本机就有那一份，却回不去（2026-11-16 做版本库时改掉）。
+        """
         prev = config.get("previous_version")
-        if prev:
-            self._show_update_dialog(prev)
+        if not prev:
+            self._info("没有可回滚的版本记录。\n\n换过版本之后这里才会有内容。")
+            return
+        from dsh_host import versions
+        have = {v["version"] for v in versions.list_installed()}
+        if prev in have:
+            host_log("回滚：版本库里已有 %s，直接切换（不下载）" % prev)
+            self._activate_version(prev)
+            return
+        host_log("回滚：版本库里没有 %s，走安装流程" % prev)
+        self._show_update_dialog(prev)
     def _reinstall_dsh(self):
         """按当前版本重装一遍 DSH。
 
