@@ -290,6 +290,15 @@ def selftest_checks() -> list:
     check("切进常规页不等占用统计（不再卡顿）",
           goto_cost is not None and goto_cost < 0.5,
           "%.3f 秒" % goto_cost if goto_cost is not None else "页面未构建")
+    # 先让缓存失效再显式刷一次，断言才钉在「这一次真的交给了后台线程」上。
+    # 不这么做的话：前面 5 页轮切时 GeneralPage 已经算过一轮，若那次在 30 秒 TTL
+    # 内完成，这里会走 _render_usage 的同步缓存分支，_usage_worker 停在上一次已结束
+    # 的实例上 —— 断言随事件循环快慢随机翻车（2026-11-20 CI 实测：切页 0.010 秒，
+    # 却判 worker 未运行）。
+    if gp is not None:
+        gp._usage = None
+        gp._usage_at = 0.0
+        gp.refresh()
     check("占用统计跑在后台线程（不占界面线程）",
           gp is not None and gp._usage_worker is not None
           and gp._usage_worker.isRunning())
