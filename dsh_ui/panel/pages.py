@@ -18,9 +18,10 @@ from string import Template
 from PySide6.QtCore import (QAbstractAnimation, QEvent, Property, QEasingCurve,
                             QPointF, QPropertyAnimation, QRectF, QSize, Qt,
                             QThread, QTimer, QUrl, Signal)
-from PySide6.QtGui import (QColor, QDesktopServices, QGuiApplication, QPainter,
+from PySide6.QtGui import (QColor, QDesktopServices, QGuiApplication, QIcon, QPainter,
+                           QPixmap, QTransform,
                            QPainterPath, QPen)
-from PySide6.QtWidgets import (QComboBox, QDialog, QFrame,
+from PySide6.QtWidgets import (QComboBox, QDialog, QFrame, QMenu,
                                QGraphicsOpacityEffect, QHBoxLayout, QLabel,
                                QLineEdit, QPushButton, QScrollArea,
                                QSizePolicy, QStackedWidget, QToolButton,
@@ -1078,48 +1079,65 @@ class RunModePage(BasePage):
         return card
 
     def _build_start_card(self) -> Card:
-        """「启动时先起谁」。没配远程主机时后两项不能选。"""
+        """「启动时先起谁」。
+
+        **不用 QComboBox。** 它的外框和下拉箭头都由系统自绘，和这套令牌对不上
+        （老大原话："UI 主题一致性很重要"）。改成按钮 + QMenu：
+        QMenu 走项目统一的 `apply_menu`（那里已经处理了 Win11 给菜单挂阴影
+        导致硬裁边的问题），箭头用 SVG 图标自己画。
+        """
         card = Card("启动时", self.pal)
         row = QWidget()
         lay = QHBoxLayout(row)
         lay.setContentsMargins(16, 4, 16, 10)
         lay.setSpacing(8)
-        combo = QComboBox()
-        combo.addItem("先起本机", "local")
-        combo.addItem("直接连远程", "remote")
-        combo.addItem("每次询问", "ask")
+
+        self._start_modes = [("先起本机", "local"),
+                             ("直接连远程", "remote"),
+                             ("每次询问", "ask")]
         hosts = self.host.remote_hosts() or []
-        if not hosts:
-            # 没有可用主机时，"连远程"和"每次询问"都是死选项——禁用比
-            # 选了之后启动失败好。
-            for i in (1, 2):
-                item = combo.model().item(i)
-                if item is not None:
-                    item.setEnabled(False)
         cur = str(config.get("start_mode") or "local")
-        combo.setCurrentIndex({"local": 0, "remote": 1, "ask": 2}.get(cur, 0))
-        combo.currentIndexChanged.connect(
-            lambda i: self._on_start_mode(combo.itemData(i)))
-        lay.addWidget(combo)
+
+        btn = QPushButton()
+        btn.setObjectName("ghost")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        # 箭头从 chevron-right 转 90° 得到，不为一个箭头再添一张图
+        img = icons.render("chevron-right", 12, self.pal["muted"], dpr=2.0)
+        arrow = QPixmap.fromImage(
+            img.transformed(QTransform().rotate(90), Qt.TransformationMode.SmoothTransformation))
+        btn.setIcon(QIcon(arrow))
+        btn.setLayoutDirection(Qt.LayoutDirection.RightToLeft)   # 图标放右边
+        btn.setMinimumWidth(150)
+        lay.addWidget(btn)
         lay.addStretch(1)
         card.add(row)
-        # 面板是独立窗口，不继承应用级 QSS，所以这里要把外框写上——
-        # 不然它会退化成"纯文字 + 一个小箭头"（截图确认）。
-        combo.setStyleSheet(
-            "QComboBox { background: %(card)s; color: %(text)s;"
-            " border: 1px solid %(line)s; border-radius: 6px;"
-            " padding: 5px 26px 5px 10px; font-family: %(font)s; font-size: 13px; }"
-            "QComboBox:hover { border-color: %(muted)s; }"
-            % {"card": self.pal["card"], "text": self.pal["text"],
-               "line": self.pal["line"], "muted": self.pal["muted"], "font": FONT})
-        dsh_theme.style_combo(combo, self.pal)
-        self.combo_start = combo
+        self.btn_start = btn
+        self._refresh_start_button(btn, cur, hosts)
+        btn.clicked.connect(lambda: self._open_start_menu(btn, hosts))
         return card
+
+    def _refresh_start_button(self, btn, mode: str, hosts) -> None:
+        label = dict(self._start_modes).get(mode, "先起本机")
+        btn.setText(label + "  ")
+
+    def _open_start_menu(self, btn, hosts) -> None:
+        cur = str(config.get("start_mode") or "local")
+        menu = QMenu(btn)
+        for label, mode in self._start_modes:
+            act = menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(mode == cur)
+            act.setEnabled(bool(hosts) or mode == "local")
+            act.triggered.connect(lambda _=False, m=mode: self._on_start_mode(m))
+        dsh_theme.apply_menu(menu, self.pal)
+        menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
 
     def _on_start_mode(self, mode: str) -> None:
         if not mode:
             return
         config.set(start_mode=mode)
+        if getattr(self, "btn_start", None) is not None:
+            self._refresh_start_button(self.btn_start, mode, self.host.remote_hosts() or [])
         if mode == "remote" and not config.get("start_remote_host"):
             hosts = self.host.remote_hosts() or []
             if hosts:
