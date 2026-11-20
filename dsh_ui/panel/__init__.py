@@ -279,6 +279,28 @@ def selftest_checks() -> list:
           sp is not None and set(sp.rows.keys()) == {k for k, _n in CHECK_ROWS},
           "、".join(sp.rows.keys()) if sp is not None else "状态页未构建")
 
+    # --- 版本管理页：会刷新、清理只删刚换下的那个（2026-11-20）---
+    vp = _page_of(panel, VersionPage)
+    _show_ok = False
+    if vp is not None and "on_show" in type(vp).__dict__:
+        try:
+            vp.on_show()          # 覆盖了就必须真能跑通（它会重读磁盘）
+            _show_ok = True
+        except Exception:                                    # noqa: BLE001
+            _show_ok = False
+    check("版本页每次切回都重读磁盘", _show_ok, "on_show 已覆盖并执行通过")
+    from dsh_ui.dialogs import VersionCleanupDialog
+    _cand = [{"version": "0.0.1", "size_mb": 900},
+             {"version": "0.0.2", "size_mb": 800}]
+    _dlg = VersionCleanupDialog(
+        panel, {"needed": True, "total_mb": 1700, "count": 3,
+                "active": "0.0.3", "candidates": _cand},
+        {"version": "0.0.2", "size_mb": 800})
+    check("清理提示只点名刚换下的那一个版本",
+          _dlg.to_remove == ["0.0.2"],
+          "to_remove=%s" % (_dlg.to_remove,))
+    _dlg.deleteLater()
+
     # --- 常规页的占用统计必须走后台线程（2026-10-20 卡顿回归）---
     # 用户反馈"每次切进常规 tab 都明显卡顿"：根因是 `storage.breakdown()`
     # 在 GUI 线程里同步遍历整个数据根（实测 10.2 秒 / 6.6 万文件 / 727 MB）。

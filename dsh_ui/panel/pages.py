@@ -549,6 +549,18 @@ class VersionPage(BasePage):
     而切换是一次指针移动。这一页就是把这件事摆出来让人看得见。
     """
 
+    def on_show(self) -> None:
+        """每次切回这一页都重读磁盘。
+
+        页面原先只在首次构建时 refresh 一次，之后不主动推就永远停在旧快照上：
+        更新完 DSH、切完版本、导入新版本，回来看到的还是上次的列表
+        （2026-11-20 报告「版本信息不刷新」）。
+        """
+        if not self._built:
+            super().on_show()
+        else:
+            self.refresh()
+
     def build(self) -> None:
         self.layout_.addWidget(_label("版本管理", "h1"))
         self.layout_.addWidget(_label("切换不动正在用的那份。"))

@@ -252,6 +252,7 @@ class ServiceMixin:
             return
         # 切换后必须清掉"启动路径"缓存里那个已就绪标记
         self._set_tip("正在用 %s 启动…" % version)
+        self._refresh_versions_page()
         self._prepare_env()
 
     def _stop_service(self) -> int:

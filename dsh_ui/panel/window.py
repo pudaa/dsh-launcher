@@ -253,6 +253,20 @@ class ControlPanel(QWidget):
             self.pages[index] = page
         return page
 
+    def refresh_versions(self) -> None:
+        """让「版本管理」页立刻重读磁盘（没构建过就什么都不做）。
+
+        更新与切版本都发生在别处，页面自己不知道；以前只能等用户切回去，
+        而切回去也不刷新（VersionPage 没覆盖 on_show）。
+        """
+        for page in self.pages.values():
+            if isinstance(page, VersionPage):
+                try:
+                    page.refresh()
+                except Exception as e:                       # noqa: BLE001
+                    host_log("刷新版本页失败：%s: %s" % (type(e).__name__, e))
+                return
+
     def goto(self, index: int) -> None:
         if index < 0 or index >= len(self.PAGES):
             return

@@ -159,20 +159,23 @@ class VersionCleanupDialog(QDialog):
     想精细挑选的人去版本页自己删，不必在这个提示里替他把选项铺开。
     """
 
-    def __init__(self, parent, info: dict):
+    def __init__(self, parent, info: dict, victim: dict | None = None):
         super().__init__(parent)
         self.setWindowTitle("旧版本")
         self.setMinimumWidth(360)
-        # 删除的对象是**除当前版本以外**的全部
-        self.to_remove: list[str] = [c["version"] for c in info["candidates"]]
+        # 只删**刚被换下来的那一个**。以前这里是全部 candidates，配上
+        # 「保留 / 删除」两个按钮，点一次删除等于把版本库里的旧版全清空
+        # （2026-11-20 老大实测踩到）。想多删几个的人去「版本管理」页逐个删，
+        # 这个提示不该替他做决定。认不出是哪个就一个都不删。
+        v = dict(victim or {})
+        self.to_remove: list[str] = [v["version"]] if v.get("version") else []
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(22, 18, 22, 14)
         lay.setSpacing(14)
 
-        msg = QLabel("旧版本要留着吗？\n%d 个，共 %d MB。" % (
-            len(info["candidates"]),
-            sum(c["size_mb"] for c in info["candidates"])))
+        msg = QLabel("刚换下来的 %s（%d MB）要留着吗？" % (
+            v.get("version") or "旧版本", int(v.get("size_mb") or 0)))
         msg.setObjectName("dlgBody")
         lay.addWidget(msg)
 

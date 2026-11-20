@@ -139,7 +139,15 @@ class UpdatesMixin:
             return
         host_log("版本库占用 %d MB / %d 个版本，提示清理"
                  % (info["total_mb"], info["count"]))
-        dlg = VersionCleanupDialog(self, info)
+        # 只问刚被换下来那一个，不是「旧版本」这个集合。
+        prev = config.get("previous_version")
+        hit = next((c for c in info["candidates"] if c["version"] == prev), None)
+        if hit is None:
+            # 认不出是哪个就一个都不问：宁可不说，也不能删错
+            host_log("版本库里有 %d 个旧版本，但查不到刚换下来的那个，跳过清理提示"
+                     % len(info["candidates"]))
+            return
+        dlg = VersionCleanupDialog(self, info, hit)
         accepted = dlg.exec() == QDialog.DialogCode.Accepted
         targets = list(dlg.to_remove) if accepted else []
         dlg.deleteLater()
@@ -152,8 +160,22 @@ class UpdatesMixin:
                 host_log("已删除旧版本 %s" % v)
             else:
                 host_log("删除 %s 失败：%s" % (v, msg))
+        self._refresh_versions_page()
         if freed:
             self._info("已清理 %d MB。" % freed)
+
+    def _refresh_versions_page(self) -> None:
+        """更新/切版本/删版本之后，让「版本管理」页立刻反映新状态。
+
+        面板可能正开着这一页；不推一次，用户看到的还是更新前的列表。
+        """
+        panel = getattr(self, "_panel", None)
+        if panel is None:
+            return
+        try:
+            panel.refresh_versions()
+        except Exception as e:                               # noqa: BLE001
+            host_log("刷新版本页失败：%s: %s" % (type(e).__name__, e))
 
     def _rollback(self):
         """回滚到上一个版本。
@@ -235,6 +257,7 @@ class UpdatesMixin:
             # 版本库模式下每次更新都会**新增**一个版本目录（旧的不删），
             # 攒几次就是好几个 GB，而用户不会主动去版本页看自己堆了多少。
             # 挑"刚更新完、还惦记着这件事"的时候问一句最自然。
+            self._refresh_versions_page()
             QTimer.singleShot(2400, self._maybe_suggest_cleanup)
     def _check_host_update(self, manual: bool):
         """检查桌面壳自身更新。与 DSH 检查完全独立。"""
