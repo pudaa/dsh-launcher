@@ -148,3 +148,59 @@ class MemWorker(QThread):
         """停并等它真的退出。返回是否在超时内结束。"""
         self._halt.set()
         return self.wait(timeout_ms)
+
+
+class VersionProbeWorker(QThread):
+    """版本页里「贵」的那一半：插件适配、系统里那份、缺的体积。
+
+    实测（2026-11-20）：plugin_scan 0.14s、system_install 0.44s、
+    每个已装版本的 plugin_compat 0.27s（起一个 node 子进程）——单个版本
+    就 0.85s，三五个版本轻松两三秒。压在界面线程上就是「点开版本页先僵住」。
+    """
+    done = Signal(object)
+
+    def __init__(self, rows, parent=None):
+        super().__init__(parent)
+        self.rows = list(rows or [])
+
+    def run(self):
+        from dsh_host import versions as _v
+        out = {"plugins": [], "compat": {}, "system": {}, "sizes": {},
+               "error": ""}
+        try:
+            out["plugins"] = _v.plugin_scan()
+            for r in self.rows:
+                try:
+                    out["compat"][r["version"]] = _v.plugin_compat(
+                        r["version"], out["plugins"])
+                except Exception:                            # noqa: BLE001
+                    pass
+                # index 里没有体积的老记录在这里补算（1 GB 目录要几百毫秒）
+                if not r.get("size_mb"):
+                    try:
+                        out["sizes"][r["version"]] = _v.dir_size_mb(r["path"])
+                    except Exception:                        # noqa: BLE001
+                        pass
+            try:
+                out["system"] = _v.system_install()
+            except Exception:                                # noqa: BLE001
+                out["system"] = {}
+        except Exception as e:                               # noqa: BLE001
+            out["error"] = "%s: %s" % (type(e).__name__, e)
+        self.done.emit(out)
+
+
+class VersionAvailWorker(QThread):
+    """拉 registry 上的全部版本。**联网**，所以单独一个线程。
+
+    registry 一项 1 秒多，网络差时更久；它只决定「可安装」那一块，
+    不该拖着已经能显示的已安装列表一起等。
+    """
+    done = Signal(list)
+
+    def run(self):
+        from dsh_host import versions as _v
+        try:
+            self.done.emit(_v.available_versions())
+        except Exception:                                    # noqa: BLE001
+            self.done.emit([])

@@ -452,6 +452,67 @@ def cleanup_suggestion() -> dict:
     return {"needed": needed, "total_mb": total, "count": len(rows),
             "active": active, "candidates": others}
 
+#: 「可安装版本」列表的进程内缓存（秒）。registry 拉一次 1 秒多，
+#: 而用户会在页面上反复看——没必要每次都拉。失败不缓存。
+AVAIL_TTL = 120.0
+_avail_cache: dict = {"at": 0.0, "rows": []}
+
+
+def versions_from_doc(doc: dict) -> list[dict]:
+    """从 registry 文档里抽出 [{version, published}]，按发布时间倒序。
+
+    纯函数，不联网：自测直接喂一份假文档就能验排序与字段。
+    `time` 里没有的版本排在最后（用空串当 key，稳定排序）。
+    """
+    vs = doc.get("versions") if isinstance(doc, dict) else None
+    if not isinstance(vs, dict):
+        return []
+    times = doc.get("time") if isinstance(doc.get("time"), dict) else {}
+    rows = [{"version": str(k),
+             "published": str(times.get(k) or "")} for k in vs]
+    rows.sort(key=lambda r: r["published"] or "", reverse=True)
+    return rows
+
+
+def pending_versions(avail: list[dict], installed, limit: int | None = None) -> list[dict]:
+    """registry 列表里排除已安装的，可选截断到 limit。
+
+    纯函数：页面分页与自测共用同一套判定，避免「界面上过滤了、分页却按全量算」。
+    """
+    have = set(installed or ())
+    out = [r for r in (avail or []) if r.get("version") not in have]
+    return out[:limit] if limit else out
+
+
+def available_versions(ttl: float = AVAIL_TTL) -> list[dict]:
+    """registry 上的全部版本（含未安装的）。取不到就返回空列表。
+
+    走 updater 已有的两条路：先问 npm 配置里的 registry（尊重镜像），
+    再退回官方 npmjs。**不抛异常**——页面拿不到列表时只是少了这一块，
+    不该因此整页报错。
+    """
+    now = time.time()
+    if _avail_cache["rows"] and now - _avail_cache["at"] < ttl:
+        return _avail_cache["rows"]
+    from . import updater
+    doc = None
+    try:
+        install = contract.resolve_install(verify=False)
+        reg = updater.get_registry(install).rstrip("/")
+        pkg = updater.PKG_NAME.replace("/", "%2f")
+        for url in ("%s/%s" % (reg, pkg),
+                    "https://registry.npmjs.org/%s" % pkg):
+            doc = updater._http_json(url)
+            if isinstance(doc, dict) and doc.get("versions"):
+                break
+    except Exception:                                          # noqa: BLE001
+        doc = None
+    rows = versions_from_doc(doc or {})
+    if rows:
+        _avail_cache.update({"at": now, "rows": rows})
+    return rows
+
+
 def prefix_of(bin_js: str) -> str:
     """从 bin.js 反推 npm prefix。
 

@@ -38,7 +38,7 @@ class PanelHost:
                  flag=None, set_flag=None, action=None, data_dir=None,
                  usage=None, remote_hosts=None, remote_save=None,
                  remote_connect=None, remote_disconnect=None,
-                 remote_state=None):
+                 remote_state=None, net: bool = True):
         self._install = install
         self._handle = handle
         self._release = host_release
@@ -64,6 +64,9 @@ class PanelHost:
         self.remote_disconnect = remote_disconnect or (lambda: None)
         #: {"host_id":…, "stage":…, "connected":bool, "error":…}
         self.remote_state = remote_state or (lambda: {})
+        #: 面板是否允许自己联网、起子进程（版本页拉 registry / 算插件适配）。
+        #: 自测关掉它：静态检查不该依赖网络，也不该等 npm。
+        self.net = bool(net)
 
     def install(self):
         return self._install() if callable(self._install) else self._install

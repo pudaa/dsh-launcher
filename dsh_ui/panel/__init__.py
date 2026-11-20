@@ -172,7 +172,8 @@ def selftest_checks() -> list:
     host = PanelHost(install=None, handle=None, theme=lambda: "dark",
                      usage=fake_usage_scan,
                      remote_hosts=lambda: list(fake_hosts),
-                     remote_state=lambda: dict(fake_remote_state))
+                     remote_state=lambda: dict(fake_remote_state),
+                     net=False)
     panel = ControlPanel(host)
     panel.resize(PANEL_W, PANEL_H)
     panel.show()
@@ -300,6 +301,18 @@ def selftest_checks() -> list:
           _dlg.to_remove == ["0.0.2"],
           "to_remove=%s" % (_dlg.to_remove,))
     _dlg.deleteLater()
+    from dsh_host import versions as _vs
+    _doc = {"versions": {"1.0.0": {}, "2.0.0": {}, "1.5.0": {}},
+            "time": {"1.0.0": "2026-01-01T00:00:00Z",
+                     "2.0.0": "2026-03-01T00:00:00Z",
+                     "1.5.0": "2026-02-01T00:00:00Z"}}
+    _avail = _vs.versions_from_doc(_doc)
+    check("可安装版本按发布时间倒序",
+          [r["version"] for r in _avail] == ["2.0.0", "1.5.0", "1.0.0"])
+    check("已安装的版本不出现在可安装里",
+          [r["version"] for r in _vs.pending_versions(_avail, ["1.5.0"])]
+          == ["2.0.0", "1.0.0"])
+    check("可安装列表每批 10 个", AVAIL_PAGE == 10)
 
     # --- 常规页的占用统计必须走后台线程（2026-10-20 卡顿回归）---
     # 用户反馈"每次切进常规 tab 都明显卡顿"：根因是 `storage.breakdown()`

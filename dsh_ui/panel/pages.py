@@ -536,6 +536,11 @@ class GeneralPage(BasePage):
         for r in self.toggles.values():
             r.set_palette_colors(pal)
 
+#: 「可安装」列表每批显示多少个。registry 上有 40+ 个版本，一次铺开
+#: 又长又没必要——先给最近的一批，其余点「显示更多」。
+AVAIL_PAGE = 10
+
+
 class VersionPage(BasePage):
     """版本库：多个 DSH 版本共存，切换只改指针。
 
@@ -619,6 +624,32 @@ class VersionPage(BasePage):
         self.install_hint.setContentsMargins(16, 4, 16, 8)
         c1.add(self.install_hint)
         self.layout_.addWidget(c1)
+
+        # --- 可安装：registry 上的全部版本 ---
+        # 以前只能自己去搜版本号再回来填，跟「版本管理」的用途是反的。
+        # 这里列出全部版本、已装的自动排除，版本多时分批显示。
+        c3 = Card("可安装", self.pal)
+        self.card_avail = c3
+        self.layout_.addWidget(c3)
+        # 提示行放在卡片**外面**：卡片内容每次刷新会整个清空重建，
+        # 挂进去的控件下一次就成了「已删除对象」（2026-11-20 实测踩到）。
+        self.avail_hint = _label("正在获取版本列表…", "muted")
+        self.avail_hint.setContentsMargins(16, 0, 16, 4)
+        self.layout_.addWidget(self.avail_hint)
+        self.btn_more = QPushButton("显示更多")
+        self.btn_more.setObjectName("ghost")
+        self.btn_more.clicked.connect(self._more_avail)
+        self.btn_more.setVisible(False)
+        self.layout_.addWidget(self.btn_more)
+
+        # refresh 会重建这些；后台线程的结果也回填到这里
+        self._rows = []
+        self._active = ""
+        self._compat = {}
+        self._avail_all = []
+        self._avail_limit = AVAIL_PAGE
+        self._probe_worker = None
+        self._avail_worker = None
         self.refresh()
 
     # ---- 渲染 ----
@@ -641,6 +672,9 @@ class VersionPage(BasePage):
         except Exception as e:                                   # noqa: BLE001
             self.summary.setText("读取版本库失败：%s" % e)
             return
+        self._rows = rows
+        self._active = active
+        self._compat = {}
 
         self.kv_cur.set(active or "未启用版本库")
         self.kv_src.set(config.get("dsh_version_prefix") or "（未设置）")
@@ -649,29 +683,127 @@ class VersionPage(BasePage):
             self.card_list.add_text(
                 "还没有版本。先把当前安装导入一份，或直接装新的。")
             self.summary.setText("")
-            return
+        else:
+            # 先把便宜的部分画出来：版本号与 index.json 里现成的体积。
+            # 插件适配要起 node 子进程、系统那份要问 npm，一律挪到后台——
+            # 否则「点开版本页」要先僵半秒到好几秒（版本越多越久）。
+            for row in rows:
+                self.card_list.add(self._row(row, row["version"] == active))
+            self.summary.setText(
+                "共 %d 个版本，合计 %d MB。" % (len(rows), sum(r["size_mb"] for r in rows))
+                if enabled else "版本库未启用：下拉里选了版本之后才会用它启动。")
+        self.card_system.setVisible(False)
+        self._start_probe(rows)
+        self._start_avail()
 
-        # 系统那份：只在"有，而且版本库里还没有"时才露出来
-        try:
-            sys_inst = versions.system_install()
-        except Exception:                                        # noqa: BLE001
-            sys_inst = {}
-        if sys_inst and sys_inst["version"] not in {r["version"] for r in rows}:
-            self.sys_text.setText("检测到 %s（%s）。导入一份副本之后就能在版本库里切它。"
-                                  % (sys_inst["version"], sys_inst["source"]))
+    # ---- 后台探测：插件适配 / 系统里那份 / 缺的体积 ----
+    def _start_probe(self, rows) -> None:
+        if not getattr(self.host, "net", True):
+            return
+        if not rows or (self._probe_worker is not None
+                        and self._probe_worker.isRunning()):
+            return
+        self._probe_worker = VersionProbeWorker(rows, self)
+        self._probe_worker.done.connect(self._apply_probe)
+        self._probe_worker.start()
+
+    def _apply_probe(self, out: dict) -> None:
+        self._compat = out.get("compat") or {}
+        sizes = out.get("sizes") or {}
+        for row in self._rows:
+            if row["version"] in sizes:
+                row["size_mb"] = sizes[row["version"]]
+        # 用缓存好的结果重画（不再起子进程，很快）
+        self._clear(self.card_list)
+        for row in self._rows:
+            self.card_list.add(self._row(row, row["version"] == self._active))
+        sys_inst = out.get("system") or {}
+        known = {r["version"] for r in self._rows}
+        if sys_inst.get("version") and sys_inst["version"] not in known:
+            self.sys_text.setText(
+                "检测到 %s（%s）。导入一份副本之后就能在版本库里切它。"
+                % (sys_inst["version"], sys_inst.get("source") or ""))
             self.card_system.setVisible(True)
         else:
             self.card_system.setVisible(False)
+        if out.get("error"):
+            self.summary.setToolTip("后台检测出错：%s" % out["error"])
 
-        plugins = versions.plugin_scan()
-        for row in rows:
-            self.card_list.add(self._row(row, row["version"] == active, plugins))
-        self.summary.setText(
-            "共 %d 个版本，合计 %d MB。" % (len(rows), sum(r["size_mb"] for r in rows))
-            if enabled else "版本库未启用：下拉里选了版本之后才会用它启动。")
+    # ---- 可安装列表 ----
+    def _start_avail(self) -> None:
+        if not getattr(self.host, "net", True):
+            return
+        if self._avail_worker is not None and self._avail_worker.isRunning():
+            return
+        self.avail_hint.setText("正在获取版本列表…")
+        self._avail_worker = VersionAvailWorker(self)
+        self._avail_worker.done.connect(self._apply_avail)
+        self._avail_worker.start()
 
-    def _row(self, row: dict, is_active: bool, plugins) -> QWidget:
+    def _apply_avail(self, rows) -> None:
+        self._avail_all = list(rows or [])
+        self.avail_hint.setText("" if self._avail_all
+                                else "暂时取不到版本列表（网络不可达或 registry 异常）。")
+        self._render_avail()
+
+    def _render_avail(self) -> None:
         from dsh_host import versions
+        self._clear(self.card_avail)
+        installed = [r["version"] for r in self._rows]
+        if not self._avail_all:
+            self.btn_more.setVisible(False)
+            return
+        pend_all = versions.pending_versions(self._avail_all, installed)
+        if not pend_all:
+            self.card_avail.add_text("registry 上的版本都已经装过了。")
+            self.btn_more.setVisible(False)
+            return
+        for r in pend_all[: self._avail_limit]:
+            self.card_avail.add(self._avail_row(r))
+        rest = len(pend_all) - self._avail_limit
+        self.btn_more.setVisible(rest > 0)
+        if rest > 0:
+            self.btn_more.setText("显示更多（还有 %d 个）" % rest)
+
+    def _more_avail(self) -> None:
+        self._avail_limit += AVAIL_PAGE
+        self._render_avail()
+
+    def _avail_row(self, r: dict) -> QWidget:
+        w = QWidget()
+        lay = QHBoxLayout(w)
+        lay.setContentsMargins(16, 8, 16, 8)
+        lay.setSpacing(10)
+        name = QLabel(r["version"])
+        name.setStyleSheet("color: %s; font-family: %s; font-size: 13px;"
+                           % (self.pal["text"], FONT))
+        lay.addWidget(name)
+        pub = (r.get("published") or "")[:10]
+        if pub:
+            when = QLabel(pub)
+            when.setStyleSheet("color: %s; font-family: %s; font-size: 12px;"
+                               % (self.pal["muted"], FONT))
+            lay.addWidget(when)
+        lay.addStretch(1)
+        btn = QPushButton("安装")
+        btn.setObjectName("action")
+        btn.clicked.connect(lambda _=False, v=r["version"]: self._install_version(v))
+        lay.addWidget(btn)
+        return w
+
+    def _install_version(self, version: str) -> None:
+        self.e_version.setText(version)
+        self._install()
+
+    def shutdown(self, timeout_ms: int = 8000) -> bool:
+        """收尾：等后台探测/列表线程结束（线程活着退出会让 Qt abort）。"""
+        ok = True
+        for w in (self._probe_worker, self._avail_worker):
+            if w is not None and w.isRunning():
+                ok = w.wait(timeout_ms) and ok
+        return ok
+
+    def _row(self, row: dict, is_active: bool) -> QWidget:
         w = QWidget()
         lay = QHBoxLayout(w)
         lay.setContentsMargins(16, 10, 16, 10)
@@ -695,15 +827,20 @@ class VersionPage(BasePage):
                            % (self.pal["muted"], FONT))
         lay.addWidget(meta)
 
-        # 兼容性摘要：只有声明了 engines.dsh 的才算出结论，其余是"未声明"
-        info = versions.plugin_compat(row["version"], plugins)
-        bad, unknown = len(info["bad"]), len(info["unknown"])
-        if bad:
-            tag, color = "%d 个插件声明不兼容" % bad, self.pal["bad"]
-        elif info["checked"]:
-            tag, color = "%d 个插件声明兼容" % len(info["ok"]), self.pal["ok"]
+        # 兼容性摘要：后台算好后从缓存取；还没算完就说「检测中」。
+        # 不在这里现算——一次 0.27s（起 node 子进程），版本多了会把页面拖住。
+        info = self._compat.get(row["version"])
+        bad = 0
+        if info is None:
+            tag, color = "插件适配检测中…", self.pal["muted"]
         else:
-            tag, color = "插件适配未声明", self.pal["muted"]
+            bad, unknown = len(info["bad"]), len(info["unknown"])
+            if bad:
+                tag, color = "%d 个插件声明不兼容" % bad, self.pal["bad"]
+            elif info["checked"]:
+                tag, color = "%d 个插件声明兼容" % len(info["ok"]), self.pal["ok"]
+            else:
+                tag, color = "插件适配未声明", self.pal["muted"]
         tip = QLabel(tag)
         tip.setStyleSheet("color: %s; font-family: %s; font-size: 12px;"
                           % (color, FONT))
