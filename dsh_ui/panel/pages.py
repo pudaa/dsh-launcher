@@ -874,7 +874,6 @@ class DeployPage(BasePage):
         c3 = Card(
             "自动安装", self.pal,
             help_text="装到应用数据目录，与命令行那份互不影响。")
-        c3.add_text(f"让{HOST_NAME}代劳，需要联网。")
         holder = QWidget()
         lay = QHBoxLayout(holder)
         lay.setContentsMargins(16, 4, 16, 10)
@@ -891,8 +890,7 @@ class DeployPage(BasePage):
         # 跑到部署页找重装。
         c4 = Card(
             "修复版本不一致", self.pal,
-            help_text="症状是接口报错、账号读不出，版本号却正常。")
-        c4.add_text("重装全部组件，数据不受影响。")
+            help_text="症状是接口报错、账号读不出，版本号却正常。重装不动数据。")
         holder2 = QWidget()
         lay2 = QHBoxLayout(holder2)
         lay2.setContentsMargins(16, 4, 16, 10)
@@ -996,7 +994,6 @@ class RunModePage(BasePage):
             help_text="本程序独占管理，不受终端 npm 操作影响。代价是多占一份磁盘。")
         self.kv_priv = KeyValueRow("状态", "—", self.pal)
         c1.add(self.kv_priv)
-        c1.add_text("与命令行那份互不影响。")
         h1 = QWidget()
         r1 = QHBoxLayout(h1)
         r1.setContentsMargins(16, 4, 16, 10)
@@ -1015,7 +1012,6 @@ class RunModePage(BasePage):
             help_text="与终端里那份是同一套文件，你升级它也变。")
         self.kv_pub = KeyValueRow("状态", "—", self.pal)
         c2.add(self.kv_pub)
-        c2.add_text("不额外占用磁盘。")
         h2 = QWidget()
         r2 = QHBoxLayout(h2)
         r2.setContentsMargins(16, 4, 16, 10)
@@ -1077,7 +1073,6 @@ class RunModePage(BasePage):
         row.addStretch(1)
         card.add(holder)
 
-        card.add_text("远端服务去留按主机设置。DSH 只监听远端本机。")
         return card
 
     def _rebuild_hosts(self) -> None:

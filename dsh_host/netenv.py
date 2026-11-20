@@ -51,11 +51,7 @@ def proxy_hint() -> str:
     no_proxy = _env("NO_PROXY", "no_proxy").lower()
     if any(h in no_proxy for h in _DIRECT_HOSTS):
         return ""
-    return ("检测到本机设置了网络代理，但 DeepSeek 的域名没有排除在外。\n\n"
-            "DSH 只会走环境变量里配的代理（它不读系统的代理设置），"
-            "而账号相关的请求经代理会被拒绝——表现是「账号资料暂不可用」，"
-            "登录状态和余额却显示正常，很容易误判成登录过期。\n\n"
-            "要排除的话，两个域名都得写：\n"
+    return ("本机设了代理，但 DeepSeek 域名没排除。DSH 只认环境变量里的代理，"
+            "账号请求经代理会被拒——症状是「账号资料暂不可用」，登录状态却正常。\n\n"
             "NO_PROXY=platform.deepseek.com,chat.deepseek.com\n"
-            "然后重启桌面壳。"
-            "（本项目不会替你改环境变量，这一步由你决定。）")
+            "改完重启桌面壳（本项目不替你改环境变量）。")
