@@ -334,7 +334,11 @@ def candidate_bin_js(prefer: str | None = None):
     # 1.5 版本库：用户在「版本」页选定的那个版本。
     # 排在显式覆盖之后、dsh_source 之前——它比"来源偏好"更具体，
     # 但不该盖过用户手填的 DSH_BIN。
-    vp = str(cfg.get("dsh_version_prefix") or "")
+    # **只在没有指定来源偏好时才用版本库。** 调用方显式要 "system" 时
+    # （比如版本页要检查"系统里装的是哪一版"），返回版本库会让人查不到系统那份，
+    # 表现是"明明装了系统版，界面却说不存在"。
+    _pref = (prefer or "").strip().lower()
+    vp = str(cfg.get("dsh_version_prefix") or "") if _pref in ("", "auto", "private") else ""
     if vp:
         for rel in (("node_modules",), ("lib", "node_modules")):
             p = os.path.join(vp, *rel, "@deepseek-ai", "dsh", "lib", "bin.js")

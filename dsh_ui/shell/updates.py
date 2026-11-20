@@ -33,7 +33,7 @@ from dsh_ui import devtools as dsh_devtools
 from dsh_ui import panel as dsh_panel
 from dsh_ui import theme as dsh_theme
 from dsh_ui.dialogs import (DataTaskDialog, HostUpdateDialog, OnboardingDialog,
-                            ReinstallDialog, UpdateDialog)
+                            ReinstallDialog, UpdateDialog, VersionCleanupDialog)
 from dsh_ui.prelude import *        # noqa: F401,F403
 from dsh_ui.workers import (CheckWorker, DataTaskWorker, DiagnoseWorker, HostCheckWorker,
                             HostUpdateWorker, NotesWorker, ProvisionWorker,
@@ -121,6 +121,40 @@ class UpdatesMixin:
         self.act_prev.setChecked(False)
         host_log("回归稳定版 %s" % target)
         self._show_update_dialog(target)
+    def _maybe_suggest_cleanup(self) -> None:
+        """更新完成后问一次：旧版本还留着吗。
+
+        只在版本库启用时问，且只在真的"有点多"的时候问（超过阈值或版本数）。
+        每次都弹会变成骚扰——多数人两三个版本就够，那时候提醒纯属噪音。
+        """
+        from dsh_host import versions
+        try:
+            if not versions.is_enabled():
+                return
+            info = versions.cleanup_suggestion()
+        except Exception as e:                                   # noqa: BLE001
+            host_log("检查版本库占用失败：%s: %s" % (type(e).__name__, e))
+            return
+        if not info.get("needed"):
+            return
+        host_log("版本库占用 %d MB / %d 个版本，提示清理"
+                 % (info["total_mb"], info["count"]))
+        dlg = VersionCleanupDialog(self, info)
+        accepted = dlg.exec() == QDialog.DialogCode.Accepted
+        targets = list(dlg.to_remove)
+        dlg.deleteLater()
+        freed = 0
+        for v in targets:
+            row = next((r for r in info["candidates"] if r["version"] == v), None)
+            ok, msg = versions.remove(v)
+            if ok:
+                freed += (row["size_mb"] if row else 0)
+                host_log("已删除旧版本 %s" % v)
+            else:
+                host_log("删除 %s 失败：%s" % (v, msg))
+        if freed:
+            self._info("已清理 %d MB。" % freed)
+
     def _rollback(self):
         """回滚到上一个版本。
 
@@ -198,6 +232,10 @@ class UpdatesMixin:
             self.update_info = None
             self._refresh_menu()
             QTimer.singleShot(2000, lambda: self._check_update(manual=False))
+            # 版本库模式下每次更新都会**新增**一个版本目录（旧的不删），
+            # 攒几次就是好几个 GB，而用户不会主动去版本页看自己堆了多少。
+            # 挑"刚更新完、还惦记着这件事"的时候问一句最自然。
+            QTimer.singleShot(2400, self._maybe_suggest_cleanup)
     def _check_host_update(self, manual: bool):
         """检查桌面壳自身更新。与 DSH 检查完全独立。"""
         if getattr(self, "_host_checking", False):

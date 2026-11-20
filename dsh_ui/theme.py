@@ -486,6 +486,18 @@ QPushButton {
 }
 QPushButton:hover { background: %(btn_hover)s; }
 QPushButton:disabled { color: %(muted)s; }
+
+/* 复选框：默认形态是系统自绘的方角灰框，和整套令牌完全不搭
+   （2026-11-20 做版本清理对话框时截图确认）。这里只接管外框，
+   勾选态用强调色实心——不画勾号是有意的：QSS 里塞图标要额外落一个
+   文件进运行时目录，而不画勾在 16px 尺寸下反而更清楚。 */
+QCheckBox { color: %(text)s; font-family: %(font)s; font-size: 13px; spacing: 8px; }
+QCheckBox::indicator {
+    width: 15px; height: 15px; border: 1px solid %(line)s;
+    border-radius: 4px; background: transparent;
+}
+QCheckBox::indicator:hover { border-color: %(accent)s; }
+QCheckBox::indicator:checked { background: %(accent)s; border-color: %(accent)s; }
 /* 官方在指针操作下不画焦点环（input-modality=pointer 时 outline 透明） */
 QPushButton:focus { outline: none; }
 
@@ -520,6 +532,7 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: trans
         "btn_hover": pal["btn_hover"], "primary_fill": pal["primary_fill"],
         "primary_hover": pal["primary_hover"], "primary_text": pal["primary_text"],
         "nav_active": pal["nav_active"], "scroll": pal["scroll"],
+        "accent": pal["accent"],
         "font": FONT, "mono": '"Cascadia Mono", "Consolas", monospace',
         "r_sm": RADIUS["sm"],
     } + combo_qss(pal)

@@ -428,6 +428,65 @@ def plugin_compat(target: str, plugins: list[dict] | None = None) -> dict:
     return res
 
 
+#: 超过这个体积（MB）或版本数就建议清理。
+#:
+#: 实测一份 739~1129 MB，两个版本就接近 2 GB。老大 2026-11-20 提的问题很实在：
+#: 版本库让"更新"变成"新增"，那更新几次之后磁盘就会被吃光——而用户完全
+#: 不会意识到那些旧版本还躺着。所以更新完主动问一次。
+CLEANUP_MB = 2500
+CLEANUP_COUNT = 3
+
+
+def cleanup_suggestion() -> dict:
+    """要不要提醒清理旧版本。返回 {"needed", "total_mb", "count", "candidates"}。
+
+    `candidates` 是**除当前版本以外**的全部版本，按体积从大到小排——
+    用户最想删的通常是那个占地方又不再用的大版本。
+    """
+    rows = list_installed()
+    active = active_version()
+    total = sum(r["size_mb"] for r in rows)
+    others = [r for r in rows if r["version"] != active]
+    others.sort(key=lambda r: r["size_mb"], reverse=True)
+    needed = bool(others) and (total >= CLEANUP_MB or len(rows) > CLEANUP_COUNT)
+    return {"needed": needed, "total_mb": total, "count": len(rows),
+            "active": active, "candidates": others}
+
+def prefix_of(bin_js: str) -> str:
+    """从 bin.js 反推 npm prefix。
+
+    布局只有两种：`<prefix>/node_modules/@deepseek-ai/dsh/lib/bin.js`（Windows）
+    和 `<prefix>/lib/node_modules/...`（Linux）。一路往上找到 node_modules 的父级。
+    """
+    d = os.path.dirname(os.path.abspath(bin_js))
+    while d and os.path.basename(d) not in ("node_modules", "lib"):
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    if os.path.basename(d) == "node_modules":
+        return os.path.dirname(d)
+    if os.path.basename(d) == "lib":        # <prefix>/lib/node_modules
+        return os.path.dirname(d)
+    return ""
+
+
+def system_install() -> dict:
+    """找系统里那份 DSH（PATH / npm 全局），用于"复制进版本库"。
+
+    返回 {} 表示没找到。**显式传 prefer="system"**——不传的话
+    candidate_bin_js 会优先返回版本库自己，永远查不到系统那份。
+    """
+    try:
+        for src, bin_js, _node in contract.candidate_bin_js("system"):
+            prefix = prefix_of(bin_js)
+            ver = version_of(prefix) if prefix else ""
+            if ver:
+                return {"version": ver, "prefix": prefix, "source": src}
+    except Exception:                                          # noqa: BLE001
+        pass
+    return {}
+
 def is_enabled() -> bool:
     """版本库当前是否在用（配置里有指向且目录有效）。"""
     p = str(config.get("dsh_version_prefix") or "")

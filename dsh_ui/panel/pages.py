@@ -571,6 +571,25 @@ class VersionPage(BasePage):
         self.summary.setWordWrap(True)
         self.layout_.addWidget(self.summary)
 
+        # --- 从系统导入（只在系统里真有一份、且版本库还没有它时出现）---
+        # 为什么不偷偷复制：系统 prefix 里通常还躺着 npm/corepack 等全局包，
+        # 整目录搬进来会带上无关的东西。先告诉用户"有这么一份"，由他决定。
+        c2 = Card("系统里另有一份", self.pal)
+        self.sys_row = QWidget()
+        sys_lay = QHBoxLayout(self.sys_row)
+        sys_lay.setContentsMargins(16, 4, 16, 8)
+        sys_lay.setSpacing(8)
+        self.sys_text = _label("", "muted")
+        sys_lay.addWidget(self.sys_text, 1)
+        self.btn_import = QPushButton("导入版本库")
+        self.btn_import.setObjectName("action")
+        self.btn_import.clicked.connect(self._import_system)
+        sys_lay.addWidget(self.btn_import)
+        c2.add(self.sys_row)
+        self.card_system = c2
+        self.layout_.addWidget(c2)
+        c2.setVisible(False)
+
         # --- 安装新版本 ---
         # 以前只能靠"检查更新"往唯一那份上覆盖。现在装进独立目录，
         # 装坏了只是多一个目录，删掉即可，正在跑的那份从头到尾没被碰过。
@@ -624,6 +643,18 @@ class VersionPage(BasePage):
                 "还没有任何版本。可以先把当前安装导入成一份副本，之后再装别的版本。")
             self.summary.setText("")
             return
+
+        # 系统那份：只在"有，而且版本库里还没有"时才露出来
+        try:
+            sys_inst = versions.system_install()
+        except Exception:                                        # noqa: BLE001
+            sys_inst = {}
+        if sys_inst and sys_inst["version"] not in {r["version"] for r in rows}:
+            self.sys_text.setText("检测到 %s（%s）。导入一份副本之后就能在版本库里切它。"
+                                  % (sys_inst["version"], sys_inst["source"]))
+            self.card_system.setVisible(True)
+        else:
+            self.card_system.setVisible(False)
 
         plugins = versions.plugin_scan()
         for row in rows:
@@ -706,6 +737,29 @@ class VersionPage(BasePage):
         return w
 
     # ---- 交互 ----
+    def _import_system(self) -> None:
+        from dsh_host import versions
+        info = versions.system_install()
+        if not info:
+            self.refresh()
+            return
+        if not self._confirm(
+                "把系统里的 %s 复制一份进版本库？\n\n"
+                "会占用几百 MB。复制完成后系统那份不动，"
+                "你可以随时在两边之间选择。" % info["version"]):
+            return
+        self.install_hint.setText("正在复制 %s…" % info["version"])
+        self.btn_import.setEnabled(False)
+        ok, msg = versions.adopt_current(info["prefix"])
+        self.btn_import.setEnabled(True)
+        if not ok:
+            self.install_hint.setText("导入失败。")
+            self._warn(msg)
+        else:
+            self.install_hint.setText("导入完成。")
+            self.log("已把系统安装 %s 导入版本库" % info["version"])
+        self.refresh()
+
     def _install(self) -> None:
         from dsh_host import contract
 
