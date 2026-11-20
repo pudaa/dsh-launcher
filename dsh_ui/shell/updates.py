@@ -141,7 +141,7 @@ class UpdatesMixin:
                  % (info["total_mb"], info["count"]))
         dlg = VersionCleanupDialog(self, info)
         accepted = dlg.exec() == QDialog.DialogCode.Accepted
-        targets = list(dlg.to_remove)
+        targets = list(dlg.to_remove) if accepted else []
         dlg.deleteLater()
         freed = 0
         for v in targets:

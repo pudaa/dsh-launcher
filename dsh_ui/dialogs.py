@@ -152,75 +152,43 @@ class OnboardingDialog(QDialog):
             QTimer.singleShot(800, self.accept)
 
 class VersionCleanupDialog(QDialog):
-    """更新完之后问一次：旧版本还要留着吗。
+    """更新完之后问一句：旧版本还留着吗。
 
-    为什么需要（2026-11-20 老大提的）：版本库把"更新"从覆盖变成新增，好处是
-    随时能切回去，代价是每装一版就多占 700~1100 MB。用户不会主动去翻版本页
-    看自己堆了多少——所以要在他刚更新完、还惦记着这件事的时候问一句。
-
-    默认**一个都不勾**：删东西必须是他主动选的，不能我们替他勾好"看起来没用"的。
+    只有一句话和一个二选一。以前这里塞了复选框列表加三段说明，
+    老大原话"直接说旧版本是否保留，选项是或否就可以了"——
+    想精细挑选的人去版本页自己删，不必在这个提示里替他把选项铺开。
     """
 
     def __init__(self, parent, info: dict):
         super().__init__(parent)
-        self.setWindowTitle("旧版本还留着吗")
-        self.setMinimumWidth(520)
-        self.to_remove: list[str] = []
+        self.setWindowTitle("旧版本")
+        self.setMinimumWidth(360)
+        # 删除的对象是**除当前版本以外**的全部
+        self.to_remove: list[str] = [c["version"] for c in info["candidates"]]
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(22, 20, 22, 16)
-        lay.setSpacing(12)
+        lay.setContentsMargins(22, 18, 22, 14)
+        lay.setSpacing(14)
 
-        head = QLabel("版本库现在占 %d MB（%d 个版本）。" % (info["total_mb"], info["count"]))
-        head.setObjectName("dlgBody")
-        head.setWordWrap(True)
-        lay.addWidget(head)
-
-        tip = QLabel("旧版本留着可以随时切回去，但会一直占着磁盘。勾选要删掉的——"
-                     "删了之后要重新下载才能回来。")
-        tip.setObjectName("dlgHint")
-        tip.setWordWrap(True)
-        lay.addWidget(tip)
-
-        self._boxes: list[tuple[QCheckBox, str]] = []
-        for row in info["candidates"]:
-            line = QHBoxLayout()
-            box = QCheckBox()
-            line.addWidget(box)
-            name = QLabel(row["version"])
-            line.addWidget(name)
-            size = QLabel("%d MB" % row["size_mb"])
-            size.setObjectName("dlgHint")
-            line.addWidget(size)
-            if row.get("note"):
-                note = QLabel(row["note"][:20])
-                note.setObjectName("dlgHint")
-                line.addWidget(note)
-            line.addStretch(1)
-            lay.addLayout(line)
-            self._boxes.append((box, row["version"]))
+        msg = QLabel("旧版本要留着吗？\n%d 个，共 %d MB。" % (
+            len(info["candidates"]),
+            sum(c["size_mb"] for c in info["candidates"])))
+        msg.setObjectName("dlgBody")
+        lay.addWidget(msg)
 
         btns = QHBoxLayout()
         btns.addStretch(1)
-        b_keep = QPushButton("都留着")
-        b_keep.setObjectName("ghost")
-        b_del = QPushButton("删除选中的")
-        b_del.setObjectName("action")
-        btns.addWidget(b_keep)
-        btns.addWidget(b_del)
+        self.b_keep = QPushButton("保留")
+        self.b_keep.setObjectName("ghost")
+        self.b_del = QPushButton("删除")
+        self.b_del.setObjectName("action")
+        self.b_del.setDefault(True)
+        btns.addWidget(self.b_keep)
+        btns.addWidget(self.b_del)
         lay.addLayout(btns)
 
-        b_keep.clicked.connect(self.reject)
-        b_del.clicked.connect(self._accept)
-
-    def _accept(self) -> None:
-        self.to_remove = [v for box, v in self._boxes if box.isChecked()]
-        if not self.to_remove:
-            # 没勾任何东西就点"删除"，等同于"都留着"——不要用一个空操作关掉窗口
-            # 还让用户以为删掉了什么。
-            self.reject()
-            return
-        self.accept()
+        self.b_keep.clicked.connect(self.reject)
+        self.b_del.clicked.connect(self.accept)
 
 
 class UpdateDialog(QDialog):
